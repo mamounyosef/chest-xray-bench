@@ -1,1 +1,1 @@
-# chest-xray-classification
+# chest-xray-bench
