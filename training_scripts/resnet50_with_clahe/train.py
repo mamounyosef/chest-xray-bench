@@ -1,15 +1,19 @@
 """
-train.py  —  experiment: resnet50_without_clahe
-================================================
+train.py  —  experiment: resnet50_with_clahe
+============================================
 Thin entry point. The shared engine does all the heavy lifting; this file only:
   1. loads the config (../shared_config.yaml merged with ./config.yaml),
   2. builds the model (the one thing that differs between experiments),
   3. hands off to shared_code.run_experiment.
 
+This is the CLAHE arm: IDENTICAL to resnet50_without_clahe in every respect
+EXCEPT clahe.use_clahe: true (set in this folder's config.yaml). Keeping
+everything else fixed is what makes the CLAHE comparison controlled.
+
 Resume is config-driven: set `resume:` in config.yaml (null/'best'/'last'/<step>/<path>).
 
 Run locally:   python train.py
-Run on Modal:  modal run training_scripts/resnet50_without_clahe/train.py
+Run on Modal:  modal run training_scripts/resnet50_with_clahe/train.py
 """
 
 import sys
@@ -18,7 +22,7 @@ from pathlib import Path
 import torch.nn as nn
 import torchvision
 
-EXP_NAME = "resnet50_without_clahe"
+EXP_NAME = "resnet50_with_clahe"
 
 
 def _resolve_pkg_root() -> Path:

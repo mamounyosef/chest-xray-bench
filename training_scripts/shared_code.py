@@ -769,6 +769,7 @@ def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
         ckpts = sorted(ckpt_dir.glob("ckpt_step*.pt"),
                        key=lambda p: int(p.stem.replace("ckpt_step", "")))
         for old in ckpts[:-keep] if keep > 0 else ckpts:
+            print(f"🗑️  deleting old checkpoint: {old}")
             old.unlink(missing_ok=True)
     if is_best:
         torch.save(state, ckpt_dir / out["best_name"])
@@ -881,16 +882,20 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             "imgs_per_s": round(imgs_per_s, 1), "sec_per_step": round(dt, 4),
         })
         if global_step % console_log_every == 0 or i == 1:
+            cur_loss = loss.item()
+            # delta vs the previous CONSOLE-printed train loss (persists across
+            # epochs via a function attribute); empty on the very first print.
+            d_loss = _fmt_delta(cur_loss, getattr(train_one_epoch, "_last_print_loss", None))
+            train_one_epoch._last_print_loss = cur_loss
             print(f"  Epoch {epoch + 1}  epoch_step: {i}/{n_batches}  "
                   f"global_step: {global_step}/{total_steps}  "
-                  f"loss={loss.item():.4f}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
+                  f"loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
                   f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}")
 
         if log_fn is not None and (global_step % wandb_log_every == 0 or i == 1):
             _safe("wandb", log_fn, {
                 "train/loss": loss.item(), "train/lr": lr,
                 "train/grad_norm": float(grad_norm), "train/imgs_per_s": imgs_per_s,
-                "train/epoch": epoch + 1,
             }, global_step)
 
         if debug_dir is not None and debug_every > 0 and global_step % debug_every == 0:
@@ -906,6 +911,14 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             if stop:
                 break
     return global_step, stop
+
+
+def _fmt_delta(curr, prev) -> str:
+    """' (+0.0138)' / ' (-0.0042)' vs the previous validation, '' on the first
+    validation (no baseline) or when either value is NaN."""
+    if prev is None or curr is None or math.isnan(curr) or math.isnan(prev):
+        return ""
+    return f" ({curr - prev:+.4f})"
 
 
 def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None):
@@ -975,7 +988,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     prior_elapsed = 0.0          # wall-clock seconds accumulated before this process
     track = {"best": (-math.inf if mode == "max" else math.inf),
              "no_improve": 0, "last_monitor": 0.0,
-             "best_step": 0, "best_epoch": 0, "best_metrics": None}
+             "best_step": 0, "best_epoch": 0, "best_metrics": None,
+             "prev_macro": None, "prev_per_task": None, "prev_val_loss": None}
     if resume is not None:
         info = load_checkpoint(resume, model, ckpt_dir, optimizer, scheduler,
                                scaler, device, restore_rng=True)
@@ -1051,16 +1065,30 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
               _flatten_val_row(epoch + 1, gstep, val_loss, metrics,
                                cfg["tasks"], elapsed(), eta(gstep)))
 
+        d_val_loss = _fmt_delta(val_loss, track["prev_val_loss"])   # vs last validation
         print("-" * 70)
         print(f"  🔎 [VAL] epoch={epoch + 1} step={gstep}  elapsed={fmt_duration(elapsed())}  "
-              f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}")
-        print(f"     📊 mean AUROC={macro['mean_auroc']:.4f}  mean AUPRC={macro['mean_auprc']:.4f}  "
-              f"F1={macro['mean_f1']:.4f}  P={macro['mean_precision']:.4f}  "
-              f"R={macro['mean_recall']:.4f}  Spec={macro['mean_specificity']:.4f}")
+              f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}{d_val_loss}")
+        pm = track["prev_macro"]            # previous validation's macro (None on 1st)
+        def _d(key):                        # delta vs last validation for a macro key
+            return _fmt_delta(macro[key], pm[key] if pm is not None else None)
+        print(f"     📊 mean AUROC={macro['mean_auroc']:.4f}{_d('mean_auroc')}  "
+              f"mean AUPRC={macro['mean_auprc']:.4f}{_d('mean_auprc')}  "
+              f"F1={macro['mean_f1']:.4f}{_d('mean_f1')}  "
+              f"P={macro['mean_precision']:.4f}{_d('mean_precision')}  "
+              f"R={macro['mean_recall']:.4f}{_d('mean_recall')}  "
+              f"Spec={macro['mean_specificity']:.4f}{_d('mean_specificity')}")
+        ppt = track["prev_per_task"]        # previous validation's per-task metrics
         for t in cfg["tasks"]:
             m = metrics["per_task"][t]
-            print(f"        {t:<18} AUROC={m['auroc']:.4f}  AUPRC={m['auprc']:.4f}  "
-                  f"(pos={m['n_pos']})")
+            pt = ppt.get(t) if ppt is not None else None
+            d_auroc = _fmt_delta(m['auroc'], pt['auroc'] if pt is not None else None)
+            d_auprc = _fmt_delta(m['auprc'], pt['auprc'] if pt is not None else None)
+            print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
+                  f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']})")
+        track["prev_macro"] = dict(macro)            # baseline for next validation
+        track["prev_per_task"] = {t: dict(metrics["per_task"][t]) for t in cfg["tasks"]}
+        track["prev_val_loss"] = val_loss
 
         prev_best = track["best"]
         is_best = better(current, track["best"])

@@ -47,19 +47,19 @@ image:
 augmentation:
   enable: true
   rotation:                   # random rotation in +/- deg
-    p:   0.5
-    deg: 7
+    p:   0.2
+    deg: 5
   translate:                  # random shift, +/- fraction of W/H
-    p:    0.5
+    p:    0.2
     frac: 0.05
   scale:                      # random zoom factor sampled in range
-    p:     0.5
+    p:     0.2
     range: [0.95, 1.05]
   brightness:                 # +/- fraction
-    p:      0.5
+    p:      0.2
     factor: 0.10
   contrast:                   # +/- fraction
-    p:      0.5
+    p:      0.2
     factor: 0.10
 
 # ----------------------------------------------------------------------------

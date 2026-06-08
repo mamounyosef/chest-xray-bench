@@ -1,13 +1,17 @@
 # =============================================================================
-# config.yaml  —  experiment: resnet50_without_clahe   (baseline arm)
+# config.yaml  —  experiment: resnet50_with_clahe   (CLAHE arm)
 # -----------------------------------------------------------------------------
 # Holds only what VARIES per experiment. Common settings (paths, tasks, image,
 # augmentation, reproducibility, output) come from ../shared_config.yaml and are
 # merged in at load time. Anything set here overrides the shared value.
+#
+# This file is IDENTICAL to resnet50_without_clahe/config.yaml except for the
+# two CLAHE-specific lines (experiment.name and clahe.use_clahe). Everything
+# else is held fixed so the comparison isolates the effect of CLAHE alone.
 # =============================================================================
 
 experiment:
-  name: "resnet50_without_clahe"
+  name: "resnet50_with_clahe"
 
 model:
   name: "resnet50"          # torchvision resnet50
@@ -31,10 +35,12 @@ labels:
   u_policy: "ones"
 
 # ----------------------------------------------------------------------------
-# CLAHE  —  OFF for this arm (baseline).
+# CLAHE  —  ON for this arm. Contrast Limited Adaptive Histogram Equalization
+# applied to the grayscale image before resize/pad. The only thing that differs
+# from the baseline arm.
 # ----------------------------------------------------------------------------
 clahe:
-  use_clahe: false
+  use_clahe: true
   clip_limit: 2.0
   tile_grid:  [8, 8]
 
@@ -98,7 +104,7 @@ training:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 12              # counted in VALIDATIONS, not epochs
+    patience: 15              # counted in VALIDATIONS, not epochs
 
 # ----------------------------------------------------------------------------
 # Evaluation
