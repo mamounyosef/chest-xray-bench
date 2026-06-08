@@ -1,0 +1,87 @@
+# =============================================================================
+# shared_config.yaml  —  settings COMMON to every experiment
+# -----------------------------------------------------------------------------
+# Only the truly-stable, obvious-to-share settings live here. Each experiment's
+# own config.yaml holds what varies (experiment, model, labels, clahe, dataloader,
+# training, evaluation) and is deep-merged on top of this (experiment wins).
+# =============================================================================
+
+# ----------------------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------------------
+paths:
+  data_root:    "D:/CheXpert-v1.0-small"
+  data_dir:     "d:/My Projects/chest-xray-bench/data"
+  train_csv:    "01_train.csv"        # patient-grouped 90% (NLP labels)
+  val_csv:      "01_val.csv"          # patient-grouped 10% (NLP labels, in-loop val)
+  valid200_csv: "01_valid200.csv"     # official 200-study radiologist set (report only)
+  test500_csv:  "01_test500.csv"      # official 500-study radiologist set (report only)
+
+# ----------------------------------------------------------------------------
+# Tasks  —  the 5 competition pathologies (headline = mean AUROC). Order fixes
+# the column order of every label tensor & metric vector.
+# ----------------------------------------------------------------------------
+tasks:
+  - Atelectasis
+  - Cardiomegaly
+  - Consolidation
+  - Edema
+  - Pleural Effusion
+
+# ----------------------------------------------------------------------------
+# Image geometry & normalization  —  aspect-preserving fit inside (W,H) + center
+# zero-pad. ImageNet normalization (pretrained backbone). Grayscale -> 3 channels.
+# ----------------------------------------------------------------------------
+image:
+  width:  384
+  height: 320
+  interpolation: "INTER_AREA"
+  channels: 3
+  norm_mean: [0.485, 0.456, 0.406]
+  norm_std:  [0.229, 0.224, 0.225]
+
+# ----------------------------------------------------------------------------
+# Augmentation  —  TRAIN SPLIT ONLY. Each aug rolls its OWN independent p.
+# NO flips (cardiac laterality). enable=false disables all at once.
+# ----------------------------------------------------------------------------
+augmentation:
+  enable: true
+  rotation:                   # random rotation in +/- deg
+    p:   0.5
+    deg: 7
+  translate:                  # random shift, +/- fraction of W/H
+    p:    0.5
+    frac: 0.05
+  scale:                      # random zoom factor sampled in range
+    p:     0.5
+    range: [0.95, 1.05]
+  brightness:                 # +/- fraction
+    p:      0.5
+    factor: 0.10
+  contrast:                   # +/- fraction
+    p:      0.5
+    factor: 0.10
+
+# ----------------------------------------------------------------------------
+# Reproducibility
+# ----------------------------------------------------------------------------
+reproducibility:
+  seed: 42
+  deterministic: true
+
+# ----------------------------------------------------------------------------
+# Output  —  written into each experiment's results/ folder:
+#     results/checkpoints/   <- rolling last-N + best.pt
+#     results/train_log.csv  <- one row per training step
+#     results/val_log.csv    <- one row per validation
+#   plus train_config/<datetime>.txt  <- full terminal capture of each run
+# ----------------------------------------------------------------------------
+output:
+  run_dir:        "results"
+  checkpoints_dir: "checkpoints"
+  best_name:       "best.pt"
+  keep_last_n:     5
+  train_log_csv:   "train_log.csv"
+  val_log_csv:     "val_log.csv"
+  console_log_every: 50
+  console_capture_dir: "train_config"

@@ -5,17 +5,20 @@ shared_code.py  —  CHEST-XRAY-BENCH shared library
 Everything that must stay identical across experiments lives here so the
 comparison stays controlled: config loading, the data layer (preprocessing /
 Dataset / loaders), and the training engine (seed / model / loss / metrics /
-loop). Each experiment is just a tiny script in its own subfolder that loads
-its own self-contained `config.yaml` (no shared base file, no merging).
+loop). A small `shared_config.yaml` holds settings common to all experiments;
+each experiment's own `config.yaml` holds what varies and is merged on top.
 
 Sections:
     [1] Config loading   [2] Data layer   [3] Metrics/optim   [4] Engine
+    [5] Modal helpers (optional cloud execution)
 """
 
 from __future__ import annotations
 
+import copy
 import csv
 import functools
+import json
 import math
 import random
 import sys
@@ -35,47 +38,69 @@ from torch import optim
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.v2 as T
 
-# Directory of this file; shared_code.yaml sits right next to it.
+# Directory of this file (training_scripts/); experiment folders sit next to it.
 PKG_DIR = Path(__file__).resolve().parent
+SHARED_CONFIG = PKG_DIR / "shared_config.yaml"
 
 
 # =============================================================================
 # Section 1 — Config loading
-# Each experiment has ONE self-contained config.yaml in its own folder (no shared
-# base file, no merging). shared_code.py is the only thing shared between runs.
+# A small shared_config.yaml (next to this file) holds the settings common to
+# EVERY experiment: paths, tasks, image, augmentation, reproducibility, output.
+# Each experiment's own config.yaml holds what VARIES: experiment, model, labels,
+# clahe, dataloader, training, evaluation. The two are deep-merged (experiment
+# wins on any shared key), so the returned cfg is complete.
 # =============================================================================
 
 def _read_yaml(path: Path) -> dict:
-    """Load one YAML file into a dict (empty file -> {})."""
+    """Load one YAML file into a dict (empty/blank file -> {})."""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return data if data is not None else {}
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge `override` INTO a copy of `base`. Nested dicts merge
+    key-by-key; scalars/lists in override replace the base value wholesale."""
+    merged = copy.deepcopy(base)
+    for key, val in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+            merged[key] = _deep_merge(merged[key], val)
+        else:
+            merged[key] = copy.deepcopy(val)
+    return merged
+
+
 def load_config(experiment_dir, config_name: str = "config.yaml",
-                verbose: bool = True) -> dict:
-    """Load one experiment's self-contained config.yaml and return it as a dict.
+                shared_config=SHARED_CONFIG, verbose: bool = True) -> dict:
+    """Merge shared_config.yaml with one experiment's config.yaml and return it.
 
     Parameters
     ----------
     experiment_dir : folder of the experiment (holds its config.yaml).
     config_name    : config filename inside that folder.
+    shared_config  : path to the shared common-settings YAML.
     verbose        : print a short summary of the key settings.
     """
     experiment_dir = Path(experiment_dir)
+    shared_config = Path(shared_config)
     config_path = experiment_dir / config_name
     if not config_path.exists():
         raise FileNotFoundError(f"experiment config not found: {config_path}")
 
-    cfg = _read_yaml(config_path)
+    shared = _read_yaml(shared_config) if shared_config.exists() else {}
+    exp = _read_yaml(config_path)
+    cfg = _deep_merge(shared, exp)
 
     if verbose:
+        miss = "" if shared_config.exists() else "  (MISSING!)"
         print("=" * 70)
         print("[load_config] loaded experiment configuration")
         print("-" * 70)
-        print(f"  experiment dir  : {experiment_dir}")
-        print(f"  config file     : {config_path}")
-        print(f"  top-level keys  : {list(cfg.keys())}")
+        print(f"  shared config   : {shared_config}{miss}")
+        print(f"  experiment file : {config_path}")
+        print(f"  shared sections : {list(shared.keys())}")
+        print(f"  experiment keys : {list(exp.keys())}")
         print(f"  experiment name : {cfg.get('experiment', {}).get('name', '<unset>')}")
         print(f"  model           : {cfg.get('model', {}).get('name', '<unset>')}")
         print(f"  use_clahe       : {cfg.get('clahe', {}).get('use_clahe')}")
@@ -87,8 +112,8 @@ def load_config(experiment_dir, config_name: str = "config.yaml",
 
 # =============================================================================
 # Section 2 — Data layer  (promoted from data_code/02_splits_dataset.ipynb)
-# Everything is driven by the merged cfg so each experiment gets an identical
-# pipeline except for the few keys it overrides (use_clahe, u_policy, ...).
+# Everything is driven by cfg, so each experiment's config.yaml fully determines
+# its pipeline (use_clahe, u_policy, augmentation, ...).
 # =============================================================================
 
 def resolve_path(rel: str, cfg: dict) -> Path | None:
@@ -377,8 +402,9 @@ def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int 
             return sched, False
         return cosine, False
     if name == "plateau":
+        mode = cfg["training"]["early_stopping"].get("mode", "max")
         sched = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="max", patience=s.get("plateau_patience", 2),
+            optimizer, mode=mode, patience=s.get("plateau_patience", 2),
             min_lr=s.get("min_lr", 0.0))
         return sched, True
     raise ValueError(f"unknown scheduler: {name!r}")
@@ -415,12 +441,18 @@ class _Tee:
 
     def write(self, data):
         for s in self._streams:
-            s.write(data)
-            s.flush()
+            try:
+                s.write(data)
+                s.flush()
+            except Exception:
+                pass        # never let a stream error (e.g. capture file) crash prints
 
     def flush(self):
         for s in self._streams:
-            s.flush()
+            try:
+                s.flush()
+            except Exception:
+                pass
 
     def isatty(self):
         return False
@@ -436,19 +468,78 @@ class CSVLogger:
         self._writer = None
 
     def log(self, row: dict):
-        if self._f is None:
-            new = (not self.path.exists()) or self.path.stat().st_size == 0
-            self._f = open(self.path, "a", newline="", encoding="utf-8")
-            self._writer = csv.DictWriter(self._f, fieldnames=list(row.keys()))
-            if new:
-                self._writer.writeheader()
-        self._writer.writerow(row)
-        self._f.flush()
+        # Robust: a logging failure must never crash training. On error, drop the
+        # row, reset the handle, and let the next call try to reopen.
+        try:
+            if self._f is None:
+                new = (not self.path.exists()) or self.path.stat().st_size == 0
+                self._f = open(self.path, "a", newline="", encoding="utf-8")
+                self._writer = csv.DictWriter(self._f, fieldnames=list(row.keys()))
+                if new:
+                    self._writer.writeheader()
+            self._writer.writerow(row)
+            self._f.flush()
+        except Exception as e:
+            print(f"  ⚠️  CSV log failed (continuing): {type(e).__name__}: {e}")
+            try:
+                if self._f is not None:
+                    self._f.close()
+            except Exception:
+                pass
+            self._f, self._writer = None, None
 
     def close(self):
-        if self._f is not None:
-            self._f.close()
-            self._f = None
+        try:
+            if self._f is not None:
+                self._f.close()
+        except Exception:
+            pass
+        self._f = None
+
+
+def _safe(label: str, fn, *args, **kwargs):
+    """Run fn(*args) but never let it crash the run; warn and continue on error."""
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        print(f"  ⚠️  {label} failed (continuing): {type(e).__name__}: {e}")
+        return None
+
+
+def _write_summary(path: Path, data: dict):
+    """Write the best-so-far metrics snapshot as JSON (atomic-ish via flush)."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+
+
+def _save_debug_image(imgs: torch.Tensor, cfg: dict, debug_dir: Path,
+                      epoch: int, epoch_step: int):
+    """Save ONE random sample from the batch exactly as the model sees it
+    (un-normalized back to [0,1] for viewing) -> debug_dir/e{epoch}_{step}.png."""
+    idx = random.randrange(imgs.size(0))
+    t = imgs[idx].detach().float().cpu()                       # (C,H,W) normalized
+    mean = torch.tensor(cfg["image"]["norm_mean"][:t.shape[0]]).view(-1, 1, 1)
+    std = torch.tensor(cfg["image"]["norm_std"][:t.shape[0]]).view(-1, 1, 1)
+    t = (t * std + mean).clamp(0, 1)                           # un-normalize -> [0,1]
+    arr = (t * 255).round().to(torch.uint8).permute(1, 2, 0).numpy()
+    if arr.shape[2] == 1:
+        arr = arr[:, :, 0]
+    debug_dir = Path(debug_dir)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr).save(debug_dir / f"e{epoch}_{epoch_step}.png")
+
+
+def _monitor_value(macro: dict, val_loss: float, monitor: str) -> float:
+    """Resolve an early_stopping.monitor string to its value.
+    'val_loss' -> val_loss; 'val_<macro key>' (e.g. val_mean_auroc) -> macro[...]."""
+    m = monitor[4:] if monitor.startswith("val_") else monitor
+    if m == "loss":
+        return val_loss
+    if m in macro:
+        return macro[m]
+    raise KeyError(f"unknown early_stopping.monitor: {monitor!r} "
+                   f"(expected val_loss or one of val_{{{', '.join(macro)}}})")
 
 
 def fmt_duration(seconds: float) -> str:
@@ -519,6 +610,7 @@ def print_config(cfg: dict):
     print(f"  experiment        : {cfg.get('experiment', {}).get('name', '<unnamed>')}")
     print(f"  model             : {cfg.get('model', {}).get('name', '<unset>')}"
           f"  (pretrained={cfg.get('model', {}).get('pretrained')})")
+    print(f"  resume            : {cfg.get('resume')}")
     print(f"  tasks ({len(cfg['tasks'])})         : {cfg['tasks']}")
     print("  --- paths --------------------------------------------------------")
     p = cfg["paths"]
@@ -566,6 +658,10 @@ def print_config(cfg: dict):
           f"(logs: {out['train_log_csv']}, {out['val_log_csv']})")
     print(f"  console_log_every : {out['console_log_every']}  "
           f"capture_dir={out['console_capture_dir']}")
+    if "modal" in cfg:
+        m = cfg["modal"]
+        print(f"  modal (cloud)     : gpu={m.get('gpu')}  cpu={m.get('cpu_cores')}  "
+              f"ram={m.get('memory_gb')}GB  timeout={m.get('timeout_seconds')}s")
     # Guaranteed-complete fallback: dump the FULL merged config verbatim, so even
     # any key not explicitly formatted above is recorded in the run's txt log.
     print("  --- raw merged config (verbatim) ---------------------------------")
@@ -655,7 +751,8 @@ def load_checkpoint(resume, model, ckpt_dir: Path, optimizer=None, scheduler=Non
 
 
 def _resolve_resume(resume, ckpt_dir: Path) -> Path:
-    """Map a resume spec ('best' | 'last' | path) to a concrete checkpoint file."""
+    """Map a resume spec to a concrete checkpoint file.
+    Accepts 'best' | 'last' | <int step> (-> ckpt_step{N}.pt) | explicit path."""
     if resume == "best":
         cands = list(ckpt_dir.glob("best*.pt"))
         if not cands:
@@ -667,6 +764,11 @@ def _resolve_resume(resume, ckpt_dir: Path) -> Path:
         if not ckpts:
             raise FileNotFoundError(f"no step checkpoints in {ckpt_dir}")
         return ckpts[-1]
+    if isinstance(resume, int) or (isinstance(resume, str) and resume.isdigit()):
+        path = ckpt_dir / f"ckpt_step{int(resume)}.pt"
+        if not path.exists():
+            raise FileNotFoundError(f"no checkpoint for step {int(resume)}: {path}")
+        return path
     path = Path(resume)
     if not path.exists():
         raise FileNotFoundError(f"resume checkpoint not found: {path}")
@@ -676,7 +778,9 @@ def _resolve_resume(resume, ckpt_dir: Path) -> Path:
 def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                     epoch: int, global_step: int, train_logger: CSVLogger,
                     amp: bool, grad_clip, eval_every_steps, on_eval,
-                    console_log_every: int, elapsed_fn, eta_fn) -> tuple:
+                    console_log_every: int, elapsed_fn, eta_fn, total_steps: int,
+                    log_fn=None, wandb_log_every: int = 50,
+                    cfg: dict = None, debug_dir=None, debug_every: int = 0) -> tuple:
     """One epoch of training. Logs every step (loss/lr/grad_norm/throughput/elapsed/eta)
     and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop)."""
     model.train()
@@ -693,6 +797,14 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         with torch.autocast(device_type=device.type, enabled=amp):
             logits = model(imgs)
             loss = loss_fn(logits, labels)
+
+        # NaN/Inf guard: skip this batch's update instead of crashing the run.
+        if not torch.isfinite(loss):
+            print(f"  ⚠️  non-finite loss ({loss.item()}) at step ~{global_step + 1}; "
+                  f"skipping this batch")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
@@ -705,7 +817,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         imgs_per_s = imgs.size(0) / dt if dt > 0 else 0.0
         el = elapsed_fn()
         eta = eta_fn(global_step)
-        train_logger.log({
+        _safe("train_log", train_logger.log, {
             "step": global_step, "epoch": epoch + 1,     # 1-indexed for humans
             "elapsed_sec": round(el, 2),
             "eta_sec": round(eta, 2) if math.isfinite(eta) else "",
@@ -714,9 +826,20 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             "imgs_per_s": round(imgs_per_s, 1), "sec_per_step": round(dt, 4),
         })
         if global_step % console_log_every == 0 or i == 1:
-            print(f"  e{epoch + 1} [{i:>5}/{n_batches}] step={global_step}  "
+            print(f"  Epoch {epoch + 1}  epoch_step: {i}/{n_batches}  "
+                  f"global_step: {global_step}/{total_steps}  "
                   f"loss={loss.item():.4f}  lr={lr:.2e}  gnorm={float(grad_norm):.2f}  "
                   f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}")
+
+        if log_fn is not None and (global_step % wandb_log_every == 0 or i == 1):
+            _safe("wandb", log_fn, {
+                "train/loss": loss.item(), "train/lr": lr,
+                "train/grad_norm": float(grad_norm), "train/imgs_per_s": imgs_per_s,
+                "train/epoch": epoch + 1,
+            }, global_step)
+
+        if debug_dir is not None and debug_every > 0 and global_step % debug_every == 0:
+            _safe("debug_image", _save_debug_image, imgs, cfg, debug_dir, epoch + 1, i)
 
         if eval_every_steps and global_step % eval_every_steps == 0:
             stop = on_eval(epoch, global_step)
@@ -726,7 +849,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
     return global_step, stop
 
 
-def _run_experiment(cfg: dict, model, experiment_dir, resume=None):
+def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None):
     """End-to-end training for one experiment. Identical machinery for every run;
     only the injected `model` and cfg overrides differ. Trains on 01_train.csv,
     validates on 01_val.csv, checkpoints (rolling + best by mean AUROC), early-stops.
@@ -770,11 +893,17 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None):
     ev_epochs = cfg["evaluation"]["eval_every_epochs"]
     es = cfg["training"]["early_stopping"]
     es_enable, es_patience = es["enable"], int(es["patience"])
+    monitor = es.get("monitor", "val_mean_auroc")     # which metric drives best + early-stop
+    mode = es.get("mode", "max")                       # "max" | "min"
+    better = (lambda a, b: a > b) if mode == "max" else (lambda a, b: a < b)
+    summary_path = results_dir / out.get("summary_json", "summary.json")
 
     # --- resumable state ---
     start_epoch, global_step = 0, 0
     prior_elapsed = 0.0          # wall-clock seconds accumulated before this process
-    track = {"best": -math.inf, "no_improve": 0, "last_auroc": 0.0}
+    track = {"best": (-math.inf if mode == "max" else math.inf),
+             "no_improve": 0, "last_monitor": 0.0,
+             "best_step": 0, "best_epoch": 0, "best_metrics": None}
     if resume is not None:
         info = load_checkpoint(resume, model, ckpt_dir, optimizer, scheduler,
                                scaler, device, restore_rng=True)
@@ -785,7 +914,16 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None):
 
     run_start = time.time()
     console_log_every = int(out["console_log_every"])
+    wandb_log_every = int(cfg.get("wandb", {}).get("log_every", 50))   # train-metric cadence
     total_steps = epochs * len(train_loader)     # ETA denominator (full schedule)
+
+    # debug-image saving (assurance that preprocessing/augmentation look right)
+    _dbg = cfg.get("debug", {})
+    debug_every = int(_dbg.get("save_images_every", 0) or 0)
+    debug_dir = (results_dir / _dbg.get("dir", "debugged_images")) if debug_every > 0 else None
+    if debug_dir is not None:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[debug] saving a batch image every {debug_every} steps -> {debug_dir}")
 
     def elapsed() -> float:
         """Total training wall-clock seconds (continues across resumes)."""
@@ -806,23 +944,39 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None):
         print(f"   continue from   : epoch {start_epoch + 1}/{epochs}  (global step {global_step})")
         print(f"   steps done      : {global_step}/{total_steps}  ({pct:.1f}%)")
         print(f"   steps remaining : {steps_left}")
-        print(f"   best so far     : {track['best']:.4f} mean AUROC")
+        print(f"   best so far     : {track['best']:.4f} ({monitor})")
         print(f"   elapsed so far  : {fmt_duration(prior_elapsed)} ({prior_elapsed:.0f}s)")
         print("=" * 70)
+
+    def _summary(status: str) -> dict:
+        return {
+            "experiment": cfg.get("experiment", {}).get("name"),
+            "status": status,                      # running | completed | early_stopped
+            "monitor": monitor, "mode": mode,
+            "best_value": track["best"] if math.isfinite(track["best"]) else None,
+            "best_step": track["best_step"], "best_epoch": track["best_epoch"],
+            "best_metrics": track["best_metrics"],
+            "last_step": track.get("last_step", 0), "total_steps": total_steps,
+            "elapsed_sec": round(elapsed(), 2),
+            "elapsed_human": fmt_duration(elapsed()),
+            "updated": datetime.now().isoformat(timespec="seconds"),
+        }
 
     # --- validation + checkpoint + early-stop, shared by step- and epoch-eval ---
     def on_eval(epoch: int, gstep: int) -> bool:
         val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device, amp)
         macro = metrics["macro"]
-        mean_auroc = macro["mean_auroc"]
-        track["last_auroc"] = mean_auroc
-        val_logger.log(_flatten_val_row(epoch + 1, gstep, val_loss, metrics,
-                                        cfg["tasks"], elapsed(), eta(gstep)))
+        current = _monitor_value(macro, val_loss, monitor)
+        track["last_monitor"] = current
+        track["last_step"] = gstep
+        _safe("val_log", val_logger.log,
+              _flatten_val_row(epoch + 1, gstep, val_loss, metrics,
+                               cfg["tasks"], elapsed(), eta(gstep)))
 
         print("-" * 70)
         print(f"  🔎 [VAL] epoch={epoch + 1} step={gstep}  elapsed={fmt_duration(elapsed())}  "
               f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}")
-        print(f"     📊 mean AUROC={mean_auroc:.4f}  mean AUPRC={macro['mean_auprc']:.4f}  "
+        print(f"     📊 mean AUROC={macro['mean_auroc']:.4f}  mean AUPRC={macro['mean_auprc']:.4f}  "
               f"F1={macro['mean_f1']:.4f}  P={macro['mean_precision']:.4f}  "
               f"R={macro['mean_recall']:.4f}  Spec={macro['mean_specificity']:.4f}")
         for t in cfg["tasks"]:
@@ -831,19 +985,33 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None):
                   f"(pos={m['n_pos']})")
 
         prev_best = track["best"]
-        is_best = mean_auroc > track["best"]
+        is_best = better(current, track["best"])
         if is_best:
-            track["best"], track["no_improve"] = mean_auroc, 0
+            track["best"], track["no_improve"] = current, 0
+            track["best_step"], track["best_epoch"] = gstep, epoch + 1
+            track["best_metrics"] = {**macro, "val_loss": val_loss}
         else:
             track["no_improve"] += 1
-        save_checkpoint(ckpt_dir, cfg, model, optimizer, scheduler, scaler,
-                        epoch, gstep, track["best"], is_best, device, elapsed())
+        _safe("checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
+              scheduler, scaler, epoch, gstep, track["best"], is_best, device, elapsed())
+        _safe("summary", _write_summary, summary_path, _summary("running"))
+        if log_fn is not None:            # W&B: same scores as the val CSV (no system stats)
+            wb = {"val/loss": val_loss}
+            wb.update({f"val/{k}": v for k, v in macro.items()})
+            for t in cfg["tasks"]:
+                pm = metrics["per_task"][t]
+                for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity"):
+                    wb[f"val/{key}/{t}"] = pm[key]
+            _safe("wandb", log_fn, wb, gstep)
+        if persist_fn is not None:        # e.g. Modal volume.commit() -> live updates
+            _safe("persist", persist_fn)
         if is_best:
-            gain = mean_auroc - prev_best if math.isfinite(prev_best) else mean_auroc
-            print(f"     ⭐ NEW BEST mean AUROC={mean_auroc:.4f} (+{gain:.4f})  💾 saved best.pt")
+            gain = current - prev_best if math.isfinite(prev_best) else current
+            sign = "+" if mode == "max" else ""
+            print(f"     ⭐ NEW BEST {monitor}={current:.4f} ({sign}{gain:.4f})  💾 saved best.pt")
         else:
             print(f"     ⚠️  no improvement ({track['no_improve']}/{es_patience})  "
-                  f"best={track['best']:.4f}  💾 ckpt saved")
+                  f"best {monitor}={track['best']:.4f}  💾 ckpt saved")
         print("-" * 70)
 
         return bool(es_enable and track["no_improve"] >= es_patience)
@@ -857,14 +1025,15 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None):
         global_step, stop = train_one_epoch(
             model, train_loader, optimizer, loss_fn, scaler, device,
             epoch, global_step, train_logger, amp, grad_clip, ev_steps, on_eval,
-            console_log_every, elapsed, eta)
+            console_log_every, elapsed, eta, total_steps, log_fn, wandb_log_every,
+            cfg=cfg, debug_dir=debug_dir, debug_every=debug_every)
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)
 
         if scheduler is not None:
             if sched_needs_metric:
-                scheduler.step(track["last_auroc"])
+                scheduler.step(track["last_monitor"])
             else:
                 scheduler.step()
 
@@ -872,22 +1041,33 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None):
             print(f"🛑 [early-stop] no improvement for {es_patience} validations — stopping.")
             break
 
+    status = "early_stopped" if stop else "completed"
+    _safe("summary", _write_summary, summary_path, _summary(status))
+    if persist_fn is not None:
+        _safe("persist", persist_fn)
     train_logger.close()
     val_logger.close()
     print("#" * 70)
-    print(f"# 🏁 done. best mean AUROC = {track['best']:.4f}  "
-          f"⏱️  total train time = {fmt_duration(elapsed())} ({elapsed():.0f}s)")
+    print(f"# 🏁 done ({status}). best {monitor} = {track['best']:.4f} "
+          f"@ step {track['best_step']}  ⏱️  total train time = "
+          f"{fmt_duration(elapsed())} ({elapsed():.0f}s)")
     print("#" * 70)
     return track["best"]
 
 
-def run_experiment(cfg: dict, model, experiment_dir, resume=None):
+def run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None):
     """Public entry point. Tees ALL terminal output (stdout + stderr) of this run
     into <experiment>/<console_capture_dir>/<YYYY-MM-DD_HH-MM-SS>.txt so every run
     keeps a complete, timestamped record, then delegates to _run_experiment.
     Streams are always restored and the file closed — even if the run crashes
-    (the traceback is captured first)."""
+    (the traceback is captured first).
+
+    resume is config-driven: if not passed explicitly, it is read from
+    cfg['resume'] (null/'best'/'last'/<int step>/<path>). An explicit argument
+    wins over the config."""
     experiment_dir = Path(experiment_dir)
+    if resume is None:
+        resume = cfg.get("resume")
     cap_dir = experiment_dir / cfg["output"]["console_capture_dir"]
     cap_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -905,11 +1085,60 @@ def run_experiment(cfg: dict, model, experiment_dir, resume=None):
     sys.stderr = _Tee(orig_err, log_f)
     print(f"📝 capturing full console output of this run -> {cap_path}")
     try:
-        return _run_experiment(cfg, model, experiment_dir, resume)
+        return _run_experiment(cfg, model, experiment_dir, resume, persist_fn, log_fn)
     finally:
         sys.stdout, sys.stderr = orig_out, orig_err
         log_f.close()
         print(f"📝 saved run log -> {cap_path}")
+
+
+# =============================================================================
+# Section 5 — Modal helpers (cloud execution)
+# All Modal usage is OPTIONAL and `import modal` is lazy (inside modal_image),
+# so a plain local `python train.py` never requires the modal package. Each
+# experiment's train.py assembles its app from these three helpers.
+# =============================================================================
+
+# Packages installed into the Modal container image. torch's default Linux wheel
+# is CUDA-enabled; opencv-headless avoids the GUI libs we don't need on a server.
+_MODAL_PIP = [
+    "torch", "torchvision", "numpy", "pandas", "scikit-learn",
+    "opencv-python-headless", "pillow", "pyyaml", "wandb",
+]
+
+
+def modal_image():
+    """Build the Modal container image: pip deps + the whole training_scripts/
+    source tree (code + YAML configs), excluding local run artifacts."""
+    import modal
+    return (
+        modal.Image.debian_slim(python_version="3.11")
+        .pip_install(*_MODAL_PIP)
+        .add_local_dir(
+            str(PKG_DIR), remote_path="/root/training_scripts",
+            ignore=["**/results/**", "**/train_config/**", "**/__pycache__/**"],
+        )
+    )
+
+
+def modal_resources(cfg: dict) -> dict:
+    """Map cfg['modal'] to @app.function(...) resource kwargs (GB -> MB for memory)."""
+    m = cfg["modal"]
+    return dict(
+        gpu=m["gpu"],
+        cpu=m["cpu_cores"],
+        memory=int(m["memory_gb"]) * 1024,
+        timeout=int(m["timeout_seconds"]),
+    )
+
+
+def remote_cfg(cfg: dict) -> dict:
+    """Copy of cfg with data paths repointed at the mounted Modal data volume."""
+    rc = copy.deepcopy(cfg)
+    m = cfg["modal"]
+    rc["paths"]["data_root"] = m["remote_data_root"]
+    rc["paths"]["data_dir"] = m["remote_data_dir"]
+    return rc
 
 
 if __name__ == "__main__":
