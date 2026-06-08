@@ -66,6 +66,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
     for key, val in override.items():
         if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
             merged[key] = _deep_merge(merged[key], val)
+        elif val is None and isinstance(merged.get(key), dict):
+            # an empty/None section in the override (e.g. a bare "output:") must
+            # NOT wipe out the shared dict — keep the base value.
+            continue
         else:
             merged[key] = copy.deepcopy(val)
     return merged
@@ -231,7 +235,8 @@ class CheXpertDataset(Dataset):
         self.tasks = cfg["tasks"]
         self.paths = df["Path"].tolist()
         policy = cfg["labels"]["u_policy"]
-        self.labels = torch.from_numpy(build_labels(df, self.tasks, policy).to_numpy())
+        # .copy() -> writable array (silences the non-writable-tensor warning)
+        self.labels = torch.from_numpy(build_labels(df, self.tasks, policy).to_numpy().copy())
         self.use_clahe = bool(cfg["clahe"]["use_clahe"])
         self._clahe = (
             _get_clahe(cfg["clahe"]["clip_limit"], tuple(cfg["clahe"]["tile_grid"]))
@@ -283,22 +288,40 @@ def make_loaders(cfg: dict):
     g = torch.Generator()
     g.manual_seed(cfg["reproducibility"]["seed"])
 
-    common = dict(num_workers=dl["num_workers"], pin_memory=dl["pin_memory"],
-                  worker_init_fn=seed_worker)
-    extra = {}
-    if dl["num_workers"] > 0:   # these kwargs are only valid with real workers
-        extra = dict(prefetch_factor=dl["prefetch_factor"],
-                     persistent_workers=dl["persistent_workers"])
+    # train settings
+    tr_bs = int(dl["batch_size"])
+    tr_nw = int(dl["num_workers"])
+    tr_pin = bool(dl["pin_memory"])
+    tr_pf = dl["prefetch_factor"]
+    tr_pw = bool(dl["persistent_workers"])
+    # validation settings — each falls back to its train counterpart if omitted.
+    # (val runs under no_grad -> can use a bigger batch; doesn't affect metrics.)
+    va_bs = int(dl.get("val_batch_size") or tr_bs)
+    va_nw = int(dl.get("val_num_workers", tr_nw))
+    va_pin = bool(dl.get("val_pin_memory", tr_pin))
+    va_pf = dl.get("val_prefetch_factor", tr_pf)
+    va_pw = bool(dl.get("val_persistent_workers", tr_pw))
 
-    train_loader = DataLoader(train_ds, batch_size=dl["batch_size"], shuffle=True,
-                              drop_last=dl["drop_last"], generator=g, **common, **extra)
-    val_loader = DataLoader(val_ds, batch_size=dl["batch_size"], shuffle=False,
-                            drop_last=False, **common, **extra)
+    def _kw(nw, pin, pf, pw):
+        # prefetch_factor / persistent_workers are only valid when num_workers>0
+        kw = dict(num_workers=nw, pin_memory=pin, worker_init_fn=seed_worker)
+        if nw > 0:
+            kw.update(prefetch_factor=pf, persistent_workers=pw)
+        return kw
+
+    train_loader = DataLoader(train_ds, batch_size=tr_bs, shuffle=True,
+                              drop_last=bool(dl["drop_last"]), generator=g,
+                              **_kw(tr_nw, tr_pin, tr_pf, tr_pw))
+    val_loader = DataLoader(val_ds, batch_size=va_bs, shuffle=False,
+                            drop_last=False, **_kw(va_nw, va_pin, va_pf, va_pw))
 
     print("-" * 70)
-    print(f"  batch_size={dl['batch_size']}  num_workers={dl['num_workers']}  "
-          f"use_clahe={train_ds.use_clahe}  u_policy={cfg['labels']['u_policy']}")
-    print(f"  augment (train): {'ON' if train_ds.train_transforms is not None else 'OFF'}")
+    print(f"  train: bs={tr_bs}  workers={tr_nw}  pin={tr_pin}  prefetch={tr_pf}  "
+          f"persistent={tr_pw}  drop_last={bool(dl['drop_last'])}")
+    print(f"  val  : bs={va_bs}  workers={va_nw}  pin={va_pin}  prefetch={va_pf}  "
+          f"persistent={va_pw}")
+    print(f"  use_clahe={train_ds.use_clahe}  u_policy={cfg['labels']['u_policy']}  "
+          f"augment (train): {'ON' if train_ds.train_transforms is not None else 'OFF'}")
     print(f"  train: {len(train_ds)} imgs -> {len(train_loader)} batches")
     print(f"  val  : {len(val_ds)} imgs -> {len(val_loader)} batches")
     print("=" * 70)
@@ -373,40 +396,51 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold: float = 0.5) -> dict
 
 
 def build_optimizer(model: nn.Module, cfg: dict) -> optim.Optimizer:
-    """AdamW from cfg['training']['optimizer'] (lr, weight_decay)."""
+    """AdamW from cfg['training']['optimizer'] (lr, weight_decay). Uses the fused
+    CUDA kernel when performance.fused_optimizer and the params are on CUDA."""
     o = cfg["training"]["optimizer"]
-    return optim.AdamW(model.parameters(), lr=o["lr"], weight_decay=o["weight_decay"])
+    fused = bool(cfg.get("performance", {}).get("fused_optimizer", False)) \
+        and next(model.parameters()).is_cuda
+    return optim.AdamW(model.parameters(), lr=o["lr"],
+                       weight_decay=o["weight_decay"], fused=fused)
 
 
-def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int | None = None):
-    """cosine (+linear warmup) | plateau | none, stepped PER EPOCH.
+def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int):
+    """Build the LR scheduler. Returns (scheduler_or_None, mode):
+        mode == "step"    -> step once per OPTIMIZER STEP (cosine / warmup)
+        mode == "plateau" -> step once per validation with the monitored metric
+        mode is None      -> no scheduler
 
-    Returns (scheduler_or_None, requires_metric). `requires_metric` is True only
-    for plateau, telling the engine to call scheduler.step(val_mean_auroc)."""
+    cosine: linear warmup over `warmup_epochs` (expressed in STEPS) from
+    `warmup_start_factor`*lr up to lr, then cosine-anneal down to `min_lr` across
+    the remaining steps. Stepping per step gives a smooth ramp + decay (not the
+    once-per-epoch staircase that left the LR pinned during warmup)."""
     s = cfg["training"]["scheduler"]
     name = s["name"].lower()
     epochs = cfg["training"]["epochs"]
+    total_steps = max(1, epochs * steps_per_epoch)
 
     if name == "none":
-        return None, False
+        return None, None
     if name == "cosine":
-        warmup = int(s.get("warmup_epochs", 0))
+        warmup_steps = int(round(float(s.get("warmup_epochs", 0)) * steps_per_epoch))
         min_lr = s.get("min_lr", 0.0)
+        start_factor = float(s.get("warmup_start_factor", 0.01))   # ~0 -> base lr
         cosine = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(1, epochs - warmup), eta_min=min_lr)
-        if warmup > 0:
+            optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=min_lr)
+        if warmup_steps > 0:
             warmup_sched = optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=0.01, total_iters=warmup)
+                optimizer, start_factor=start_factor, total_iters=warmup_steps)
             sched = optim.lr_scheduler.SequentialLR(
-                optimizer, [warmup_sched, cosine], milestones=[warmup])
-            return sched, False
-        return cosine, False
+                optimizer, [warmup_sched, cosine], milestones=[warmup_steps])
+            return sched, "step"
+        return cosine, "step"
     if name == "plateau":
         mode = cfg["training"]["early_stopping"].get("mode", "max")
         sched = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode=mode, patience=s.get("plateau_patience", 2),
             min_lr=s.get("min_lr", 0.0))
-        return sched, True
+        return sched, "plateau"
     raise ValueError(f"unknown scheduler: {name!r}")
 
 
@@ -641,18 +675,24 @@ def print_config(cfg: dict):
     print(f"  prefetch_factor   : {dl['prefetch_factor']}  persistent={dl['persistent_workers']}")
     print("  --- training -----------------------------------------------------")
     print(f"  epochs            : {tr['epochs']}")
-    print(f"  optimizer         : AdamW  lr={opt['lr']}  weight_decay={opt['weight_decay']}")
+    print(f"  optimizer         : AdamW  lr={opt['lr']:.4e}  weight_decay={opt['weight_decay']}")
     print(f"  scheduler         : {sch['name']}  warmup_epochs={sch.get('warmup_epochs')}  "
           f"min_lr={sch.get('min_lr')}")
     print(f"  loss              : {loss['name']}  pos_weight={loss.get('pos_weight')}")
     print(f"  amp               : {tr['amp']}  grad_clip={tr['grad_clip']}")
     print(f"  early_stopping    : enable={es['enable']}  monitor={es['monitor']}  "
           f"mode={es['mode']}  patience={es['patience']}")
+    _perf = cfg.get("performance", {})
+    print(f"  performance       : channels_last={_perf.get('channels_last')}  "
+          f"fused_adamw={_perf.get('fused_optimizer')}  compile={_perf.get('compile')}"
+          f"  (mode={_perf.get('compile_mode')})")
     print("  --- evaluation / repro / output ----------------------------------")
     print(f"  metric (headline) : {ev['metric']}  (eval_level={ev['eval_level']})")
     print(f"  eval cadence      : every_epochs={ev['eval_every_epochs']}  "
           f"every_steps={ev['eval_every_steps']}")
     print(f"  seed              : {rep['seed']}  deterministic={rep['deterministic']}")
+    print(f"  checkpointing     : periodic every {out.get('checkpoint_every_steps', 0)} steps "
+          f"(0=off) + best.pt at validation")
     print(f"  keep_last_n ckpts : {out['keep_last_n']}  best_name={out['best_name']}")
     print(f"  run_dir           : {out['run_dir']}  "
           f"(logs: {out['train_log_csv']}, {out['val_log_csv']})")
@@ -670,13 +710,16 @@ def print_config(cfg: dict):
 
 
 @torch.no_grad()
-def validate(model, val_loader, loss_fn, cfg, device, amp: bool) -> tuple:
+def validate(model, val_loader, loss_fn, cfg, device, amp: bool,
+             channels_last: bool = False) -> tuple:
     """Full pass over the val loader -> (val_loss, metrics dict). No grad, eval mode."""
     model.eval()
     total_loss, n = 0.0, 0
     ys, ps = [], []
     for imgs, labels in val_loader:
         imgs = imgs.to(device, non_blocking=True)
+        if channels_last:
+            imgs = imgs.to(memory_format=torch.channels_last)
         labels = labels.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=amp):
             logits = model(imgs)
@@ -693,14 +736,23 @@ def validate(model, val_loader, loss_fn, cfg, device, amp: bool) -> tuple:
     return val_loss, metrics
 
 
+def _unwrap(model):
+    """The underlying module behind a torch.compile wrapper (or the model itself),
+    so checkpoints always use plain (un-prefixed) state-dict keys."""
+    return getattr(model, "_orig_mod", model)
+
+
 def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
                     epoch: int, global_step: int, best_score: float,
-                    is_best: bool, device, elapsed_sec: float) -> Path:
-    """Write a fully-resumable checkpoint, prune to keep_last_n rolling copies,
-    and (when is_best) refresh best.pt."""
+                    device, elapsed_sec: float,
+                    rolling: bool = False, is_best: bool = False):
+    """Write a fully-resumable checkpoint. Two independent triggers:
+      rolling=True : write ckpt_step{N}.pt and prune to keep_last_n  (periodic)
+      is_best=True : (over)write best.pt                              (at validation)
+    Both can be true; either writes the same complete state."""
     out = cfg["output"]
     state = {
-        "model": model.state_dict(),
+        "model": _unwrap(model).state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
         "scaler": scaler.state_dict(),
@@ -711,19 +763,15 @@ def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
         "rng": _rng_state(device),
         "cfg": cfg,
     }
-    path = ckpt_dir / f"ckpt_step{global_step}.pt"
-    torch.save(state, path)
-
-    # rolling cleanup: keep only the newest keep_last_n step-checkpoints
-    keep = int(out["keep_last_n"])
-    ckpts = sorted(ckpt_dir.glob("ckpt_step*.pt"),
-                   key=lambda p: int(p.stem.replace("ckpt_step", "")))
-    for old in ckpts[:-keep] if keep > 0 else ckpts:
-        old.unlink(missing_ok=True)
-
+    if rolling:
+        torch.save(state, ckpt_dir / f"ckpt_step{global_step}.pt")
+        keep = int(out["keep_last_n"])      # prune to the newest keep_last_n
+        ckpts = sorted(ckpt_dir.glob("ckpt_step*.pt"),
+                       key=lambda p: int(p.stem.replace("ckpt_step", "")))
+        for old in ckpts[:-keep] if keep > 0 else ckpts:
+            old.unlink(missing_ok=True)
     if is_best:
         torch.save(state, ckpt_dir / out["best_name"])
-    return path
 
 
 def load_checkpoint(resume, model, ckpt_dir: Path, optimizer=None, scheduler=None,
@@ -734,7 +782,7 @@ def load_checkpoint(resume, model, ckpt_dir: Path, optimizer=None, scheduler=Non
     path = _resolve_resume(resume, ckpt_dir)
     print(f"[resume] loading checkpoint: {path}")
     ckpt = torch.load(path, map_location=device or "cpu", weights_only=False)
-    model.load_state_dict(ckpt["model"])
+    _unwrap(model).load_state_dict(ckpt["model"])
     if optimizer is not None and ckpt.get("optimizer") is not None:
         optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
@@ -780,7 +828,10 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                     amp: bool, grad_clip, eval_every_steps, on_eval,
                     console_log_every: int, elapsed_fn, eta_fn, total_steps: int,
                     log_fn=None, wandb_log_every: int = 50,
-                    cfg: dict = None, debug_dir=None, debug_every: int = 0) -> tuple:
+                    cfg: dict = None, debug_dir=None, debug_every: int = 0,
+                    channels_last: bool = False,
+                    checkpoint_fn=None, checkpoint_every: int = 0,
+                    scheduler=None) -> tuple:
     """One epoch of training. Logs every step (loss/lr/grad_norm/throughput/elapsed/eta)
     and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop)."""
     model.train()
@@ -791,6 +842,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
     for i, (imgs, labels) in enumerate(loader, start=1):
         t0 = time.time()
         imgs = imgs.to(device, non_blocking=True)
+        if channels_last:
+            imgs = imgs.to(memory_format=torch.channels_last)
         labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
@@ -810,6 +863,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         scaler.step(optimizer)
         scaler.update()
+        if scheduler is not None:        # cosine/warmup: step once per optimizer step
+            scheduler.step()
 
         global_step += 1
         dt = time.time() - t0
@@ -828,7 +883,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         if global_step % console_log_every == 0 or i == 1:
             print(f"  Epoch {epoch + 1}  epoch_step: {i}/{n_batches}  "
                   f"global_step: {global_step}/{total_steps}  "
-                  f"loss={loss.item():.4f}  lr={lr:.2e}  gnorm={float(grad_norm):.2f}  "
+                  f"loss={loss.item():.4f}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
                   f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}")
 
         if log_fn is not None and (global_step % wandb_log_every == 0 or i == 1):
@@ -840,6 +895,10 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
 
         if debug_dir is not None and debug_every > 0 and global_step % debug_every == 0:
             _safe("debug_image", _save_debug_image, imgs, cfg, debug_dir, epoch + 1, i)
+
+        if checkpoint_fn is not None and checkpoint_every > 0 \
+                and global_step % checkpoint_every == 0:
+            checkpoint_fn(epoch, global_step)        # periodic rolling ckpt (no eval)
 
         if eval_every_steps and global_step % eval_every_steps == 0:
             stop = on_eval(epoch, global_step)
@@ -879,12 +938,25 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     # --- data / model / optim ---
     train_loader, val_loader = make_loaders(cfg)
     model = model.to(device)
+
+    # performance options (CUDA-only)
+    perf = cfg.get("performance", {})
+    channels_last = bool(perf.get("channels_last")) and device.type == "cuda"
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    do_compile = bool(perf.get("compile")) and device.type == "cuda"
+    if do_compile:
+        model = torch.compile(model, mode=perf.get("compile_mode", "default"))
+
     optimizer = build_optimizer(model, cfg)
-    scheduler, sched_needs_metric = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
+    scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
     loss_fn = build_loss(cfg, device)
     amp = bool(cfg["training"]["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=amp)
     print(f"[setup] optimizer=AdamW  scheduler={cfg['training']['scheduler']['name']}  amp={amp}")
+    print(f"[setup] channels_last={channels_last}  compile={do_compile}"
+          f"{' (mode=' + perf.get('compile_mode', 'default') + ')' if do_compile else ''}"
+          f"  fused_adamw={bool(perf.get('fused_optimizer')) and device.type == 'cuda'}")
 
     # --- training params ---
     epochs = cfg["training"]["epochs"]
@@ -915,7 +987,10 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     run_start = time.time()
     console_log_every = int(out["console_log_every"])
     wandb_log_every = int(cfg.get("wandb", {}).get("log_every", 50))   # train-metric cadence
+    ckpt_every = int(out.get("checkpoint_every_steps", 0) or 0)         # periodic rolling ckpt
     total_steps = epochs * len(train_loader)     # ETA denominator (full schedule)
+    print(f"[checkpoint] periodic rolling checkpoint every "
+          f"{ckpt_every if ckpt_every > 0 else 'OFF'} steps; best.pt at validation")
 
     # debug-image saving (assurance that preprocessing/augmentation look right)
     _dbg = cfg.get("debug", {})
@@ -964,7 +1039,10 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
 
     # --- validation + checkpoint + early-stop, shared by step- and epoch-eval ---
     def on_eval(epoch: int, gstep: int) -> bool:
-        val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device, amp)
+        print("=" * 70)
+        print(f"🔎 VALIDATION START — epoch {epoch + 1}  step {gstep}  "
+              f"({len(val_loader)} batches, {len(val_loader.dataset)} images) ...")
+        val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device, amp, channels_last)
         macro = metrics["macro"]
         current = _monitor_value(macro, val_loss, monitor)
         track["last_monitor"] = current
@@ -992,8 +1070,9 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             track["best_metrics"] = {**macro, "val_loss": val_loss}
         else:
             track["no_improve"] += 1
-        _safe("checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
-              scheduler, scaler, epoch, gstep, track["best"], is_best, device, elapsed())
+        _safe("best-checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
+              scheduler, scaler, epoch, gstep, track["best"], device, elapsed(),
+              rolling=False, is_best=is_best)
         _safe("summary", _write_summary, summary_path, _summary("running"))
         if log_fn is not None:            # W&B: same scores as the val CSV (no system stats)
             wb = {"val/loss": val_loss}
@@ -1011,10 +1090,21 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             print(f"     ⭐ NEW BEST {monitor}={current:.4f} ({sign}{gain:.4f})  💾 saved best.pt")
         else:
             print(f"     ⚠️  no improvement ({track['no_improve']}/{es_patience})  "
-                  f"best {monitor}={track['best']:.4f}  💾 ckpt saved")
+                  f"best {monitor}={track['best']:.4f}")
         print("-" * 70)
 
         return bool(es_enable and track["no_improve"] >= es_patience)
+
+    # --- periodic rolling checkpoint, INDEPENDENT of validation ---
+    def save_periodic(epoch: int, gstep: int):
+        _safe("checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
+              scheduler, scaler, epoch, gstep, track["best"], device, elapsed(),
+              rolling=True, is_best=False)
+        _safe("summary", _write_summary, summary_path, _summary("running"))
+        if persist_fn is not None:
+            _safe("persist", persist_fn)
+        print(f"  💾 periodic checkpoint @ step {gstep} "
+              f"(rolling, keep_last_n={out['keep_last_n']})")
 
     # --- epoch loop ---
     stop = False
@@ -1026,16 +1116,18 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             model, train_loader, optimizer, loss_fn, scaler, device,
             epoch, global_step, train_logger, amp, grad_clip, ev_steps, on_eval,
             console_log_every, elapsed, eta, total_steps, log_fn, wandb_log_every,
-            cfg=cfg, debug_dir=debug_dir, debug_every=debug_every)
+            cfg=cfg, debug_dir=debug_dir, debug_every=debug_every,
+            channels_last=channels_last,
+            checkpoint_fn=save_periodic, checkpoint_every=ckpt_every,
+            scheduler=(scheduler if sched_mode == "step" else None))
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)
 
-        if scheduler is not None:
-            if sched_needs_metric:
-                scheduler.step(track["last_monitor"])
-            else:
-                scheduler.step()
+        # plateau steps once per epoch on the monitored metric; "step"-mode
+        # schedulers (cosine/warmup) are stepped inside train_one_epoch.
+        if scheduler is not None and sched_mode == "plateau":
+            scheduler.step(track["last_monitor"])
 
         if stop:
             print(f"🛑 [early-stop] no improvement for {es_patience} validations — stopping.")

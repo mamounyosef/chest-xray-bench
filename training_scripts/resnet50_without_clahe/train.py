@@ -18,12 +18,27 @@ from pathlib import Path
 import torch.nn as nn
 import torchvision
 
-# Make shared_code.py (one level up, in training_scripts/) importable.
-HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent))
+EXP_NAME = "resnet50_without_clahe"
+
+
+def _resolve_pkg_root() -> Path:
+    """Locate the training_scripts/ dir (holds shared_code.py + shared_config.yaml)
+    in BOTH environments: locally it's this file's parent's parent; on Modal the
+    whole tree is mounted at /root/training_scripts by shared_code.modal_image().
+    Pick whichever actually contains shared_code.py."""
+    for cand in (Path("/root/training_scripts"),
+                 Path(__file__).resolve().parent.parent):
+        if (cand / "shared_code.py").exists():
+            return cand
+    return Path(__file__).resolve().parent.parent
+
+
+PKG_ROOT = _resolve_pkg_root()
+EXP_DIR = PKG_ROOT / EXP_NAME
+sys.path.insert(0, str(PKG_ROOT))
 import shared_code as sc          # noqa: E402  (import after sys.path tweak)
 
-cfg = sc.load_config(HERE, verbose=False)
+cfg = sc.load_config(EXP_DIR, verbose=False)
 
 
 def build_model(cfg: dict) -> nn.Module:
@@ -42,7 +57,7 @@ def build_model(cfg: dict) -> nn.Module:
 # -----------------------------------------------------------------------------
 def run_local():
     model = build_model(cfg)
-    sc.run_experiment(cfg, model, HERE)
+    sc.run_experiment(cfg, model, EXP_DIR)
 
 
 # -----------------------------------------------------------------------------

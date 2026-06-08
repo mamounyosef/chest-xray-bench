@@ -39,15 +39,38 @@ clahe:
   tile_grid:  [8, 8]
 
 # ----------------------------------------------------------------------------
-# DataLoader
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
 # ----------------------------------------------------------------------------
 dataloader:
-  batch_size:   64
-  num_workers:  8
-  pin_memory:   true
-  drop_last:    false
-  prefetch_factor: 4
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
   persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         256
+  val_num_workers:        16
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
 
 # ----------------------------------------------------------------------------
 # Training
@@ -75,7 +98,7 @@ training:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 5              # counted in VALIDATIONS, not epochs
+    patience: 15              # counted in VALIDATIONS, not epochs
 
 # ----------------------------------------------------------------------------
 # Evaluation
@@ -86,7 +109,8 @@ evaluation:
   metric: "mean_auroc"
   eval_level: "image"
   eval_every_epochs: null
-  eval_every_steps: 200
+  eval_every_steps: 500
+
 
 # ----------------------------------------------------------------------------
 # Modal  —  cloud run resources + volume layout for THIS experiment.
