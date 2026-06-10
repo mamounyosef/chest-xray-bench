@@ -109,7 +109,7 @@ evaluation:
   metric: "mean_auroc"
   eval_level: "image"
   eval_every_epochs: null
-  eval_every_steps: 600
+  eval_every_steps: 500
 
 
 # ----------------------------------------------------------------------------

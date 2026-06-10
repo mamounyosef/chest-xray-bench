@@ -33,7 +33,7 @@ import torch
 import torch.nn as nn
 import yaml
 from PIL import Image
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
 from torch import optim
 from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.v2 as T
@@ -345,7 +345,7 @@ def set_seed(seed: int, deterministic: bool = True):
     print(f"[set_seed] seed={seed}  deterministic={deterministic}")
 
 
-def compute_metrics(y_true, y_prob, tasks: list, threshold: float = 0.5) -> dict:
+def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5) -> dict:
     """Multi-label metrics from ground-truth (N,T) 0/1 and probabilities (N,T).
 
     Per task: AUROC, AUPRC (threshold-free) + F1 / precision / recall /
@@ -353,10 +353,22 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold: float = 0.5) -> dict
     (AUROC/AUPRC use nanmean so a task with a single class present — undefined
     AUROC -> NaN — is skipped instead of poisoning the average).
     Returns {"macro": {...}, "per_task": {task: {...}}}.
+
+    `threshold` may be a single float (same cut for every task, e.g. 0.5 during
+    in-training validation) OR a per-task sequence of length len(tasks) — the
+    frozen per-task thresholds calibrated on the validation set. The threshold
+    used for each task is recorded back into its per-task dict.
     """
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
-    preds = (y_prob >= threshold).astype(int)
+    thr = np.asarray(threshold, dtype=float)
+    if thr.ndim == 0:
+        thr_row = np.full(len(tasks), float(thr))
+    else:
+        thr_row = thr.reshape(-1)
+        if len(thr_row) != len(tasks):
+            raise ValueError(f"threshold vector len {len(thr_row)} != n_tasks {len(tasks)}")
+    preds = (y_prob >= thr_row.reshape(1, -1)).astype(int)
 
     per_task = {}
     cols = {k: [] for k in ("auroc", "auprc", "f1", "precision", "recall", "specificity")}
@@ -378,7 +390,8 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold: float = 0.5) -> dict
         f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
 
         per_task[t] = dict(auroc=auroc, auprc=auprc, f1=f1, precision=precision,
-                           recall=recall, specificity=specificity, n_pos=n_pos)
+                           recall=recall, specificity=specificity, n_pos=n_pos,
+                           threshold=float(thr_row[k]))
         for key, val in (("auroc", auroc), ("auprc", auprc), ("f1", f1),
                          ("precision", precision), ("recall", recall),
                          ("specificity", specificity)):
@@ -981,7 +994,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     monitor = es.get("monitor", "val_mean_auroc")     # which metric drives best + early-stop
     mode = es.get("mode", "max")                       # "max" | "min"
     better = (lambda a, b: a > b) if mode == "max" else (lambda a, b: a < b)
-    summary_path = results_dir / out.get("summary_json", "summary.json")
+    summary_path = results_dir / out.get("summary_json", "training_summary.json")
 
     # --- resumable state ---
     start_epoch, global_step = 0, 0
@@ -1227,12 +1240,18 @@ _MODAL_PIP = [
 ]
 
 
-def modal_image():
+def modal_image(python_version: str = "3.11"):
     """Build the Modal container image: pip deps + the whole training_scripts/
-    source tree (code + YAML configs), excluding local run artifacts."""
+    source tree (code + YAML configs), excluding local run artifacts.
+
+    python_version : the container's Python. For functions shipped with
+    serialized=True (the eval/calibration scripts launched via `python ... +
+    app.run()`), this MUST match the LOCAL interpreter's version, so those
+    scripts pass their own version. Training (`modal run`) doesn't need a match
+    and keeps the 3.11 default."""
     import modal
     return (
-        modal.Image.debian_slim(python_version="3.11")
+        modal.Image.debian_slim(python_version=python_version)
         .pip_install(*_MODAL_PIP)
         .add_local_dir(
             str(PKG_DIR), remote_path="/root/training_scripts",
@@ -1259,6 +1278,567 @@ def remote_cfg(cfg: dict) -> dict:
     rc["paths"]["data_root"] = m["remote_data_root"]
     rc["paths"]["data_dir"] = m["remote_data_dir"]
     return rc
+
+
+# =============================================================================
+# Section 6 — Plots from the training logs (post-hoc, CPU-only)
+# Reads the two CSVs a run produces (train_log.csv + val_log.csv) and writes a
+# set of PNGs to results/<plots>/.  No torch / GPU needed.  Each plot is wrapped
+# so one failure never aborts the rest.  Reused unchanged by every experiment.
+# =============================================================================
+
+def _smooth(series, window: int):
+    """Trailing rolling mean (min_periods=1 so the head isn't dropped)."""
+    if window and window > 1:
+        return series.rolling(window, min_periods=1).mean()
+    return series
+
+
+def _epoch_boundary_steps(train_df) -> list:
+    """Global steps at which a NEW epoch begins (after the first) — drawn as
+    faint vertical guides so the curves are readable per epoch."""
+    steps = []
+    if "epoch" in train_df.columns:
+        prev = None
+        for st, ep in zip(train_df["step"], train_df["epoch"]):
+            if prev is not None and ep != prev:
+                steps.append(st)
+            prev = ep
+    return steps
+
+
+def _vlines(ax, steps):
+    """Faint grey vertical guides at the given x positions (epoch boundaries)."""
+    for s in steps:
+        ax.axvline(s, color="0.85", lw=0.8, zorder=0)
+
+
+def _mark_extreme(ax, x, y, mode: str = "max"):
+    """Star + annotate the best point of a metric curve (max or min)."""
+    y = np.asarray(y, dtype=float)
+    if len(y) == 0 or np.all(np.isnan(y)):
+        return
+    idx = int(np.nanargmax(y)) if mode == "max" else int(np.nanargmin(y))
+    xi = float(np.asarray(x)[idx])
+    ax.scatter([xi], [y[idx]], marker="*", s=220, color="crimson", zorder=6)
+    ax.annotate(f"best={y[idx]:.4f}\n@ step {int(xi)}", (xi, y[idx]),
+                textcoords="offset points", xytext=(8, -12), fontsize=8,
+                color="crimson")
+
+
+def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
+               smooth_window: int = 50, dpi: int = 130):
+    """Render the training-curve PNGs for one finished/running experiment.
+
+    Inputs : results_dir/<train_log_csv> and results_dir/<val_log_csv>.
+    Outputs: results_dir/<out_subdir>/*.png  (one concept per file):
+        loss_curves, mean_auroc, mean_auprc, per_task_auroc, per_task_auprc,
+        macro_f1_precision_recall, training_diagnostics (lr/img-s/grad-norm).
+    """
+    import matplotlib
+    matplotlib.use("Agg")                 # headless: write files, never open a window
+    import matplotlib.pyplot as plt
+
+    results_dir = Path(results_dir)
+    out = cfg["output"]
+    tasks = cfg["tasks"]
+    name = cfg.get("experiment", {}).get("name", "experiment")
+    plots_dir = results_dir / out_subdir
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    train_path = results_dir / out["train_log_csv"]
+    val_path = results_dir / out["val_log_csv"]
+    print("=" * 70)
+    print(f"[make_plots] {name}")
+    print(f"  train log : {train_path}")
+    print(f"  val   log : {val_path}")
+    print(f"  output    : {plots_dir}")
+
+    train_df = pd.read_csv(train_path) if train_path.exists() else None
+    val_df = pd.read_csv(val_path) if val_path.exists() else None
+    if train_df is None:
+        print("  ⚠️  no train_log.csv — skipping train-based plots")
+    if val_df is None:
+        print("  ⚠️  no val_log.csv — skipping validation-based plots")
+
+    bsteps = _epoch_boundary_steps(train_df) if train_df is not None else []
+    saved = []
+
+    def _save(fig, fname):
+        path = plots_dir / fname
+        fig.tight_layout()
+        fig.savefig(path, dpi=dpi)
+        plt.close(fig)
+        saved.append(fname)
+        print(f"  ✅ {fname}")
+
+    # 1) loss curves — train (raw + smoothed) and validation, vs global step
+    def _plot_loss():
+        if train_df is None and val_df is None:
+            return
+        fig, ax = plt.subplots(figsize=(9, 5))
+        if train_df is not None:
+            ax.plot(train_df["step"], train_df["train_loss"], color="tab:blue",
+                    alpha=0.25, lw=0.8, label="train (raw)")
+            ax.plot(train_df["step"], _smooth(train_df["train_loss"], smooth_window),
+                    color="tab:blue", lw=1.8, label=f"train (smooth {smooth_window})")
+        if val_df is not None:
+            ax.plot(val_df["step"], val_df["val_loss"], color="tab:orange",
+                    marker="o", ms=4, lw=1.6, label="validation")
+        _vlines(ax, bsteps)
+        ax.set_xlabel("global step"); ax.set_ylabel("BCE loss")
+        ax.set_title(f"{name} — loss"); ax.legend(); ax.grid(True, alpha=0.3)
+        _save(fig, "loss_curves.png")
+
+    # 2/3) a single macro metric vs step (best point starred)
+    def _plot_macro_metric(col, title, fname, mode="max"):
+        if val_df is None or col not in val_df.columns:
+            return
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(val_df["step"], val_df[col], color="tab:green",
+                marker="o", ms=4, lw=1.8)
+        _mark_extreme(ax, val_df["step"].values, val_df[col].values, mode)
+        _vlines(ax, bsteps)
+        ax.set_xlabel("global step"); ax.set_ylabel(col)
+        ax.set_title(f"{name} — {title}"); ax.grid(True, alpha=0.3)
+        _save(fig, fname)
+
+    # 4/5) per-task curves (one line per pathology) for a given metric prefix
+    def _plot_per_task(prefix, title, fname):
+        if val_df is None:
+            return
+        cols = [f"{prefix}/{t}" for t in tasks if f"{prefix}/{t}" in val_df.columns]
+        if not cols:
+            return
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for t in tasks:
+            c = f"{prefix}/{t}"
+            if c in val_df.columns:
+                ax.plot(val_df["step"], val_df[c], marker="o", ms=3, lw=1.5, label=t)
+        _vlines(ax, bsteps)
+        ax.set_xlabel("global step"); ax.set_ylabel(prefix.upper())
+        ax.set_title(f"{name} — {title}")
+        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+        _save(fig, fname)
+
+    # 6) macro F1 / precision / recall together (all 0–1, one figure)
+    def _plot_macro_fpr():
+        if val_df is None:
+            return
+        series = [("mean_f1", "F1", "tab:purple"),
+                  ("mean_precision", "precision", "tab:red"),
+                  ("mean_recall", "recall", "tab:blue")]
+        series = [s for s in series if s[0] in val_df.columns]
+        if not series:
+            return
+        fig, ax = plt.subplots(figsize=(9, 5))
+        for col, lbl, color in series:
+            ax.plot(val_df["step"], val_df[col], marker="o", ms=3, lw=1.6,
+                    color=color, label=lbl)
+        _vlines(ax, bsteps)
+        ax.set_xlabel("global step"); ax.set_ylabel("score @ 0.5")
+        ax.set_title(f"{name} — macro F1 / precision / recall (threshold 0.5)")
+        ax.legend(); ax.grid(True, alpha=0.3)
+        _save(fig, "macro_f1_precision_recall.png")
+
+    # 7) training diagnostics: LR / throughput / grad-norm (3 stacked panels)
+    def _plot_diagnostics():
+        if train_df is None:
+            return
+        fig, axes = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
+        axes[0].plot(train_df["step"], train_df["lr"], color="tab:blue", lw=1.5)
+        axes[0].set_ylabel("learning rate"); axes[0].set_title(f"{name} — training diagnostics")
+        if "imgs_per_s" in train_df.columns:
+            axes[1].plot(train_df["step"], train_df["imgs_per_s"], color="tab:gray",
+                         alpha=0.3, lw=0.8)
+            axes[1].plot(train_df["step"], _smooth(train_df["imgs_per_s"], smooth_window),
+                         color="tab:green", lw=1.6)
+        axes[1].set_ylabel("images / sec")
+        if "grad_norm" in train_df.columns:
+            axes[2].plot(train_df["step"], train_df["grad_norm"], color="tab:gray",
+                         alpha=0.3, lw=0.8)
+            axes[2].plot(train_df["step"], _smooth(train_df["grad_norm"], smooth_window),
+                         color="tab:red", lw=1.6)
+        axes[2].set_ylabel("grad norm"); axes[2].set_xlabel("global step")
+        for ax in axes:
+            _vlines(ax, bsteps); ax.grid(True, alpha=0.3)
+        _save(fig, "training_diagnostics.png")
+
+    _safe("plot:loss", _plot_loss)
+    _safe("plot:mean_auroc", _plot_macro_metric,
+          "mean_auroc", "validation mean AUROC", "mean_auroc.png", "max")
+    _safe("plot:mean_auprc", _plot_macro_metric,
+          "mean_auprc", "validation mean AUPRC", "mean_auprc.png", "max")
+    _safe("plot:per_task_auroc", _plot_per_task, "auroc", "per-task AUROC", "per_task_auroc.png")
+    _safe("plot:per_task_auprc", _plot_per_task, "auprc", "per-task AUPRC", "per_task_auprc.png")
+    _safe("plot:macro_fpr", _plot_macro_fpr)
+    _safe("plot:diagnostics", _plot_diagnostics)
+
+    print(f"[make_plots] wrote {len(saved)} plot(s) -> {plots_dir}")
+    print("=" * 70)
+    return saved
+
+
+# =============================================================================
+# Section 7 — Official-set evaluation (final test)
+# Loads best.pt and scores it on the official radiologist sets (valid200 and
+# test500) INDEPENDENTLY, using the exact same data layer + metrics as training
+# (cfg drives CLAHE / u_policy / image geometry, so each arm is scored fairly).
+# Writes results/<set>_results.json (source of truth) + a readable .txt twin.
+# =============================================================================
+
+_REPORT_KEYS = ("auroc", "auprc", "f1", "precision", "recall", "specificity")
+
+
+def _json_safe(obj):
+    """Recursively make a dict JSON-valid: non-finite floats -> None (null)."""
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, (np.floating,)):
+        v = float(obj)
+        return v if math.isfinite(v) else None
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    return obj
+
+
+@torch.no_grad()
+def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
+                       channels_last: bool, batch_size: int, num_workers: int):
+    """Run the model over one dataframe (split='val' -> no augmentation) and
+    return (y_true (N,T), y_prob (N,T), mean_loss)."""
+    ds = CheXpertDataset(df, cfg, split="val")
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False,
+                        num_workers=num_workers, pin_memory=(device.type == "cuda"))
+    model.eval()
+    total_loss, n = 0.0, 0
+    ys, ps = [], []
+    for imgs, labels in loader:
+        imgs = imgs.to(device, non_blocking=True)
+        if channels_last:
+            imgs = imgs.to(memory_format=torch.channels_last)
+        labels = labels.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, enabled=amp):
+            logits = model(imgs)
+            loss = loss_fn(logits, labels)
+        bs = imgs.size(0)
+        total_loss += loss.item() * bs
+        n += bs
+        ys.append(labels.detach().cpu().numpy())
+        ps.append(torch.sigmoid(logits).float().detach().cpu().numpy())
+    return np.concatenate(ys), np.concatenate(ps), total_loss / max(1, n)
+
+
+def _load_ckpt_weights(model, ckpt_dir: Path, checkpoint, device):
+    """Load `checkpoint` (best | last | <step> | path) weights into `model`.
+    best.pt holds a plain, un-compiled state dict (see _unwrap). Returns
+    (ckpt_dict, ckpt_path)."""
+    ckpt_path = _resolve_resume(checkpoint, ckpt_dir)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    _unwrap(model).load_state_dict(ckpt["model"])
+    return ckpt, ckpt_path
+
+
+# ---- threshold calibration (max-F1 per task, on the validation set) ----------
+
+def _best_f1_threshold(y_true_col, y_prob_col) -> tuple:
+    """Threshold that maximizes F1 for one task, found exactly from the
+    precision-recall curve. Degenerate tasks (no pos or no neg) -> 0.5.
+    Returns (threshold, f1_at_threshold)."""
+    yt = np.asarray(y_true_col)
+    yp = np.asarray(y_prob_col)
+    n_pos = int(yt.sum())
+    if n_pos == 0 or n_pos == len(yt):
+        return 0.5, float("nan")
+    prec, rec, thr = precision_recall_curve(yt, yp)
+    # prec/rec are len(thr)+1; the trailing point (recall=0) has no threshold.
+    f1 = 2 * prec * rec / (prec + rec + 1e-12)
+    f1 = f1[:-1]
+    if len(f1) == 0 or np.all(np.isnan(f1)):
+        return 0.5, float("nan")
+    best = int(np.nanargmax(f1))
+    return float(thr[best]), float(f1[best])
+
+
+def calibrate_thresholds(cfg, model, df_val, device, amp: bool = False,
+                         batch_size: int = None, num_workers: int = 0) -> tuple:
+    """Run the model over the validation dataframe and pick the per-task max-F1
+    threshold for each pathology. Returns (thresholds_dict, y_true, y_prob) so
+    the caller can also report the val metrics achieved at those thresholds."""
+    tasks = cfg["tasks"]
+    if batch_size is None:
+        batch_size = int(cfg["dataloader"].get("val_batch_size",
+                         cfg["dataloader"]["batch_size"]))
+    loss_fn = build_loss(cfg, device)
+    print(f"[calibrate] inference over {len(df_val)} validation images "
+          f"(bs={batch_size}, workers={num_workers}) ...")
+    y_true, y_prob, _ = _predict_dataframe(
+        cfg, model, df_val, device, loss_fn, amp, channels_last=False,
+        batch_size=batch_size, num_workers=num_workers)
+    thresholds = {}
+    for k, t in enumerate(tasks):
+        thr, _f1 = _best_f1_threshold(y_true[:, k], y_prob[:, k])
+        thresholds[t] = thr
+    return thresholds, y_true, y_prob
+
+
+def _threshold_payload(cfg, thresholds, y_true, y_prob, ckpt, ckpt_path,
+                       n_val: int, objective: str = "f1") -> tuple:
+    """Build the thresholds.json payload (+ the val metrics at those thresholds
+    for printing). Returns (payload_dict, val_metrics_dict)."""
+    tasks = cfg["tasks"]
+    thr_vec = [thresholds[t] for t in tasks]
+    metrics = compute_metrics(y_true, y_prob, tasks, threshold=thr_vec)
+    payload = {
+        "experiment": cfg.get("experiment", {}).get("name"),
+        "objective": objective,
+        "scope": "per_task",
+        "calibration_set": cfg["paths"]["val_csv"],
+        "checkpoint": str(ckpt_path),
+        "checkpoint_step": ckpt.get("global_step"),
+        "checkpoint_epoch": ckpt.get("epoch"),
+        "n_val_images": int(n_val),
+        "thresholds": {t: float(thresholds[t]) for t in tasks},
+        "val_metrics_at_threshold": {"macro": metrics["macro"],
+                                     "per_task": metrics["per_task"]},
+        "calibrated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    return payload, metrics
+
+
+def _thresholds_path(results_dir: Path, cfg) -> Path:
+    return Path(results_dir) / cfg["output"].get("thresholds_json", "thresholds.json")
+
+
+def load_thresholds(results_dir: Path, cfg) -> tuple:
+    """Read frozen per-task thresholds from results/thresholds.json.
+    Returns ({task: threshold}, path) or (None, path) if absent/incomplete."""
+    path = _thresholds_path(results_dir, cfg)
+    if not path.exists():
+        return None, path
+    data = json.load(open(path, encoding="utf-8"))
+    thr = data.get("thresholds", {})
+    tasks = cfg["tasks"]
+    if not all(t in thr for t in tasks):
+        return None, path
+    return {t: float(thr[t]) for t in tasks}, path
+
+
+def run_calibration(cfg, model, experiment_dir, device=None, checkpoint: str = "best",
+                    amp: bool = False, batch_size: int = None, num_workers: int = 0,
+                    objective: str = "f1") -> dict:
+    """Calibrate per-task thresholds on the validation set and SAVE them to
+    results/thresholds.json (the frozen decision rule applied at test time).
+    Prints the chosen thresholds + the val metrics they achieve. Returns the
+    {task: threshold} dict.
+
+    NOTE: thresholds are model-specific — re-run this for every experiment /
+    checkpoint. The PROCEDURE (max-F1 on 01_val.csv) is what stays identical
+    across arms, keeping the comparison fair."""
+    experiment_dir = Path(experiment_dir)
+    out = cfg["output"]
+    tasks = cfg["tasks"]
+    results_dir = experiment_dir / out["run_dir"]
+    ckpt_dir = results_dir / out["checkpoints_dir"]
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print("#" * 70)
+    print(f"# 🎚️  threshold calibration: {cfg.get('experiment', {}).get('name')}")
+    print(f"# 🖥️  device={device}  objective={objective}  scope=per_task  "
+          f"set={cfg['paths']['val_csv']}")
+    print("#" * 70)
+
+    ckpt, ckpt_path = _load_ckpt_weights(model, ckpt_dir, checkpoint, device)
+    model = model.to(device)
+    print(f"[calibrate] checkpoint: {ckpt_path}  (step={ckpt.get('global_step')}, "
+          f"epoch={ckpt.get('epoch')})")
+
+    val_csv = Path(cfg["paths"]["data_dir"]) / cfg["paths"]["val_csv"]
+    df_val = pd.read_csv(val_csv)
+    thresholds, y_true, y_prob = calibrate_thresholds(
+        cfg, model, df_val, device, amp, batch_size, num_workers)
+    payload, metrics = _threshold_payload(
+        cfg, thresholds, y_true, y_prob, ckpt, ckpt_path, len(df_val), objective)
+
+    # print a tidy per-task table (threshold + the val scores it yields)
+    print("-" * 78)
+    print(f"  {'task':<18}{'thr':>7}{'F1':>8}{'Prec':>8}{'Rec':>8}{'AUROC':>8}{'AUPRC':>8}")
+    for t in tasks:
+        m = metrics["per_task"][t]
+        def f(x):
+            return f"{x:.4f}" if isinstance(x, float) and math.isfinite(x) else "  nan"
+        print(f"  {t:<18}{thresholds[t]:>7.3f}{f(m['f1']):>8}{f(m['precision']):>8}"
+              f"{f(m['recall']):>8}{f(m['auroc']):>8}{f(m['auprc']):>8}")
+    print("-" * 78)
+    mac = metrics["macro"]
+    print(f"  macro @ thresholds : F1={mac['mean_f1']:.4f}  P={mac['mean_precision']:.4f}  "
+          f"R={mac['mean_recall']:.4f}   (AUROC={mac['mean_auroc']:.4f} threshold-free)")
+
+    path = _thresholds_path(results_dir, cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(_json_safe(payload), fh, indent=2)
+    print(f"  💾 saved frozen thresholds -> {path}")
+    print("#" * 70)
+    print("# 🏁 calibration done.")
+    print("#" * 70)
+    return thresholds
+
+
+# ---- official-set scoring (applies the frozen per-task thresholds) -----------
+
+def _render_report_txt(report: dict) -> str:
+    """Human-readable rendering of one set's report dict."""
+    L = []
+    name, s = report["experiment"], report["set"]
+    L.append("=" * 86)
+    L.append(f"OFFICIAL EVAL — {s}   ({report['csv']})")
+    L.append("=" * 86)
+    L.append(f"  experiment : {name}")
+    L.append(f"  checkpoint : {report['checkpoint']}")
+    L.append(f"  images     : {report['n_images']}    device: {report['device']}    "
+             f"amp: {report['amp']}")
+    L.append(f"  use_clahe  : {report['use_clahe']}    u_policy: {report['u_policy']}    "
+             f"val_loss: {report['val_loss']:.5f}")
+    L.append(f"  thresholds : per-task ({report['threshold_objective']}-optimal on "
+             f"{report['threshold_source']})")
+    macro = report["macro"]
+    L.append("-" * 86)
+    L.append("  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]")
+    L.append(f"    mean AUROC : {macro['mean_auroc']:.4f}        mean AUPRC : {macro['mean_auprc']:.4f}")
+    L.append(f"    mean F1    : {macro['mean_f1']:.4f}    "
+             f"mean precision: {macro['mean_precision']:.4f}    "
+             f"mean recall: {macro['mean_recall']:.4f}    "
+             f"mean spec: {macro['mean_specificity']:.4f}")
+    L.append("-" * 86)
+    L.append("  PER-TASK")
+    L.append(f"    {'task':<18}{'thr':>7}{'AUROC':>8}{'AUPRC':>8}{'F1':>8}"
+             f"{'Prec':>8}{'Rec':>8}{'Spec':>8}{'n_pos':>8}")
+    for t, m in report["per_task"].items():
+        def f(x):
+            return f"{x:.4f}" if isinstance(x, float) and math.isfinite(x) else "  nan"
+        L.append(f"    {t:<18}{m['threshold']:>7.3f}{f(m['auroc']):>8}{f(m['auprc']):>8}"
+                 f"{f(m['f1']):>8}{f(m['precision']):>8}{f(m['recall']):>8}"
+                 f"{f(m['specificity']):>8}{m['n_pos']:>8}")
+    L.append("=" * 86)
+    return "\n".join(L)
+
+
+def evaluate_official(cfg: dict, model, experiment_dir, device=None,
+                      checkpoint: str = "best", amp: bool = False,
+                      batch_size: int = None, num_workers: int = 0,
+                      objective: str = "f1"):
+    """Load `checkpoint` (default best.pt) and score it on the official sets
+    (valid200 + test500) INDEPENDENTLY, applying the FROZEN per-task thresholds
+    from results/thresholds.json (calibrated on the validation set). If that file
+    is missing it is calibrated now (on 01_val.csv) and saved, so eval is always
+    self-contained. AUROC/AUPRC are threshold-free. For each set writes:
+        results/<set>_results.json   (source of truth)
+        results/<set>_results.txt    (readable twin)
+    Returns {set_name: report_dict}. num_workers defaults to 0 (the official
+    sets are tiny and 0 avoids Windows multiprocessing re-import issues)."""
+    experiment_dir = Path(experiment_dir)
+    out = cfg["output"]
+    tasks = cfg["tasks"]
+    results_dir = experiment_dir / out["run_dir"]
+    ckpt_dir = results_dir / out["checkpoints_dir"]
+    data_dir = Path(cfg["paths"]["data_dir"])
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if batch_size is None:
+        batch_size = int(cfg["dataloader"].get("val_batch_size",
+                         cfg["dataloader"]["batch_size"]))
+
+    print("#" * 70)
+    print(f"# 🧪 official evaluation: {cfg.get('experiment', {}).get('name')}")
+    print(f"# 🖥️  device={device}  amp={amp}  "
+          f"use_clahe={cfg['clahe']['use_clahe']}  u_policy={cfg['labels']['u_policy']}")
+    print("#" * 70)
+
+    ckpt, ckpt_path = _load_ckpt_weights(model, ckpt_dir, checkpoint, device)
+    model = model.to(device)
+    print(f"[eval] loaded checkpoint: {ckpt_path}")
+    print(f"[eval] checkpoint was step={ckpt.get('global_step')}  "
+          f"epoch={ckpt.get('epoch')}  best_score={ckpt.get('best_score')}")
+
+    # frozen per-task thresholds: load the saved file, else calibrate now + save.
+    thr_map, thr_path = load_thresholds(results_dir, cfg)
+    if thr_map is None:
+        print(f"  ⚠️  no usable {thr_path.name} — calibrating per-task thresholds now "
+              f"on {cfg['paths']['val_csv']} ...")
+        df_val = pd.read_csv(data_dir / cfg["paths"]["val_csv"])
+        thr_map, y_t, y_p = calibrate_thresholds(
+            cfg, model, df_val, device, amp, batch_size, num_workers)
+        payload, _ = _threshold_payload(
+            cfg, thr_map, y_t, y_p, ckpt, ckpt_path, len(df_val), objective)
+        thr_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(thr_path, "w", encoding="utf-8") as fh:
+            json.dump(_json_safe(payload), fh, indent=2)
+        print(f"  💾 saved frozen thresholds -> {thr_path}")
+    else:
+        print(f"[eval] using frozen thresholds from {thr_path}")
+    thr_vec = [thr_map[t] for t in tasks]
+    print(f"[eval] per-task thresholds: "
+          + "  ".join(f"{t}={thr_map[t]:.3f}" for t in tasks))
+
+    loss_fn = build_loss(cfg, device)
+    sets = [("valid200", cfg["paths"]["valid200_csv"]),
+            ("test500", cfg["paths"]["test500_csv"])]
+
+    reports = {}
+    for set_name, csv_name in sets:
+        csv_path = data_dir / csv_name
+        print("=" * 70)
+        print(f"🧪 evaluating on {set_name}  ({csv_path})")
+        if not csv_path.exists():
+            print(f"  ⚠️  CSV not found — skipping {set_name}")
+            continue
+        df = pd.read_csv(csv_path)
+        print(f"  rows: {len(df)}  ->  running inference ...")
+        y_true, y_prob, val_loss = _predict_dataframe(
+            cfg, model, df, device, loss_fn, amp, channels_last=False,
+            batch_size=batch_size, num_workers=num_workers)
+        metrics = compute_metrics(y_true, y_prob, tasks, threshold=thr_vec)
+
+        report = {
+            "experiment": cfg.get("experiment", {}).get("name"),
+            "set": set_name,
+            "csv": csv_name,
+            "checkpoint": str(ckpt_path),
+            "checkpoint_step": ckpt.get("global_step"),
+            "checkpoint_epoch": ckpt.get("epoch"),
+            "n_images": int(len(df)),
+            "device": str(device),
+            "amp": bool(amp),
+            "threshold_objective": objective,
+            "threshold_source": cfg["paths"]["val_csv"],
+            "thresholds": {t: float(thr_map[t]) for t in tasks},
+            "use_clahe": bool(cfg["clahe"]["use_clahe"]),
+            "u_policy": cfg["labels"]["u_policy"],
+            "val_loss": float(val_loss),
+            "macro": metrics["macro"],
+            "per_task": metrics["per_task"],
+            "evaluated_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        json_path = results_dir / f"{set_name}_results.json"
+        txt_path = results_dir / f"{set_name}_results.txt"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(_json_safe(report), f, indent=2)
+        txt = _render_report_txt(report)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(txt + "\n")
+        print(txt)
+        print(f"  💾 {json_path}")
+        print(f"  💾 {txt_path}")
+        reports[set_name] = report
+
+    print("#" * 70)
+    print(f"# 🏁 official evaluation done — {len(reports)} set(s) scored.")
+    print("#" * 70)
+    return reports
 
 
 if __name__ == "__main__":

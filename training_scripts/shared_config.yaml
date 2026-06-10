@@ -103,7 +103,7 @@ output:
   best_name:       "best.pt"
   train_log_csv:   "train_log.csv"
   val_log_csv:     "val_log.csv"
-  summary_json:    "summary.json"      # best-so-far metrics snapshot (live)
+  summary_json:    "training_summary.json"   # best-so-far metrics snapshot (live)
   console_capture_dir: "train_config"
   console_log_every: 20
   checkpoint_every_steps: 300

@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — test500   (01_test500.csv)
+======================================================================================
+  experiment : resnet50_without_clahe
+  checkpoint : /runs/resnet50_without_clahe/results/checkpoints/best.pt
+  images     : 668    device: cuda    amp: False
+  use_clahe  : False    u_policy: ones    val_loss: 0.37100
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8453        mean AUPRC : 0.5760
+    mean F1    : 0.4828    mean precision: 0.4855    mean recall: 0.6661    mean spec: 0.7849
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.246  0.8106  0.5947  0.5907  0.4500  0.8596  0.6184     178
+    Cardiomegaly        0.239  0.8521  0.7287  0.5103  0.9118  0.3543  0.9878     175
+    Consolidation       0.215  0.7154  0.0960  0.1556  0.0901  0.5714  0.6809      35
+    Edema               0.322  0.9148  0.6471  0.5876  0.5652  0.6118  0.9314      85
+    Pleural Effusion    0.358  0.9336  0.8137  0.5700  0.4103  0.9333  0.7062     120
+======================================================================================

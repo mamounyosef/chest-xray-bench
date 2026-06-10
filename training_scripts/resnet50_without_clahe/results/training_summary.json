@@ -1,0 +1,23 @@
+{
+  "experiment": "resnet50_without_clahe",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.7993646187170069,
+  "best_step": 10000,
+  "best_epoch": 4,
+  "best_metrics": {
+    "mean_auroc": 0.7993646187170069,
+    "mean_auprc": 0.5951750690716486,
+    "mean_f1": 0.45178772642528386,
+    "mean_precision": 0.6319498393764384,
+    "mean_recall": 0.39500127888879016,
+    "mean_specificity": 0.9163848942279845,
+    "val_loss": 0.4422550827233579
+  },
+  "last_step": 16000,
+  "total_steps": 40305,
+  "elapsed_sec": 7707.58,
+  "elapsed_human": "2h 08m",
+  "updated": "2026-06-08T22:45:53"
+}
