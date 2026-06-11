@@ -1,0 +1,23 @@
+{
+  "experiment": "resnet50_u_zeros",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.7990184569814928,
+  "best_step": 10800,
+  "best_epoch": 5,
+  "best_metrics": {
+    "mean_auroc": 0.7990184569814928,
+    "mean_auprc": 0.4862195091528491,
+    "mean_f1": 0.3698914553066325,
+    "mean_precision": 0.6307257822315439,
+    "mean_recall": 0.3344840491881408,
+    "mean_specificity": 0.9340326884640028,
+    "val_loss": 0.3516577416939261
+  },
+  "last_step": 18000,
+  "total_steps": 40305,
+  "elapsed_sec": 9535.36,
+  "elapsed_human": "2h 38m",
+  "updated": "2026-06-10T14:06:52"
+}
