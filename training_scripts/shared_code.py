@@ -722,6 +722,30 @@ def print_config(cfg: dict):
     print("=" * 70)
 
 
+def print_model_summary(model, cfg: dict):
+    """Comprehensive model summary at startup: class, output logits, and the
+    total / trainable / frozen parameter counts. Counting trainable separately
+    means any later layer-freezing (e.g. freezing a pretrained backbone) shows
+    up here automatically. Uses the unwrapped module so a torch.compile wrapper
+    doesn't affect the figures."""
+    m = _unwrap(model)
+    total = sum(p.numel() for p in m.parameters())
+    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    frozen = total - trainable
+    pct = (100.0 * trainable / total) if total else 0.0
+    print("=" * 70)
+    print("MODEL")
+    print("=" * 70)
+    print(f"  architecture      : {cfg.get('model', {}).get('name', type(m).__name__)}"
+          f"  ({type(m).__name__})")
+    print(f"  pretrained        : {cfg.get('model', {}).get('pretrained')}")
+    print(f"  output logits     : {len(cfg['tasks'])}  (one per task)")
+    print(f"  total params      : {total:,}  ({total / 1e6:.2f} M)")
+    print(f"  trainable params  : {trainable:,}  ({trainable / 1e6:.2f} M, {pct:.1f}%)")
+    print(f"  frozen params     : {frozen:,}  ({frozen / 1e6:.2f} M)")
+    print("=" * 70)
+
+
 @torch.no_grad()
 def validate(model, val_loader, loss_fn, cfg, device, amp: bool,
              channels_last: bool = False) -> tuple:
@@ -845,7 +869,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                     cfg: dict = None, debug_dir=None, debug_every: int = 0,
                     channels_last: bool = False,
                     checkpoint_fn=None, checkpoint_every: int = 0,
-                    scheduler=None) -> tuple:
+                    scheduler=None, n_epochs: int = 0) -> tuple:
     """One epoch of training. Logs every step (loss/lr/grad_norm/throughput/elapsed/eta)
     and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop)."""
     model.train()
@@ -900,7 +924,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             # epochs via a function attribute); empty on the very first print.
             d_loss = _fmt_delta(cur_loss, getattr(train_one_epoch, "_last_print_loss", None))
             train_one_epoch._last_print_loss = cur_loss
-            print(f"  Epoch {epoch + 1}  epoch_step: {i}/{n_batches}  "
+            print(f"  Epoch {epoch + 1}/{n_epochs}  epoch_step: {i}/{n_batches}  "
                   f"global_step: {global_step}/{total_steps}  "
                   f"loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
                   f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}")
@@ -964,9 +988,16 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     # --- data / model / optim ---
     train_loader, val_loader = make_loaders(cfg)
     model = model.to(device)
+    print_model_summary(model, cfg)
 
     # performance options (CUDA-only)
     perf = cfg.get("performance", {})
+    # TF32: let fp32 matmuls use tensor cores (Ampere+). Reproducibility-neutral
+    # (still deterministic) and lossless in practice for CNN training; under AMP
+    # the heavy ops are already fp16, so this only speeds the residual fp32 path.
+    tf32 = device.type == "cuda"
+    if tf32:
+        torch.set_float32_matmul_precision("high")
     channels_last = bool(perf.get("channels_last")) and device.type == "cuda"
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
@@ -982,7 +1013,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     print(f"[setup] optimizer=AdamW  scheduler={cfg['training']['scheduler']['name']}  amp={amp}")
     print(f"[setup] channels_last={channels_last}  compile={do_compile}"
           f"{' (mode=' + perf.get('compile_mode', 'default') + ')' if do_compile else ''}"
-          f"  fused_adamw={bool(perf.get('fused_optimizer')) and device.type == 'cuda'}")
+          f"  fused_adamw={bool(perf.get('fused_optimizer')) and device.type == 'cuda'}"
+          f"  tf32={tf32}")
 
     # --- training params ---
     epochs = cfg["training"]["epochs"]
@@ -1067,7 +1099,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     # --- validation + checkpoint + early-stop, shared by step- and epoch-eval ---
     def on_eval(epoch: int, gstep: int) -> bool:
         print("=" * 70)
-        print(f"🔎 VALIDATION START — epoch {epoch + 1}  step {gstep}  "
+        print(f"🔎 VALIDATION START — epoch {epoch + 1}/{epochs}  step {gstep}  "
               f"({len(val_loader)} batches, {len(val_loader.dataset)} images) ...")
         val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device, amp, channels_last)
         macro = metrics["macro"]
@@ -1080,7 +1112,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
 
         d_val_loss = _fmt_delta(val_loss, track["prev_val_loss"])   # vs last validation
         print("-" * 70)
-        print(f"  🔎 [VAL] epoch={epoch + 1} step={gstep}  elapsed={fmt_duration(elapsed())}  "
+        print(f"  🔎 [VAL] epoch={epoch + 1}/{epochs} step={gstep}  elapsed={fmt_duration(elapsed())}  "
               f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}{d_val_loss}")
         pm = track["prev_macro"]            # previous validation's macro (None on 1st)
         def _d(key):                        # delta vs last validation for a macro key
@@ -1160,7 +1192,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             cfg=cfg, debug_dir=debug_dir, debug_every=debug_every,
             channels_last=channels_last,
             checkpoint_fn=save_periodic, checkpoint_every=ckpt_every,
-            scheduler=(scheduler if sched_mode == "step" else None))
+            scheduler=(scheduler if sched_mode == "step" else None),
+            n_epochs=epochs)
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)

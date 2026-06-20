@@ -3,6 +3,7 @@ debugged_images/
 checkpoints/
 train_config/
 
+densenet121/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
