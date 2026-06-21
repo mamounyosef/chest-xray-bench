@@ -1,5 +1,6 @@
 # =============================================================================
-# config.yaml  —  experiment: densenet121   (DenseNet-121 baseline: CLAHE off, U-Ones)
+# config.yaml  —  experiment: densenet121_seed7
+#   (EXACT copy of densenet121; ONLY the RNG seed differs -> seed=7)
 # -----------------------------------------------------------------------------
 # Holds only what VARIES per experiment. Common settings (paths, tasks, image,
 # augmentation, reproducibility, output) come from ../shared_config.yaml and are
@@ -7,7 +8,15 @@
 # =============================================================================
 
 experiment:
-  name: "densenet121"
+  name: "densenet121_seed7"
+
+# ----------------------------------------------------------------------------
+# Reproducibility  —  per-experiment SEED override (the ONLY thing that varies
+# vs. densenet121). deterministic stays true (from shared_config). This is a
+# seed-sensitivity run: identical setup, different RNG seed.
+# ----------------------------------------------------------------------------
+reproducibility:
+  seed: 7
 
 model:
   name: "densenet121"       # torchvision densenet121

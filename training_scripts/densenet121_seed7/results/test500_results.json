@@ -1,0 +1,89 @@
+{
+  "experiment": "densenet121_seed7",
+  "set": "test500",
+  "csv": "01_test500.csv",
+  "checkpoint": "/runs/densenet121_seed7/results/checkpoints/best.pt",
+  "checkpoint_step": 10200,
+  "checkpoint_epoch": 3,
+  "n_images": 668,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "01_val.csv",
+  "thresholds": {
+    "Atelectasis": 0.2678236663341522,
+    "Cardiomegaly": 0.25282806158065796,
+    "Consolidation": 0.17416374385356903,
+    "Edema": 0.222560316324234,
+    "Pleural Effusion": 0.3242517113685608
+  },
+  "use_clahe": false,
+  "u_policy": "ones",
+  "val_loss": 0.3625059470445096,
+  "macro": {
+    "mean_auroc": 0.8618621402313907,
+    "mean_auprc": 0.5922203630257996,
+    "mean_f1": 0.49455256243905943,
+    "mean_precision": 0.48153538727453016,
+    "mean_recall": 0.7397683253076511,
+    "mean_specificity": 0.7895736357203159
+  },
+  "per_task": {
+    "Atelectasis": {
+      "auroc": 0.8420316441183214,
+      "auprc": 0.6126366030078074,
+      "f1": 0.6651685393258427,
+      "precision": 0.5543071161048689,
+      "recall": 0.8314606741573034,
+      "specificity": 0.7571428571428571,
+      "n_pos": 178,
+      "n_excluded": 0,
+      "threshold": 0.2678236663341522
+    },
+    "Cardiomegaly": {
+      "auroc": 0.8419240799768184,
+      "auprc": 0.7235519678614536,
+      "f1": 0.44067796610169485,
+      "precision": 0.8524590163934426,
+      "recall": 0.29714285714285715,
+      "specificity": 0.9817444219066938,
+      "n_pos": 175,
+      "n_excluded": 0,
+      "threshold": 0.25282806158065796
+    },
+    "Consolidation": {
+      "auroc": 0.7600993003836605,
+      "auprc": 0.12340410811999711,
+      "f1": 0.1920529801324503,
+      "precision": 0.10861423220973783,
+      "recall": 0.8285714285714286,
+      "specificity": 0.6240126382306477,
+      "n_pos": 35,
+      "n_excluded": 0,
+      "threshold": 0.17416374385356903
+    },
+    "Edema": {
+      "auroc": 0.9248511754616083,
+      "auprc": 0.672008008037309,
+      "f1": 0.5938864628820961,
+      "precision": 0.4722222222222222,
+      "recall": 0.8,
+      "specificity": 0.869639794168096,
+      "n_pos": 85,
+      "n_excluded": 0,
+      "threshold": 0.222560316324234
+    },
+    "Pleural Effusion": {
+      "auroc": 0.9404045012165451,
+      "auprc": 0.8295011281024316,
+      "f1": 0.5809768637532133,
+      "precision": 0.4200743494423792,
+      "recall": 0.9416666666666667,
+      "specificity": 0.7153284671532847,
+      "n_pos": 120,
+      "n_excluded": 0,
+      "threshold": 0.3242517113685608
+    }
+  },
+  "evaluated_at": "2026-06-21T21:39:12"
+}

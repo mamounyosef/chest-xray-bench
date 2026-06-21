@@ -798,14 +798,22 @@ def _rng_state(device) -> dict:
     }
 
 
+def _as_cpu_byte(t):
+    """Coerce a saved RNG-state tensor back to a CPU ByteTensor. load_checkpoint
+    loads with map_location=device, so on a CUDA run the saved CPU ByteTensors
+    come back as CUDA tensors — which torch.set_rng_state / set_rng_state_all
+    reject ('RNG state must be a torch.ByteTensor'). Move to CPU + uint8."""
+    return t.cpu().to(torch.uint8) if torch.is_tensor(t) else t
+
+
 def _restore_rng(state: dict, device):
     if not state:
         return
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch.set_rng_state(_as_cpu_byte(state["torch"]))
     if device.type == "cuda" and state.get("cuda") is not None:
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all([_as_cpu_byte(s) for s in state["cuda"]])
 
 
 def print_config(cfg: dict):
@@ -977,11 +985,15 @@ def _unwrap(model):
 def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
                     epoch: int, global_step: int, best_score: float,
                     device, elapsed_sec: float,
-                    rolling: bool = False, is_best: bool = False):
+                    rolling: bool = False, is_best: bool = False,
+                    track: dict = None):
     """Write a fully-resumable checkpoint. Two independent triggers:
       rolling=True : write ckpt_step{N}.pt and prune to keep_last_n  (periodic)
       is_best=True : (over)write best.pt                              (at validation)
-    Both can be true; either writes the same complete state."""
+    Both can be true; either writes the same complete state.
+    `track` is the full early-stopping / best-so-far tracking dict (no_improve,
+    best_step/epoch, best_metrics, delta baselines); it is saved verbatim so a
+    resumed run continues the early-stopping counter exactly where it left off."""
     out = cfg["output"]
     state = {
         "model": _unwrap(model).state_dict(),
@@ -992,6 +1004,7 @@ def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
         "global_step": global_step,
         "best_score": best_score,
         "elapsed_sec": elapsed_sec,
+        "track": dict(track) if track is not None else None,
         "rng": _rng_state(device),
         "cfg": cfg,
     }
@@ -1025,9 +1038,12 @@ def load_checkpoint(resume, model, ckpt_dir: Path, optimizer=None, scheduler=Non
     if restore_rng:
         _restore_rng(ckpt.get("rng"), device)
     info = {"epoch": ckpt["epoch"], "global_step": ckpt["global_step"],
-            "best_score": ckpt["best_score"], "elapsed_sec": ckpt.get("elapsed_sec", 0.0)}
+            "best_score": ckpt["best_score"], "elapsed_sec": ckpt.get("elapsed_sec", 0.0),
+            "track": ckpt.get("track")}                  # full early-stopping state (or None)
+    ni = (info["track"] or {}).get("no_improve")
+    ni_str = f" no_improve={ni}" if ni is not None else " (no saved track — legacy ckpt)"
     print(f"[resume] restored -> epoch={info['epoch']} step={info['global_step']} "
-          f"best_score={info['best_score']:.4f} elapsed={info['elapsed_sec']:.0f}s")
+          f"best_score={info['best_score']:.4f} elapsed={info['elapsed_sec']:.0f}s{ni_str}")
     return info
 
 
@@ -1064,15 +1080,25 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                     cfg: dict = None, debug_dir=None, debug_every: int = 0,
                     channels_last: bool = False,
                     checkpoint_fn=None, checkpoint_every: int = 0,
-                    scheduler=None, n_epochs: int = 0) -> tuple:
+                    scheduler=None, n_epochs: int = 0, skip_batches: int = 0) -> tuple:
     """One epoch of training. Logs every step (loss/lr/grad_norm/throughput/elapsed/eta)
-    and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop)."""
+    and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop).
+
+    `skip_batches` > 0 (only on the first epoch after a MID-epoch resume) fast-
+    forwards past that many already-completed batches so training continues at the
+    exact point the checkpoint was taken, keeping global_step / the LR schedule /
+    the total step budget aligned."""
     model.train()
     clip = grad_clip if grad_clip else math.inf      # inf -> measure norm, no clip
     stop = False
     n_batches = len(loader)
+    if skip_batches > 0:
+        print(f"  ⏩ resuming mid-epoch: skipping the first {skip_batches}/{n_batches} "
+              f"already-trained batches of this epoch ...")
 
     for i, (imgs, labels) in enumerate(loader, start=1):
+        if i <= skip_batches:        # already done before the checkpoint — fast-forward
+            continue
         t0 = time.time()
         imgs = imgs.to(device, non_blocking=True)
         if channels_last:
@@ -1113,7 +1139,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             "lr": lr, "grad_norm": round(float(grad_norm), 6),
             "imgs_per_s": round(imgs_per_s, 1), "sec_per_step": round(dt, 4),
         })
-        if global_step % console_log_every == 0 or i == 1:
+        if global_step % console_log_every == 0 or i == skip_batches + 1:
             cur_loss = loss.item()
             # delta vs the previous CONSOLE-printed train loss (persists across
             # epochs via a function attribute); empty on the very first print.
@@ -1225,7 +1251,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     summary_path = results_dir / out.get("summary_json", "training_summary.json")
 
     # --- resumable state ---
-    start_epoch, global_step = 0, 0
+    start_epoch, global_step, resume_skip = 0, 0, 0
+    steps_per_epoch = len(train_loader)
     prior_elapsed = 0.0          # wall-clock seconds accumulated before this process
     track = {"best": (-math.inf if mode == "max" else math.inf),
              "no_improve": 0, "last_monitor": 0.0,
@@ -1234,10 +1261,22 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     if resume is not None:
         info = load_checkpoint(resume, model, ckpt_dir, optimizer, scheduler,
                                scaler, device, restore_rng=True)
-        start_epoch = info["epoch"] + 1
         global_step = info["global_step"]
-        track["best"] = info["best_score"]
         prior_elapsed = info["elapsed_sec"]
+        # global_step is the single source of truth for WHERE we are: this handles
+        # both epoch-boundary and MID-epoch checkpoints correctly. (The old code
+        # used saved_epoch + 1, which skipped the rest of the epoch for a mid-epoch
+        # checkpoint.) start_epoch = completed full epochs; resume_skip = batches
+        # already done within the current epoch (fast-forwarded in train_one_epoch).
+        start_epoch = global_step // steps_per_epoch
+        resume_skip = global_step % steps_per_epoch
+        track["best"] = info["best_score"]
+        # Restore the FULL early-stopping / best-so-far state so the patience
+        # counter (no_improve), best_step/epoch, best_metrics and the delta
+        # baselines continue exactly where they left off. Legacy checkpoints
+        # without a saved track fall back to best_score only (no_improve=0).
+        if info.get("track"):
+            track.update(info["track"])
 
     run_start = time.time()
     console_log_every = int(out["console_log_every"])
@@ -1271,10 +1310,15 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         print("=" * 70)
         print("🔁 RESUMING FROM CHECKPOINT")
         print("-" * 70)
-        print(f"   continue from   : epoch {start_epoch + 1}/{epochs}  (global step {global_step})")
+        _midep = (f"  (mid-epoch: continue at batch {resume_skip + 1}/{steps_per_epoch})"
+                  if resume_skip else "  (at epoch boundary)")
+        print(f"   continue from   : epoch {start_epoch + 1}/{epochs}  (global step {global_step}){_midep}")
         print(f"   steps done      : {global_step}/{total_steps}  ({pct:.1f}%)")
         print(f"   steps remaining : {steps_left}")
-        print(f"   best so far     : {track['best']:.4f} ({monitor})")
+        print(f"   best so far     : {track['best']:.4f} ({monitor})  "
+              f"@ step {track['best_step']} epoch {track['best_epoch']}")
+        print(f"   early-stop count: {track['no_improve']}/{es_patience} "
+              f"(no-improvement validations; resumes from here)")
         print(f"   elapsed so far  : {fmt_duration(prior_elapsed)} ({prior_elapsed:.0f}s)")
         print("=" * 70)
 
@@ -1344,7 +1388,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             track["no_improve"] += 1
         _safe("best-checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
               scheduler, scaler, epoch, gstep, track["best"], device, elapsed(),
-              rolling=False, is_best=is_best)
+              rolling=False, is_best=is_best, track=track)
         _safe("summary", _write_summary, summary_path, _summary("running"))
         if log_fn is not None:            # W&B: same scores as the val CSV (no system stats)
             wb = {"val/loss": val_loss}
@@ -1371,7 +1415,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     def save_periodic(epoch: int, gstep: int):
         _safe("checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
               scheduler, scaler, epoch, gstep, track["best"], device, elapsed(),
-              rolling=True, is_best=False)
+              rolling=True, is_best=False, track=track)
         _safe("summary", _write_summary, summary_path, _summary("running"))
         if persist_fn is not None:
             _safe("persist", persist_fn)
@@ -1384,6 +1428,9 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         print("=" * 70)
         print(f"📚 EPOCH {epoch + 1}/{epochs}")
         print("=" * 70)
+        # only the first epoch after a mid-epoch resume fast-forwards already-done
+        # batches; every later epoch starts clean.
+        skip = resume_skip if epoch == start_epoch else 0
         global_step, stop = train_one_epoch(
             model, train_loader, optimizer, loss_fn, scaler, device,
             epoch, global_step, train_logger, amp, grad_clip, ev_steps, on_eval,
@@ -1392,7 +1439,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             channels_last=channels_last,
             checkpoint_fn=save_periodic, checkpoint_every=ckpt_every,
             scheduler=(scheduler if sched_mode == "step" else None),
-            n_epochs=epochs)
+            n_epochs=epochs, skip_batches=skip)
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)
