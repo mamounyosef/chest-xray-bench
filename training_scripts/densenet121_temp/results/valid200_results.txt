@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : densenet121_temp
+  checkpoint : /runs/densenet121_temp/results/checkpoints/best.pt
+  images     : 234    device: cuda    amp: False
+  use_clahe  : False    u_policy: ones    val_loss: 0.42014
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8529        mean AUPRC : 0.6761
+    mean F1    : 0.6290    mean precision: 0.6043    mean recall: 0.7758    mean spec: 0.7978
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.232  0.8257  0.7095  0.6738  0.5888  0.7875  0.7143      80
+    Cardiomegaly        0.245  0.7792  0.6934  0.5800  0.9062  0.4265  0.9819      68
+    Consolidation       0.195  0.8498  0.4030  0.4848  0.3232  0.9697  0.6667      33
+    Edema               0.292  0.9146  0.7699  0.7238  0.6333  0.8444  0.8836      45
+    Pleural Effusion    0.357  0.8952  0.8047  0.6826  0.5700  0.8507  0.7425      67
+======================================================================================
