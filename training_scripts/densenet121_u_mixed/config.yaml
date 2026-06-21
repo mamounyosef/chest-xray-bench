@@ -1,0 +1,167 @@
+# =============================================================================
+# config.yaml  —  experiment: densenet121_u_mixed
+#   (DenseNet-121, CLAHE off, MIXED per-task uncertainty policy)
+# -----------------------------------------------------------------------------
+# Same locked pipeline as the densenet121 (U-Ones) arm — only the uncertainty
+# handling changes, applied PER pathology via a single mixed-output head:
+#   Atelectasis      -> U-Ones        (binary, sigmoid + BCE)
+#   Cardiomegaly     -> U-MultiClass  (3-class {neg,pos,unc}, softmax + CE)
+#   Consolidation    -> U-Zeros       (binary, sigmoid + BCE)
+#   Edema            -> U-Ones        (binary, sigmoid + BCE)
+#   Pleural Effusion -> U-MultiClass  (3-class {neg,pos,unc}, softmax + CE)
+# Holds only what VARIES per experiment. Common settings come from
+# ../shared_config.yaml and are merged in at load time (this file wins).
+# =============================================================================
+
+experiment:
+  name: "densenet121_u_mixed"
+
+model:
+  name: "densenet121"       # torchvision densenet121
+  pretrained: true          # ImageNet-1k V1 weights (see train.py)
+
+# ----------------------------------------------------------------------------
+# Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
+#   null     : fresh run
+#   "best"   : results/checkpoints/best.pt
+#   "last"   : newest rolling checkpoint
+#   <int>    : a specific step, e.g. 1200  ->  ckpt_step1200.pt
+#   <path>   : explicit checkpoint file path
+# Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Label policy  —  MIXED per-task uncertainty handling (this arm's whole point).
+#   u_policy: "mixed"  switches the shared engine to a per-task output head.
+#   Each task below is one of:
+#     "ones"  / "zeros"  : BINARY head — one sigmoid logit + BCE; uncertain(-1)
+#                          mapped to 1 / 0 respectively.
+#     "multiclass"       : 3-CLASS head {neg, pos, unc} — softmax + cross-entropy;
+#                          at scoring time p_unc is dropped and the prob is
+#                          renormalized to p_pos / (p_pos + p_neg).
+#   Blank/NaN -> the NEGATIVE class for ALL five tasks (same as the baseline).
+#   The 5 tasks expand to 9 output logits (1 + 3 + 1 + 1 + 3).
+#   NOTE: on the in-loop val set (01_val, which has uncertain labels) the two
+#   multiclass tasks' uncertain rows are EXCLUDED from their AUROC/AUPRC (no
+#   binary ground truth); the clean valid200/test500 sets have no uncertain.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"        # binary,  uncertain -> 1
+    Cardiomegaly:     "multiclass"  # 3-class {neg, pos, unc}
+    Consolidation:    "zeros"       # binary,  uncertain -> 0
+    Edema:            "ones"        # binary,  uncertain -> 1
+    Pleural Effusion: "multiclass"  # 3-class {neg, pos, unc}
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF for this arm. Held identical to the densenet121 (U-Ones) arm so
+# the ONLY difference vs. it is the per-task uncertainty policy (clean ablation).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+# ----------------------------------------------------------------------------
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         256
+  val_num_workers:        10
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+training:
+  epochs:        10
+  amp:           true        # mixed precision (A100)
+  grad_clip:     null        # max-norm, or null to disable
+
+  optimizer:                 # AdamW always
+    lr:           1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 1
+    min_lr:      1.0e-6
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    # IGNORED for this arm: labels.u_policy="mixed" makes the engine use the
+    # mixed per-task loss (sum of per-task BCE for binary tasks + 3-class CE for
+    # multiclass tasks). Kept here only so the schema matches the other arms.
+    name: "bce_with_logits"
+    pos_weight: null         # unused under the mixed loss
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 10              # counted in VALIDATIONS, not epochs
+
+# ----------------------------------------------------------------------------
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+
+
+# ----------------------------------------------------------------------------
+# Modal  —  cloud run resources + volume layout for THIS experiment.
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : paths INSIDE the data volume; these
+#       override paths.data_root / paths.data_dir when running on Modal.
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "L4"
+  cpu_cores: 8
+  memory_gb: 32
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY

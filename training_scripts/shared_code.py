@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from PIL import Image
 from sklearn.metrics import average_precision_score, precision_recall_curve, roc_auc_score
@@ -152,17 +153,120 @@ def _get_clahe(clip_limit: float, tile_grid: tuple):
     return cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
 
 
-def build_labels(df: pd.DataFrame, tasks: list, policy: str = "ones") -> pd.DataFrame:
-    """Raw labels (1 / 0 / -1 / blank) -> target vector per uncertainty policy.
-    blanks/NaN -> 0 always; policy maps the uncertain (-1) entries."""
-    target = df[tasks].fillna(0).copy()
-    if policy == "ones":
-        target = target.replace(-1, 1)
-    elif policy == "zeros":
-        target = target.replace(-1, 0)
+# -----------------------------------------------------------------------------
+# Per-task uncertainty policy (head layout)
+# Every binary arm uses ONE policy for all 5 tasks (labels.u_policy "ones"|"zeros"):
+# a single sigmoid logit per task + BCE. The "mixed" arm instead gives each task
+# its OWN policy via labels.per_task, and a task may be 3-class ("multiclass":
+# {neg, pos, unc}) with a softmax+CE head. task_layout() turns cfg into the
+# per-task plan used everywhere downstream (label encoding, head width, loss,
+# inference). For any non-"mixed" u_policy it returns the original all-binary plan,
+# so existing arms are byte-for-byte unchanged.
+# -----------------------------------------------------------------------------
+_BINARY_POLICIES = ("ones", "zeros")
+
+
+def task_layout(cfg: dict) -> dict:
+    """Resolve cfg -> per-task head plan. Returns a dict with:
+        policies : list[str]   per task, 'ones'|'zeros' (binary) | 'multiclass'
+        widths   : list[int]   logits per task (1 binary, 3 multiclass)
+        slices   : list[slice] each task's columns in the logit vector
+        n_logits : int         total output logits the head must produce
+        mixed    : bool        True iff any task is multiclass
+    Binary arms (u_policy in {'ones','zeros'}) -> all widths 1, mixed=False."""
+    tasks = cfg["tasks"]
+    lab = cfg.get("labels", {})
+    u = str(lab.get("u_policy", "ones")).lower()
+    if u == "mixed":
+        per = lab.get("per_task")
+        if not per:
+            raise ValueError("labels.u_policy='mixed' requires labels.per_task "
+                             "(a {task: 'ones'|'zeros'|'multiclass'} map)")
+        policies = []
+        for t in tasks:
+            if t not in per:
+                raise ValueError(f"labels.per_task is missing task {t!r}")
+            p = str(per[t]).lower()
+            if p not in _BINARY_POLICIES and p != "multiclass":
+                raise ValueError(f"per_task[{t!r}]={p!r} (expected ones|zeros|multiclass)")
+            policies.append(p)
     else:
-        raise ValueError(f"unknown u_policy: {policy!r} (expected 'ones' | 'zeros')")
+        if u not in _BINARY_POLICIES:
+            raise ValueError(f"labels.u_policy={u!r} (expected ones|zeros|mixed)")
+        policies = [u] * len(tasks)
+    widths = [3 if p == "multiclass" else 1 for p in policies]
+    slices, off = [], 0
+    for w in widths:
+        slices.append(slice(off, off + w))
+        off += w
+    return {"tasks": list(tasks), "policies": policies, "widths": widths,
+            "slices": slices, "n_logits": off, "mixed": any(w == 3 for w in widths)}
+
+
+def num_output_logits(cfg: dict) -> int:
+    """Total output logits the model head must produce for this cfg (5 for an
+    all-binary arm; more when any task is multiclass — e.g. 9 for the u_mixed arm
+    with two 3-class tasks)."""
+    return task_layout(cfg)["n_logits"]
+
+
+def build_labels(df: pd.DataFrame, tasks: list, policies="ones") -> pd.DataFrame:
+    """Raw labels (1 / 0 / -1 / blank) -> per-task target column, per that task's
+    policy. blanks/NaN -> the NEGATIVE class always (0) for every policy.
+        'ones' / 'zeros'  (binary)   : value 0/1; -1 -> 1 / 0.   Float 0.0/1.0.
+        'multiclass'      (3-class)  : class index {0=neg, 1=pos, 2=unc};
+                                       0/blank -> 0, 1 -> 1, -1 -> 2.
+    `policies` may be a single string (same policy for every task — the binary
+    arms) or a list aligned with `tasks` (the mixed arm). Returns a
+    (N, len(tasks)) float32 frame; multiclass columns hold the class index."""
+    if isinstance(policies, str):
+        policies = [policies] * len(tasks)
+    if len(policies) != len(tasks):
+        raise ValueError(f"policies len {len(policies)} != n_tasks {len(tasks)}")
+    out = {}
+    for t, pol in zip(tasks, policies):
+        col = df[t]
+        if pol == "multiclass":
+            out[t] = col.replace(-1, 2).fillna(0)          # -1 -> unc(2); blank -> neg(0)
+        elif pol in _BINARY_POLICIES:
+            enc = col.fillna(0)                            # blank -> 0
+            out[t] = enc.replace(-1, 1 if pol == "ones" else 0)
+        else:
+            raise ValueError(f"unknown policy {pol!r} for task {t!r}")
+    target = pd.DataFrame(out, index=df.index)[list(tasks)]
     return target.astype("float32")
+
+
+def logits_to_probs(logits: torch.Tensor, layout: dict) -> torch.Tensor:
+    """Model logits (B, n_logits) -> (B, n_tasks) per-task BINARY probability,
+    ready for AUROC. Binary task: sigmoid(its single logit). Multiclass task:
+    softmax over {neg,pos,unc}, drop p_unc, renormalize p_pos/(p_pos+p_neg).
+    For an all-binary layout this is exactly sigmoid(logits)."""
+    cols = []
+    for pol, sl in zip(layout["policies"], layout["slices"]):
+        if pol == "multiclass":
+            sm = torch.softmax(logits[:, sl].float(), dim=1)   # [:,0]=neg [:,1]=pos [:,2]=unc
+            cols.append(sm[:, 1] / (sm[:, 0] + sm[:, 1]).clamp_min(1e-12))
+        else:
+            cols.append(torch.sigmoid(logits[:, sl.start].float()))
+    return torch.stack(cols, dim=1)
+
+
+def binarize_targets(targets, layout: dict):
+    """Encoded targets (N, n_tasks) -> (y_true_binary, exclude_mask), both
+    (N, n_tasks). Binary columns pass through (already 0/1, nothing excluded).
+    Multiclass columns hold the class index {0,1,2}: ground truth = (idx == 1)
+    and uncertain (idx == 2) rows are flagged in exclude_mask (no binary truth ->
+    dropped from that task's metric). For an all-binary layout the mask is all
+    False and y is unchanged."""
+    y = np.asarray(targets, dtype=float).copy()
+    excl = np.zeros(y.shape, dtype=bool)
+    for k, pol in enumerate(layout["policies"]):
+        if pol == "multiclass":
+            col = y[:, k]
+            excl[:, k] = (col == 2)
+            y[:, k] = (col == 1).astype(float)
+    return y, excl
 
 
 def build_train_transforms(cfg: dict):
@@ -234,9 +338,10 @@ class CheXpertDataset(Dataset):
         self.split = split
         self.tasks = cfg["tasks"]
         self.paths = df["Path"].tolist()
-        policy = cfg["labels"]["u_policy"]
+        self.layout = task_layout(cfg)            # per-task policy plan (binary or mixed)
         # .copy() -> writable array (silences the non-writable-tensor warning)
-        self.labels = torch.from_numpy(build_labels(df, self.tasks, policy).to_numpy().copy())
+        self.labels = torch.from_numpy(
+            build_labels(df, self.tasks, self.layout["policies"]).to_numpy().copy())
         self.use_clahe = bool(cfg["clahe"]["use_clahe"])
         self._clahe = (
             _get_clahe(cfg["clahe"]["clip_limit"], tuple(cfg["clahe"]["tile_grid"]))
@@ -345,7 +450,7 @@ def set_seed(seed: int, deterministic: bool = True):
     print(f"[set_seed] seed={seed}  deterministic={deterministic}")
 
 
-def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5) -> dict:
+def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5, exclude_mask=None) -> dict:
     """Multi-label metrics from ground-truth (N,T) 0/1 and probabilities (N,T).
 
     Per task: AUROC, AUPRC (threshold-free) + F1 / precision / recall /
@@ -358,9 +463,17 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5) -> dict:
     in-training validation) OR a per-task sequence of length len(tasks) — the
     frozen per-task thresholds calibrated on the validation set. The threshold
     used for each task is recorded back into its per-task dict.
+
+    `exclude_mask` (optional, (N,T) bool): True drops that (row, task) from the
+    task's metric. Used by the mixed arm to exclude uncertain (-1) rows from a
+    multiclass task's binary AUROC — they have no binary ground truth. The number
+    dropped is reported per task as `n_excluded`. None / all-False -> no effect
+    (every binary arm), so behavior there is unchanged.
     """
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob)
+    if exclude_mask is not None:
+        exclude_mask = np.asarray(exclude_mask, dtype=bool)
     thr = np.asarray(threshold, dtype=float)
     if thr.ndim == 0:
         thr_row = np.full(len(tasks), float(thr))
@@ -374,6 +487,11 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5) -> dict:
     cols = {k: [] for k in ("auroc", "auprc", "f1", "precision", "recall", "specificity")}
     for k, t in enumerate(tasks):
         yt, yp, pr = y_true[:, k], y_prob[:, k], preds[:, k]
+        n_excluded = 0
+        if exclude_mask is not None:
+            keep = ~exclude_mask[:, k]
+            n_excluded = int((~keep).sum())
+            yt, yp, pr = yt[keep], yp[keep], pr[keep]
         n_pos = int(yt.sum())
         n_neg = int((yt == 0).sum())
 
@@ -391,7 +509,7 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5) -> dict:
 
         per_task[t] = dict(auroc=auroc, auprc=auprc, f1=f1, precision=precision,
                            recall=recall, specificity=specificity, n_pos=n_pos,
-                           threshold=float(thr_row[k]))
+                           n_excluded=n_excluded, threshold=float(thr_row[k]))
         for key, val in (("auroc", auroc), ("auprc", auprc), ("f1", f1),
                          ("precision", precision), ("recall", recall),
                          ("specificity", specificity)):
@@ -457,9 +575,38 @@ def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int)
     raise ValueError(f"unknown scheduler: {name!r}")
 
 
+class MixedTaskLoss(nn.Module):
+    """Sum of per-task losses for a mixed-policy head. Each binary task contributes
+    BCE-with-logits on its single logit vs its 0/1 target; each multiclass task
+    contributes 3-class cross-entropy on its {neg,pos,unc} logits vs the class
+    index. Uncertain is a real CE class (kept in the loss); blanks were folded
+    into the negative class upstream by build_labels. Per-task losses are batch
+    means, summed over the tasks with equal weight ('sum of per-task losses')."""
+
+    def __init__(self, layout: dict):
+        super().__init__()
+        self.policies = layout["policies"]
+        self.slices = layout["slices"]
+
+    def forward(self, logits, targets):
+        total = logits.new_zeros(())
+        for k, (pol, sl) in enumerate(zip(self.policies, self.slices)):
+            tgt = targets[:, k]
+            if pol == "multiclass":
+                total = total + F.cross_entropy(logits[:, sl], tgt.long())
+            else:
+                total = total + F.binary_cross_entropy_with_logits(logits[:, sl.start], tgt)
+        return total
+
+
 def build_loss(cfg: dict, device=None) -> nn.Module:
-    """Multi-label BCE-with-logits. Optional per-task pos_weight (list) is moved
-    onto `device` so it lands on the same device as the logits."""
+    """Loss for this cfg. Mixed-policy arm (any multiclass task) -> MixedTaskLoss
+    (per-task BCE + 3-class CE, summed). Otherwise the standard multi-label
+    BCE-with-logits, with an optional per-task pos_weight (list) moved onto
+    `device` so it lands on the same device as the logits."""
+    layout = task_layout(cfg)
+    if layout["mixed"]:
+        return MixedTaskLoss(layout)
     l = cfg["training"]["loss"]
     name = l["name"].lower()
     if name != "bce_with_logits":
@@ -617,7 +764,8 @@ def _flatten_val_row(epoch: int, gstep: int, val_loss: float, metrics: dict,
         row[k] = round(v, 6)
     for t in tasks:
         m = metrics["per_task"][t]
-        for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity", "n_pos"):
+        for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity",
+                    "n_pos", "n_excluded"):
             val = m[key]
             row[f"{key}/{t}"] = round(val, 6) if isinstance(val, float) else val
     return row
@@ -666,6 +814,10 @@ def print_config(cfg: dict):
     print(f"  train / val csv   : {p['train_csv']}  |  {p['val_csv']}")
     print("  --- data ---------------------------------------------------------")
     print(f"  u_policy          : {cfg['labels']['u_policy']}")
+    _lay = task_layout(cfg)
+    if _lay["mixed"]:
+        print("  per-task u-policy : "
+              + ", ".join(f"{t}={p}" for t, p in zip(cfg["tasks"], _lay["policies"])))
     print(f"  image (W x H)     : {img['width']} x {img['height']}  "
           f"channels={img['channels']}  interp={img['interpolation']}")
     print(f"  normalize mean    : {img['norm_mean']}")
@@ -691,7 +843,8 @@ def print_config(cfg: dict):
     print(f"  optimizer         : AdamW  lr={opt['lr']:.4e}  weight_decay={opt['weight_decay']}")
     print(f"  scheduler         : {sch['name']}  warmup_epochs={sch.get('warmup_epochs')}  "
           f"min_lr={sch.get('min_lr')}")
-    print(f"  loss              : {loss['name']}  pos_weight={loss.get('pos_weight')}")
+    _loss_desc = "mixed per-task (BCE + 3-class CE, summed)" if _lay["mixed"] else loss["name"]
+    print(f"  loss              : {_loss_desc}  pos_weight={loss.get('pos_weight')}")
     print(f"  amp               : {tr['amp']}  grad_clip={tr['grad_clip']}")
     print(f"  early_stopping    : enable={es['enable']}  monitor={es['monitor']}  "
           f"mode={es['mode']}  patience={es['patience']}")
@@ -739,7 +892,12 @@ def print_model_summary(model, cfg: dict):
     print(f"  architecture      : {cfg.get('model', {}).get('name', type(m).__name__)}"
           f"  ({type(m).__name__})")
     print(f"  pretrained        : {cfg.get('model', {}).get('pretrained')}")
-    print(f"  output logits     : {len(cfg['tasks'])}  (one per task)")
+    _lay = task_layout(cfg)
+    if _lay["mixed"]:
+        widths = ", ".join(f"{t}:{w}" for t, w in zip(cfg["tasks"], _lay["widths"]))
+        print(f"  output logits     : {_lay['n_logits']}  (mixed heads -> {widths})")
+    else:
+        print(f"  output logits     : {_lay['n_logits']}  (one per task)")
     print(f"  total params      : {total:,}  ({total / 1e6:.2f} M)")
     print(f"  trainable params  : {trainable:,}  ({trainable / 1e6:.2f} M, {pct:.1f}%)")
     print(f"  frozen params     : {frozen:,}  ({frozen / 1e6:.2f} M)")
@@ -749,7 +907,11 @@ def print_model_summary(model, cfg: dict):
 @torch.no_grad()
 def validate(model, val_loader, loss_fn, cfg, device, amp: bool,
              channels_last: bool = False) -> tuple:
-    """Full pass over the val loader -> (val_loss, metrics dict). No grad, eval mode."""
+    """Full pass over the val loader -> (val_loss, metrics dict). No grad, eval mode.
+    Predictions are collapsed to per-task binary probabilities via the cfg head
+    layout (sigmoid for binary tasks, renormalized p_pos for multiclass), and
+    uncertain rows on multiclass tasks are excluded from those tasks' metrics."""
+    layout = task_layout(cfg)
     model.eval()
     total_loss, n = 0.0, 0
     ys, ps = [], []
@@ -765,11 +927,12 @@ def validate(model, val_loader, loss_fn, cfg, device, amp: bool,
         total_loss += loss.item() * bs
         n += bs
         ys.append(labels.detach().cpu().numpy())
-        ps.append(torch.sigmoid(logits).float().detach().cpu().numpy())
-    y = np.concatenate(ys)
+        ps.append(logits_to_probs(logits, layout).float().detach().cpu().numpy())
+    y_enc = np.concatenate(ys)
     p = np.concatenate(ps)
+    y_true, excl = binarize_targets(y_enc, layout)
     val_loss = total_loss / max(1, n)
-    metrics = compute_metrics(y, p, cfg["tasks"])
+    metrics = compute_metrics(y_true, p, cfg["tasks"], exclude_mask=excl)
     return val_loss, metrics
 
 
@@ -1129,8 +1292,10 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             pt = ppt.get(t) if ppt is not None else None
             d_auroc = _fmt_delta(m['auroc'], pt['auroc'] if pt is not None else None)
             d_auprc = _fmt_delta(m['auprc'], pt['auprc'] if pt is not None else None)
+            n_excl = m.get('n_excluded', 0)
+            excl_str = f"  excl={n_excl}" if n_excl else ""   # uncertain rows dropped (multiclass)
             print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
-                  f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']})")
+                  f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']}{excl_str})")
         track["prev_macro"] = dict(macro)            # baseline for next validation
         track["prev_per_task"] = {t: dict(metrics["per_task"][t]) for t in cfg["tasks"]}
         track["prev_val_loss"] = val_loss
@@ -1543,7 +1708,11 @@ def _json_safe(obj):
 def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
                        channels_last: bool, batch_size: int, num_workers: int):
     """Run the model over one dataframe (split='val' -> no augmentation) and
-    return (y_true (N,T), y_prob (N,T), mean_loss)."""
+    return (y_true (N,T) binary, y_prob (N,T), exclude_mask (N,T), mean_loss).
+    Predictions collapse to per-task binary probabilities via the cfg head layout
+    (sigmoid / renormalized p_pos); exclude_mask flags uncertain rows on
+    multiclass tasks (all-False for a binary arm)."""
+    layout = task_layout(cfg)
     ds = CheXpertDataset(df, cfg, split="val")
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False,
                         num_workers=num_workers, pin_memory=(device.type == "cuda"))
@@ -1562,8 +1731,9 @@ def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
         total_loss += loss.item() * bs
         n += bs
         ys.append(labels.detach().cpu().numpy())
-        ps.append(torch.sigmoid(logits).float().detach().cpu().numpy())
-    return np.concatenate(ys), np.concatenate(ps), total_loss / max(1, n)
+        ps.append(logits_to_probs(logits, layout).float().detach().cpu().numpy())
+    y_true, excl = binarize_targets(np.concatenate(ys), layout)
+    return y_true, np.concatenate(ps), excl, total_loss / max(1, n)
 
 
 def _load_ckpt_weights(model, ckpt_dir: Path, checkpoint, device):
@@ -1609,23 +1779,25 @@ def calibrate_thresholds(cfg, model, df_val, device, amp: bool = False,
     loss_fn = build_loss(cfg, device)
     print(f"[calibrate] inference over {len(df_val)} validation images "
           f"(bs={batch_size}, workers={num_workers}) ...")
-    y_true, y_prob, _ = _predict_dataframe(
+    y_true, y_prob, excl, _ = _predict_dataframe(
         cfg, model, df_val, device, loss_fn, amp, channels_last=False,
         batch_size=batch_size, num_workers=num_workers)
     thresholds = {}
     for k, t in enumerate(tasks):
-        thr, _f1 = _best_f1_threshold(y_true[:, k], y_prob[:, k])
+        keep = ~excl[:, k]                       # drop uncertain rows (multiclass tasks)
+        thr, _f1 = _best_f1_threshold(y_true[keep, k], y_prob[keep, k])
         thresholds[t] = thr
-    return thresholds, y_true, y_prob
+    return thresholds, y_true, y_prob, excl
 
 
-def _threshold_payload(cfg, thresholds, y_true, y_prob, ckpt, ckpt_path,
+def _threshold_payload(cfg, thresholds, y_true, y_prob, exclude_mask, ckpt, ckpt_path,
                        n_val: int, objective: str = "f1") -> tuple:
     """Build the thresholds.json payload (+ the val metrics at those thresholds
     for printing). Returns (payload_dict, val_metrics_dict)."""
     tasks = cfg["tasks"]
     thr_vec = [thresholds[t] for t in tasks]
-    metrics = compute_metrics(y_true, y_prob, tasks, threshold=thr_vec)
+    metrics = compute_metrics(y_true, y_prob, tasks, threshold=thr_vec,
+                              exclude_mask=exclude_mask)
     payload = {
         "experiment": cfg.get("experiment", {}).get("name"),
         "objective": objective,
@@ -1692,10 +1864,10 @@ def run_calibration(cfg, model, experiment_dir, device=None, checkpoint: str = "
 
     val_csv = Path(cfg["paths"]["data_dir"]) / cfg["paths"]["val_csv"]
     df_val = pd.read_csv(val_csv)
-    thresholds, y_true, y_prob = calibrate_thresholds(
+    thresholds, y_true, y_prob, excl = calibrate_thresholds(
         cfg, model, df_val, device, amp, batch_size, num_workers)
     payload, metrics = _threshold_payload(
-        cfg, thresholds, y_true, y_prob, ckpt, ckpt_path, len(df_val), objective)
+        cfg, thresholds, y_true, y_prob, excl, ckpt, ckpt_path, len(df_val), objective)
 
     # print a tidy per-task table (threshold + the val scores it yields)
     print("-" * 78)
@@ -1803,10 +1975,10 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
         print(f"  ⚠️  no usable {thr_path.name} — calibrating per-task thresholds now "
               f"on {cfg['paths']['val_csv']} ...")
         df_val = pd.read_csv(data_dir / cfg["paths"]["val_csv"])
-        thr_map, y_t, y_p = calibrate_thresholds(
+        thr_map, y_t, y_p, excl_v = calibrate_thresholds(
             cfg, model, df_val, device, amp, batch_size, num_workers)
         payload, _ = _threshold_payload(
-            cfg, thr_map, y_t, y_p, ckpt, ckpt_path, len(df_val), objective)
+            cfg, thr_map, y_t, y_p, excl_v, ckpt, ckpt_path, len(df_val), objective)
         thr_path.parent.mkdir(parents=True, exist_ok=True)
         with open(thr_path, "w", encoding="utf-8") as fh:
             json.dump(_json_safe(payload), fh, indent=2)
@@ -1831,10 +2003,11 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
             continue
         df = pd.read_csv(csv_path)
         print(f"  rows: {len(df)}  ->  running inference ...")
-        y_true, y_prob, val_loss = _predict_dataframe(
+        y_true, y_prob, excl, val_loss = _predict_dataframe(
             cfg, model, df, device, loss_fn, amp, channels_last=False,
             batch_size=batch_size, num_workers=num_workers)
-        metrics = compute_metrics(y_true, y_prob, tasks, threshold=thr_vec)
+        metrics = compute_metrics(y_true, y_prob, tasks, threshold=thr_vec,
+                                  exclude_mask=excl)
 
         report = {
             "experiment": cfg.get("experiment", {}).get("name"),
