@@ -166,41 +166,58 @@ def _get_clahe(clip_limit: float, tile_grid: tuple):
 _BINARY_POLICIES = ("ones", "zeros")
 
 
+def _check_policy(p, task: str) -> str:
+    """Validate + normalize one task's policy string."""
+    p = str(p).lower()
+    if p not in _BINARY_POLICIES and p != "multiclass":
+        raise ValueError(f"labels.per_task[{task!r}]={p!r} (expected ones|zeros|multiclass)")
+    return p
+
+
 def task_layout(cfg: dict) -> dict:
     """Resolve cfg -> per-task head plan. Returns a dict with:
         policies : list[str]   per task, 'ones'|'zeros' (binary) | 'multiclass'
         widths   : list[int]   logits per task (1 binary, 3 multiclass)
         slices   : list[slice] each task's columns in the logit vector
         n_logits : int         total output logits the head must produce
-        mixed    : bool        True iff any task is multiclass
-    Binary arms (u_policy in {'ones','zeros'}) -> all widths 1, mixed=False."""
+        mixed    : bool        True iff any task is multiclass (needs the mixed loss)
+        per_task : bool        True iff policies vary by task (drives the per-task print)
+
+    Every experiment specifies its own policy in its config.yaml; this resolves
+    all cases uniformly:
+      'ones' / 'zeros'  -> that binary policy for every task, BUT labels.per_task
+                           (optional) overrides the policy of any task it names
+                           (e.g. all U-Ones except Consolidation: 'zeros').
+      'mixed'           -> labels.per_task MUST name every task (binary or
+                           multiclass) — the fully explicit per-task spec.
+    No per_task and a binary u_policy -> the original all-binary plan (existing
+    arms unchanged)."""
     tasks = cfg["tasks"]
     lab = cfg.get("labels", {})
     u = str(lab.get("u_policy", "ones")).lower()
+    per = lab.get("per_task") or {}
+    unknown = [t for t in per if t not in tasks]
+    if unknown:
+        raise ValueError(f"labels.per_task names unknown task(s): {unknown}")
     if u == "mixed":
-        per = lab.get("per_task")
-        if not per:
-            raise ValueError("labels.u_policy='mixed' requires labels.per_task "
-                             "(a {task: 'ones'|'zeros'|'multiclass'} map)")
-        policies = []
-        for t in tasks:
-            if t not in per:
-                raise ValueError(f"labels.per_task is missing task {t!r}")
-            p = str(per[t]).lower()
-            if p not in _BINARY_POLICIES and p != "multiclass":
-                raise ValueError(f"per_task[{t!r}]={p!r} (expected ones|zeros|multiclass)")
-            policies.append(p)
+        missing = [t for t in tasks if t not in per]
+        if missing:
+            raise ValueError("labels.u_policy='mixed' requires labels.per_task to "
+                             f"name every task; missing: {missing}")
+        policies = [_check_policy(per[t], t) for t in tasks]
+    elif u in _BINARY_POLICIES:
+        # binary default for all tasks; per_task (optional) overrides named tasks.
+        policies = [_check_policy(per[t], t) if t in per else u for t in tasks]
     else:
-        if u not in _BINARY_POLICIES:
-            raise ValueError(f"labels.u_policy={u!r} (expected ones|zeros|mixed)")
-        policies = [u] * len(tasks)
+        raise ValueError(f"labels.u_policy={u!r} (expected ones|zeros|mixed)")
     widths = [3 if p == "multiclass" else 1 for p in policies]
     slices, off = [], 0
     for w in widths:
         slices.append(slice(off, off + w))
         off += w
     return {"tasks": list(tasks), "policies": policies, "widths": widths,
-            "slices": slices, "n_logits": off, "mixed": any(w == 3 for w in widths)}
+            "slices": slices, "n_logits": off, "mixed": any(w == 3 for w in widths),
+            "per_task": (u == "mixed") or len(set(policies)) > 1}
 
 
 def num_output_logits(cfg: dict) -> int:
@@ -815,7 +832,7 @@ def print_config(cfg: dict):
     print("  --- data ---------------------------------------------------------")
     print(f"  u_policy          : {cfg['labels']['u_policy']}")
     _lay = task_layout(cfg)
-    if _lay["mixed"]:
+    if _lay["per_task"]:
         print("  per-task u-policy : "
               + ", ".join(f"{t}={p}" for t, p in zip(cfg["tasks"], _lay["policies"])))
     print(f"  image (W x H)     : {img['width']} x {img['height']}  "
@@ -902,6 +919,21 @@ def print_model_summary(model, cfg: dict):
     print(f"  trainable params  : {trainable:,}  ({trainable / 1e6:.2f} M, {pct:.1f}%)")
     print(f"  frozen params     : {frozen:,}  ({frozen / 1e6:.2f} M)")
     print("=" * 70)
+
+
+def _gpu_mem_report(device, reset: bool = True) -> str:
+    """Peak + current RESERVED GPU memory (GB) for the window since the last call
+    that reset. Reading max_memory_reserved() then resetting the peak stats yields
+    the peak over the interval between this print and the previous one — the
+    OOM-relevant footprint. Returns '' on CPU (no-op). Reserved (not allocated) is
+    used because that's what the caching allocator actually holds from the GPU."""
+    if device is None or device.type != "cuda":
+        return ""
+    peak = torch.cuda.max_memory_reserved() / (1024 ** 3)
+    now = torch.cuda.memory_reserved() / (1024 ** 3)
+    if reset:
+        torch.cuda.reset_peak_memory_stats()
+    return f"  gpu_mem(peak/now)={peak:.2f}/{now:.2f}GB"
 
 
 @torch.no_grad()
@@ -1090,7 +1122,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             print(f"  Epoch {epoch + 1}/{n_epochs}  epoch_step: {i}/{n_batches}  "
                   f"global_step: {global_step}/{total_steps}  "
                   f"loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
-                  f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}")
+                  f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}"
+                  f"{_gpu_mem_report(device)}")
 
         if log_fn is not None and (global_step % wandb_log_every == 0 or i == 1):
             _safe("wandb", log_fn, {
@@ -1276,7 +1309,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         d_val_loss = _fmt_delta(val_loss, track["prev_val_loss"])   # vs last validation
         print("-" * 70)
         print(f"  🔎 [VAL] epoch={epoch + 1}/{epochs} step={gstep}  elapsed={fmt_duration(elapsed())}  "
-              f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}{d_val_loss}")
+              f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}{d_val_loss}"
+              f"{_gpu_mem_report(device)}")
         pm = track["prev_macro"]            # previous validation's macro (None on 1st)
         def _d(key):                        # delta vs last validation for a macro key
             return _fmt_delta(macro[key], pm[key] if pm is not None else None)

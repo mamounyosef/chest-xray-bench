@@ -1,0 +1,23 @@
+{
+  "experiment": "densenet121_cons_zeros",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8084708135042741,
+  "best_step": 9000,
+  "best_epoch": 4,
+  "best_metrics": {
+    "mean_auroc": 0.8084708135042741,
+    "mean_auprc": 0.5723453558779645,
+    "mean_f1": 0.46486174479115033,
+    "mean_precision": 0.6370944776724728,
+    "mean_recall": 0.4093604874251164,
+    "mean_specificity": 0.9177461694623718,
+    "val_loss": 0.3945409027069651
+  },
+  "last_step": 15000,
+  "total_steps": 26870,
+  "elapsed_sec": 8029.69,
+  "elapsed_human": "2h 13m",
+  "updated": "2026-06-21T16:09:35"
+}

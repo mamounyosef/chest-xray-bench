@@ -69,7 +69,7 @@ augmentation:
 # Assurance that preprocessing & augmentation look right. 0 = disabled.
 # ----------------------------------------------------------------------------
 debug:
-  save_images_every: 200
+  save_images_every: 400
   dir: "debugged_images"
 
 # ----------------------------------------------------------------------------
