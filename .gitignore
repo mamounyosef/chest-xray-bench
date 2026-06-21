@@ -3,8 +3,6 @@ debugged_images/
 checkpoints/
 train_config/
 
-densenet121/
-
 modal_commants.txt
 # Byte-compiled / optimized / DLL files
 __pycache__/
