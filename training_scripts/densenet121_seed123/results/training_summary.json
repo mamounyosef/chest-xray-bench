@@ -1,0 +1,15 @@
+{
+  "experiment": "densenet121_seed123",
+  "status": "running",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8023038912580838,
+  "best_step": 0,
+  "best_epoch": 0,
+  "best_metrics": null,
+  "last_step": 16200,
+  "total_steps": 26870,
+  "elapsed_sec": 9664.03,
+  "elapsed_human": "2h 41m",
+  "updated": "2026-06-21T21:31:12"
+}
