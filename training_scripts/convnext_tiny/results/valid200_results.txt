@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : convnext_tiny
+  checkpoint : /runs/convnext_tiny/results/checkpoints/best.pt
+  images     : 234    device: cuda    amp: False
+  use_clahe  : False    u_policy: ones    val_loss: 0.43164
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8671        mean AUPRC : 0.6824
+    mean F1    : 0.6238    mean precision: 0.6036    mean recall: 0.7559    mean spec: 0.8081
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.228  0.8255  0.6903  0.6919  0.6095  0.8000  0.7338      80
+    Cardiomegaly        0.220  0.8342  0.7432  0.5306  0.8667  0.3824  0.9759      68
+    Consolidation       0.193  0.8814  0.4990  0.4959  0.3409  0.9091  0.7114      33
+    Edema               0.294  0.9158  0.7588  0.7184  0.6379  0.8222  0.8889      45
+    Pleural Effusion    0.405  0.8785  0.7209  0.6824  0.5631  0.8657  0.7305      67
+======================================================================================
