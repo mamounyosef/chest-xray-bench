@@ -930,18 +930,17 @@ def print_model_summary(model, cfg: dict):
 
 
 def _gpu_mem_report(device, reset: bool = True) -> str:
-    """Peak + current RESERVED GPU memory (GB) for the window since the last call
-    that reset. Reading max_memory_reserved() then resetting the peak stats yields
-    the peak over the interval between this print and the previous one — the
-    OOM-relevant footprint. Returns '' on CPU (no-op). Reserved (not allocated) is
-    used because that's what the caching allocator actually holds from the GPU."""
+    """Peak RESERVED GPU memory (GB) for the window since the last call that reset.
+    Reading max_memory_reserved() then resetting the peak stats yields the peak
+    over the interval between this print and the previous one — the OOM-relevant
+    footprint. Returns '' on CPU (no-op). Reserved (not allocated) is used because
+    that's what the caching allocator actually holds from the GPU."""
     if device is None or device.type != "cuda":
         return ""
     peak = torch.cuda.max_memory_reserved() / (1024 ** 3)
-    now = torch.cuda.memory_reserved() / (1024 ** 3)
     if reset:
         torch.cuda.reset_peak_memory_stats()
-    return f"  gpu_mem(peak/now)={peak:.2f}/{now:.2f}GB"
+    return f"  gpu_mem(peak)={peak:.2f}GB"
 
 
 @torch.no_grad()
