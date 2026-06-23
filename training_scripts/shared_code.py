@@ -1513,7 +1513,7 @@ def run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=Non
 # Packages installed into the Modal container image. torch's default Linux wheel
 # is CUDA-enabled; opencv-headless avoids the GUI libs we don't need on a server.
 _MODAL_PIP = [
-    "torch", "torchvision", "numpy", "pandas", "scikit-learn",
+    "torch", "torchvision", "timm", "numpy", "pandas", "scikit-learn",
     "opencv-python-headless", "pillow", "pyyaml", "wandb",
 ]
 
