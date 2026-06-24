@@ -385,6 +385,47 @@ def seed_worker(worker_id: int):
     random.seed(worker_seed)
 
 
+class ResumableSampler(torch.utils.data.Sampler):
+    """Deterministic shuffling sampler that supports a CLEAN mid-epoch resume.
+
+    Each epoch's permutation is a pure function of (seed, epoch) — torch.randperm
+    under a generator seeded `seed + epoch` — so it is identical whether or not
+    the run was resumed (no dependence on how many epochs ran before). For a
+    mid-epoch resume, `set_epoch(epoch, skip=k)` makes the NEXT iteration yield
+    that epoch's permutation with the first `k` SAMPLE indices dropped — so the
+    DataLoader workers never load the already-trained samples (no wasted decode).
+    Because the dropped indices are just the head of the same permutation, the
+    resumed epoch trains on exactly the tail it would have anyway. The skip clears
+    after that one epoch; later epochs shuffle fully via their own seed+epoch.
+
+    `__len__` stays the FULL epoch size so steps_per_epoch / the LR-schedule
+    budget are unaffected; the resume epoch simply yields fewer batches."""
+
+    def __init__(self, n: int, seed: int):
+        self.n = int(n)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.skip = 0
+
+    def set_epoch(self, epoch: int, skip: int = 0):
+        """Select which epoch's permutation to produce next, and how many leading
+        SAMPLE indices to drop (mid-epoch resume; 0 = full epoch)."""
+        self.epoch = int(epoch)
+        self.skip = max(0, int(skip))
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        perm = torch.randperm(self.n, generator=g).tolist()
+        if self.skip:
+            perm = perm[self.skip:]
+            self.skip = 0                 # only the first (resume) epoch is truncated
+        return iter(perm)
+
+    def __len__(self):
+        return self.n
+
+
 def make_loaders(cfg: dict):
     """Build the train + val DataLoaders from cfg (split CSVs + dataloader.*).
     Seeded generator + worker_init_fn for deterministic shuffling/augmentation."""
@@ -431,7 +472,11 @@ def make_loaders(cfg: dict):
             kw.update(prefetch_factor=pf, persistent_workers=pw)
         return kw
 
-    train_loader = DataLoader(train_ds, batch_size=tr_bs, shuffle=True,
+    # ResumableSampler (instead of shuffle=True) so a mid-epoch resume can skip
+    # already-trained batches at the INDEX level — workers never load them. The
+    # loader generator `g` still seeds the workers (base_seed) for augmentation.
+    train_sampler = ResumableSampler(len(train_ds), cfg["reproducibility"]["seed"])
+    train_loader = DataLoader(train_ds, batch_size=tr_bs, sampler=train_sampler,
                               drop_last=bool(dl["drop_last"]), generator=g,
                               **_kw(tr_nw, tr_pin, tr_pf, tr_pw))
     val_loader = DataLoader(val_ds, batch_size=va_bs, shuffle=False,
@@ -1091,13 +1136,17 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
     clip = grad_clip if grad_clip else math.inf      # inf -> measure norm, no clip
     stop = False
     n_batches = len(loader)
+    # The ResumableSampler has already dropped the first `skip_batches` batches at
+    # the index level (workers never loaded them), so enumerate() starts directly
+    # at the resume point. We only OFFSET the displayed per-epoch batch number so
+    # the logs still read as batch (skip_batches+1) .. n_batches.
     if skip_batches > 0:
-        print(f"  ⏩ resuming mid-epoch: skipping the first {skip_batches}/{n_batches} "
-              f"already-trained batches of this epoch ...")
+        print(f"  ⏩ resuming mid-epoch: sampler fast-forwarded past the first "
+              f"{skip_batches}/{n_batches} already-trained batches (no reload) — "
+              f"training continues at batch {skip_batches + 1}.")
 
     for i, (imgs, labels) in enumerate(loader, start=1):
-        if i <= skip_batches:        # already done before the checkpoint — fast-forward
-            continue
+        ep_step = i + skip_batches       # 1-indexed batch number within the FULL epoch
         t0 = time.time()
         imgs = imgs.to(device, non_blocking=True)
         if channels_last:
@@ -1138,13 +1187,13 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             "lr": lr, "grad_norm": round(float(grad_norm), 6),
             "imgs_per_s": round(imgs_per_s, 1), "sec_per_step": round(dt, 4),
         })
-        if global_step % console_log_every == 0 or i == skip_batches + 1:
+        if global_step % console_log_every == 0 or i == 1:
             cur_loss = loss.item()
             # delta vs the previous CONSOLE-printed train loss (persists across
             # epochs via a function attribute); empty on the very first print.
             d_loss = _fmt_delta(cur_loss, getattr(train_one_epoch, "_last_print_loss", None))
             train_one_epoch._last_print_loss = cur_loss
-            print(f"  Epoch {epoch + 1}/{n_epochs}  epoch_step: {i}/{n_batches}  "
+            print(f"  Epoch {epoch + 1}/{n_epochs}  epoch_step: {ep_step}/{n_batches}  "
                   f"global_step: {global_step}/{total_steps}  "
                   f"loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
                   f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}"
@@ -1157,7 +1206,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             }, global_step)
 
         if debug_dir is not None and debug_every > 0 and global_step % debug_every == 0:
-            _safe("debug_image", _save_debug_image, imgs, cfg, debug_dir, epoch + 1, i)
+            _safe("debug_image", _save_debug_image, imgs, cfg, debug_dir, epoch + 1, ep_step)
 
         if checkpoint_fn is not None and checkpoint_every > 0 \
                 and global_step % checkpoint_every == 0:
@@ -1430,6 +1479,11 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         # only the first epoch after a mid-epoch resume fast-forwards already-done
         # batches; every later epoch starts clean.
         skip = resume_skip if epoch == start_epoch else 0
+        # tell the sampler which epoch's permutation to draw and how many leading
+        # samples to drop, so the workers never load already-trained batches.
+        _samp = getattr(train_loader, "sampler", None)
+        if hasattr(_samp, "set_epoch"):
+            _samp.set_epoch(epoch, skip * int(train_loader.batch_size))
         global_step, stop = train_one_epoch(
             model, train_loader, optimizer, loss_fn, scaler, device,
             epoch, global_step, train_logger, amp, grad_clip, ev_steps, on_eval,
