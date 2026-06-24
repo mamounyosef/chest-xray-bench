@@ -1,0 +1,146 @@
+# =============================================================================
+# config.yaml  —  experiment: convnext_tiny_22k
+#   (ConvNeXt-T, timm fb_in22k_ft_in1k_384, CLAHE off, U-Ones)
+# -----------------------------------------------------------------------------
+# Same architecture + pipeline as the convnext_tiny run (CLAHE off, U-Ones, seed
+# 42, 384x320 input on OUR data, L4); the ONLY difference is the pretrained
+# weights: ImageNet-22k pretrained (@224) -> ImageNet-1k fine-tuned (@384),
+# loaded via timm (NOT torchvision — see train.py). Holds only what VARIES per
+# experiment; common settings come from ../shared_config.yaml (this file wins).
+# =============================================================================
+
+experiment:
+  name: "convnext_tiny_22k"
+
+model:
+  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-T
+  # pretrained on ImageNet-22k (@224) then fine-tuned on ImageNet-1k (@384).
+  # (Distinct from torchvision's IN-1k-only convnext_tiny used by the other run,
+  #  and from timm's "in12k_*" tags which are an 11,821-class subset, NOT IN-22k.)
+  name: "convnext_tiny.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
+  pretrained: true                             # IN-22k->IN-1k weights (timm, see train.py)
+
+# ----------------------------------------------------------------------------
+# Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
+#   null     : fresh run
+#   "best"   : results/checkpoints/best.pt
+#   "last"   : newest rolling checkpoint
+#   <int>    : a specific step, e.g. 1200  ->  ckpt_step1200.pt
+#   <path>   : explicit checkpoint file path
+# Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Label policy  —  uncertain (-1) handling. "ones" | "zeros". Blank/NaN -> 0.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "ones"
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
+# only difference is the architecture (ConvNeXt-T vs ResNet-50).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+# ----------------------------------------------------------------------------
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         256
+  val_num_workers:        10
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+training:
+  epochs:        10
+  amp:           true        # mixed precision (A100)
+  grad_clip:     null        # max-norm, or null to disable
+
+  optimizer:                 # AdamW always
+    lr:           1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 1
+    min_lr:      1.0e-6
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    name: "bce_with_logits"  # multi-label binary cross-entropy on logits
+    pos_weight: null         # null = unweighted; or per-task list
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 10              # counted in VALIDATIONS, not epochs
+
+# ----------------------------------------------------------------------------
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+
+
+# ----------------------------------------------------------------------------
+# Modal  —  cloud run resources + volume layout for THIS experiment.
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : paths INSIDE the data volume; these
+#       override paths.data_root / paths.data_dir when running on Modal.
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "L4"
+  cpu_cores: 8
+  memory_gb: 50
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY
