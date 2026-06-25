@@ -1,0 +1,159 @@
+# =============================================================================
+# config.yaml  —  experiment: swin_base_22k
+#   (Swin-B, timm swin_base_patch4_window12_384.ms_in22k_ft_in1k, CLAHE off, U-Ones)
+# -----------------------------------------------------------------------------
+# Identical to the swin_base run EXCEPT the pretrained weights: this one is
+# ImageNet-22k pretrained (@224) -> ImageNet-1k fine-tuned (@384), matching the
+# scheme of convnext_tiny_22k / convnext_base_22k (swin_base used IN-1k only).
+# Still a Swin Transformer backbone (built with timm, not torchvision — see
+# train.py) on a 384x384 SQUARE input (the image: override below) since this Swin
+# variant needs a fixed 384x384. Holds only what VARIES per experiment; common
+# settings come from ../shared_config.yaml and are merged in (this file wins).
+# =============================================================================
+
+experiment:
+  name: "swin_base_22k"
+
+model:
+  # timm model id WITH an explicit pretrained tag. ".ms_in22k_ft_in1k" =
+  # ImageNet-22k pretrained (@224) then fine-tuned on ImageNet-1k (@384) — the
+  # 22k->1k scheme, consistent with the convnext_*_22k runs. (The swin_base run
+  # instead pinned ".ms_in1k", which is ImageNet-1k only.)
+  name: "swin_base_patch4_window12_384.ms_in22k_ft_in1k"   # timm id (NOT torchvision)
+  pretrained: true                                # IN-22k->IN-1k weights (timm, see train.py)
+
+# ----------------------------------------------------------------------------
+# Image geometry  —  per-experiment OVERRIDE of the shared 384x320. Swin-B
+# (swin_base_patch4_window12_384) requires a fixed 384x384 SQUARE input, so we
+# pad to a square here: the data layer does aspect-preserving resize to fit
+# inside width x height + center zero-pad to exactly that size. width/height ARE
+# the configurable padding target; interpolation / channels / normalization are
+# inherited from shared_config's image block via deep-merge.
+# ----------------------------------------------------------------------------
+image:
+  width:  384
+  height: 384
+
+# ----------------------------------------------------------------------------
+# Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
+#   null     : fresh run
+#   "best"   : results/checkpoints/best.pt
+#   "last"   : newest rolling checkpoint
+#   <int>    : a specific step, e.g. 1200  ->  ckpt_step1200.pt
+#   <path>   : explicit checkpoint file path
+# Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Label policy  —  uncertain (-1) handling. "ones" | "zeros". Blank/NaN -> 0.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "ones"
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF for this experiment (held identical to the other runs).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+# ----------------------------------------------------------------------------
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         512
+  val_num_workers:        10
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+training:
+  epochs:        10
+  amp:           true        # mixed precision (A100)
+  grad_clip:     null        # max-norm, or null to disable
+
+  optimizer:                 # AdamW always
+    lr:           1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 1
+    min_lr:      1.0e-6
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    name: "bce_with_logits"  # multi-label binary cross-entropy on logits
+    pos_weight: null         # null = unweighted; or per-task list
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 10              # counted in VALIDATIONS, not epochs
+
+# ----------------------------------------------------------------------------
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+
+
+# ----------------------------------------------------------------------------
+# Modal  —  cloud run resources + volume layout for THIS experiment.
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : paths INSIDE the data volume; these
+#       override paths.data_root / paths.data_dir when running on Modal.
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "A100-80GB"          # Swin-B/384 @ batch 64 needs the 80GB card (OOMs on L4)
+  cpu_cores: 8
+  memory_gb: 60
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY

@@ -1,0 +1,23 @@
+{
+  "experiment": "swin_base_22k",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.803620456736418,
+  "best_step": 13200,
+  "best_epoch": 5,
+  "best_metrics": {
+    "mean_auroc": 0.803620456736418,
+    "mean_auprc": 0.6041533275535053,
+    "mean_f1": 0.47632438202415733,
+    "mean_precision": 0.6335535311383989,
+    "mean_recall": 0.42588784491117027,
+    "mean_specificity": 0.9076936544549803,
+    "val_loss": 0.4415969006303717
+  },
+  "last_step": 19200,
+  "total_steps": 26870,
+  "elapsed_sec": 8995.78,
+  "elapsed_human": "2h 29m",
+  "updated": "2026-06-24T22:16:42"
+}
