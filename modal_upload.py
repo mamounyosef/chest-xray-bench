@@ -34,7 +34,7 @@ vol = modal.Volume.from_name(VOLUME, create_if_missing=True)
 
 
 @app.function(image=image, volumes={MOUNT: vol}, timeout=6 * 3600)
-def extract(archive: str):
+def extract(archive: str, expected: str = "CheXpert-v1.0-small"):
     import os
     import subprocess
     import tarfile
@@ -68,7 +68,7 @@ def extract(archive: str):
         # RAR (or anything else): try bsdtar (libarchive, solid RAR5 support),
         # then unar, then unrar. Accept the first that exits 0 AND produces the
         # expected folder.
-        expected = f"{MOUNT}/CheXpert-v1.0-small"
+        exp_dir = f"{MOUNT}/{expected}"
         attempts = [
             ["bsdtar", "-x", "-f", path, "-C", MOUNT],
             ["unar", "-quiet", "-force-overwrite", "-output-directory", MOUNT, path],
@@ -77,7 +77,7 @@ def extract(archive: str):
         for cmd in attempts:
             print(f"[extract] not zip/tar; trying {cmd[0]} ...")
             rc = subprocess.run(cmd).returncode
-            if rc == 0 and os.path.isdir(expected):
+            if rc == 0 and os.path.isdir(exp_dir):
                 kind = cmd[0]
                 break
             print(f"[extract] {cmd[0]} failed (rc={rc}); trying next ...")
@@ -92,10 +92,10 @@ def extract(archive: str):
 
     # sanity: confirm the dataset landed where the config expects it
     print(f"[extract] {MOUNT} now contains: {sorted(os.listdir(MOUNT))[:12]}")
-    expected = f"{MOUNT}/CheXpert-v1.0-small"
-    if not os.path.isdir(expected):
-        print(f"[extract] ⚠️  expected '{expected}' not found — check the archive's "
-              f"top-level folder name (data_root expects /CheXpert-v1.0-small).")
+    exp_dir = f"{MOUNT}/{expected}"
+    if not os.path.isdir(exp_dir):
+        print(f"[extract] ⚠️  expected '{exp_dir}' not found — check the archive's "
+              f"top-level folder name (data_root expects /{expected}).")
 
     os.remove(path)                                    # drop the archive, keep the files
     print("[extract] removed the archive; committing volume (indexing files)...")
@@ -105,5 +105,7 @@ def extract(archive: str):
 
 
 @app.local_entrypoint()
-def main(archive: str = "chexpert.zip"):
-    extract.remote(archive)
+def main(archive: str = "chexpert.zip", expected: str = "CheXpert-v1.0-small"):
+    # `expected` is the archive's top-level folder name to verify after extract
+    # (CheXpert default). For ChestX-ray14:  --archive chestxray14.rar --expected chestxray14
+    extract.remote(archive, expected)

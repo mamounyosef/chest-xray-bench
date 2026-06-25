@@ -227,6 +227,18 @@ def num_output_logits(cfg: dict) -> int:
     return task_layout(cfg)["n_logits"]
 
 
+def finetune_ckpt_subdir(cfg: dict) -> str:
+    """Subfolder under results/checkpoints that holds the CheXpert model's
+    checkpoints. For a two-stage run (pretrain.enable) that's the fine-tune stage's
+    folder; calibration/evaluation — which always score the CheXpert model — read
+    from there. Returns '' for a single-stage run (the flat checkpoints/ folder),
+    so every existing experiment is unchanged."""
+    pre = cfg.get("pretrain") or {}
+    if pre.get("enable"):
+        return pre.get("finetune_stage_name", "finetune_chexpert")
+    return ""
+
+
 def build_labels(df: pd.DataFrame, tasks: list, policies="ones") -> pd.DataFrame:
     """Raw labels (1 / 0 / -1 / blank) -> per-task target column, per that task's
     policy. blanks/NaN -> the NEGATIVE class always (0) for every policy.
@@ -354,7 +366,9 @@ class CheXpertDataset(Dataset):
         self.cfg = cfg
         self.split = split
         self.tasks = cfg["tasks"]
-        self.paths = df["Path"].tolist()
+        # path_column is configurable so a stage with a different CSV schema can be
+        # read by the SAME data layer (CheXpert uses 'Path'; ChestX-ray14 'path').
+        self.paths = df[cfg["paths"].get("path_column", "Path")].tolist()
         self.layout = task_layout(cfg)            # per-task policy plan (binary or mixed)
         # .copy() -> writable array (silences the non-writable-tensor warning)
         self.labels = torch.from_numpy(
@@ -770,9 +784,11 @@ def _write_summary(path: Path, data: dict):
 
 
 def _save_debug_image(imgs: torch.Tensor, cfg: dict, debug_dir: Path,
-                      epoch: int, epoch_step: int):
+                      epoch: int, epoch_step: int, stage_tag: str = None):
     """Save ONE random sample from the batch exactly as the model sees it
-    (un-normalized back to [0,1] for viewing) -> debug_dir/e{epoch}_{step}.png."""
+    (un-normalized back to [0,1] for viewing) -> debug_dir/e{epoch}_{step}.png.
+    When a stage_tag is given (two-stage runs), it prefixes the filename so the
+    two stages' debug images accumulate in the SAME folder without overwriting."""
     idx = random.randrange(imgs.size(0))
     t = imgs[idx].detach().float().cpu()                       # (C,H,W) normalized
     mean = torch.tensor(cfg["image"]["norm_mean"][:t.shape[0]]).view(-1, 1, 1)
@@ -783,7 +799,8 @@ def _save_debug_image(imgs: torch.Tensor, cfg: dict, debug_dir: Path,
         arr = arr[:, :, 0]
     debug_dir = Path(debug_dir)
     debug_dir.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(arr).save(debug_dir / f"e{epoch}_{epoch_step}.png")
+    prefix = f"{stage_tag}_" if stage_tag else ""
+    Image.fromarray(arr).save(debug_dir / f"{prefix}e{epoch}_{epoch_step}.png")
 
 
 def _monitor_value(macro: dict, val_loss: float, monitor: str) -> float:
@@ -817,11 +834,19 @@ def fmt_duration(seconds: float) -> str:
 
 
 def _flatten_val_row(epoch: int, gstep: int, val_loss: float, metrics: dict,
-                     tasks: list, elapsed_sec: float, eta_sec: float) -> dict:
-    """Flatten validation metrics into one wide CSV row (macro + per-task)."""
-    row = {"step": gstep, "epoch": epoch, "elapsed_sec": round(elapsed_sec, 2),
-           "eta_sec": round(eta_sec, 2) if math.isfinite(eta_sec) else "",
-           "val_loss": round(val_loss, 6)}
+                     tasks: list, elapsed_sec: float, eta_sec: float,
+                     stage_tag: str = None) -> dict:
+    """Flatten validation metrics into one wide CSV row (macro + per-task). When a
+    stage_tag is given (two-stage runs), a 'stage' column is added so the two
+    stages' rows — stacked in the SAME val_log.csv — stay distinguishable. When it
+    is None (every single-stage run) the column is omitted, so the schema is
+    byte-identical to before."""
+    row = {"step": gstep, "epoch": epoch}
+    if stage_tag is not None:
+        row["stage"] = stage_tag
+    row.update({"elapsed_sec": round(elapsed_sec, 2),
+                "eta_sec": round(eta_sec, 2) if math.isfinite(eta_sec) else "",
+                "val_loss": round(val_loss, 6)})
     for k, v in metrics["macro"].items():
         row[k] = round(v, 6)
     for t in tasks:
@@ -876,6 +901,11 @@ def print_config(cfg: dict):
     print(f"  model             : {cfg.get('model', {}).get('name', '<unset>')}"
           f"  (pretrained={cfg.get('model', {}).get('pretrained')})")
     print(f"  resume            : {cfg.get('resume')}")
+    _pre = cfg.get("pretrain") or {}
+    if _pre.get("enable"):
+        print(f"  pretraining       : ENABLED  (Stage 1 ChestX-ray14 -> Stage 2 CheXpert)"
+              f"  stages: {_pre.get('stage_name', 'pretrain_chestxray14')} -> "
+              f"{_pre.get('finetune_stage_name', 'finetune_chexpert')}")
     print(f"  tasks ({len(cfg['tasks'])})         : {cfg['tasks']}")
     print("  --- paths --------------------------------------------------------")
     p = cfg["paths"]
@@ -1124,7 +1154,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                     cfg: dict = None, debug_dir=None, debug_every: int = 0,
                     channels_last: bool = False,
                     checkpoint_fn=None, checkpoint_every: int = 0,
-                    scheduler=None, n_epochs: int = 0, skip_batches: int = 0) -> tuple:
+                    scheduler=None, n_epochs: int = 0, skip_batches: int = 0,
+                    stage_tag: str = None, wandb_prefix: str = "") -> tuple:
     """One epoch of training. Logs every step (loss/lr/grad_norm/throughput/elapsed/eta)
     and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop).
 
@@ -1179,14 +1210,17 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         imgs_per_s = imgs.size(0) / dt if dt > 0 else 0.0
         el = elapsed_fn()
         eta = eta_fn(global_step)
-        _safe("train_log", train_logger.log, {
-            "step": global_step, "epoch": epoch + 1,     # 1-indexed for humans
+        train_row = {"step": global_step, "epoch": epoch + 1}   # 1-indexed for humans
+        if stage_tag is not None:
+            train_row["stage"] = stage_tag                      # two-stage: which stage
+        train_row.update({
             "elapsed_sec": round(el, 2),
             "eta_sec": round(eta, 2) if math.isfinite(eta) else "",
             "train_loss": round(loss.item(), 6),
             "lr": lr, "grad_norm": round(float(grad_norm), 6),
             "imgs_per_s": round(imgs_per_s, 1), "sec_per_step": round(dt, 4),
         })
+        _safe("train_log", train_logger.log, train_row)
         if global_step % console_log_every == 0 or i == 1:
             cur_loss = loss.item()
             # delta vs the previous CONSOLE-printed train loss (persists across
@@ -1201,12 +1235,14 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
 
         if log_fn is not None and (global_step % wandb_log_every == 0 or i == 1):
             _safe("wandb", log_fn, {
-                "train/loss": loss.item(), "train/lr": lr,
-                "train/grad_norm": float(grad_norm), "train/imgs_per_s": imgs_per_s,
+                f"{wandb_prefix}train/loss": loss.item(), f"{wandb_prefix}train/lr": lr,
+                f"{wandb_prefix}train/grad_norm": float(grad_norm),
+                f"{wandb_prefix}train/imgs_per_s": imgs_per_s,
             }, global_step)
 
         if debug_dir is not None and debug_every > 0 and global_step % debug_every == 0:
-            _safe("debug_image", _save_debug_image, imgs, cfg, debug_dir, epoch + 1, ep_step)
+            _safe("debug_image", _save_debug_image, imgs, cfg, debug_dir,
+                  epoch + 1, ep_step, stage_tag)
 
         if checkpoint_fn is not None and checkpoint_every > 0 \
                 and global_step % checkpoint_every == 0:
@@ -1228,18 +1264,35 @@ def _fmt_delta(curr, prev) -> str:
     return f" ({curr - prev:+.4f})"
 
 
-def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None):
-    """End-to-end training for one experiment. Identical machinery for every run;
-    only the injected `model` and cfg overrides differ. Trains on 01_train.csv,
-    validates on 01_val.csv, checkpoints (rolling + best by mean AUROC), early-stops.
+def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None,
+                    *, ckpt_subdir: str = "", stage_tag: str = None,
+                    stage_header: str = None, init_weights_from=None):
+    """End-to-end training for ONE stage. Identical machinery for every run; only
+    the injected `model` and cfg overrides differ. Trains on the cfg's train_csv,
+    validates on its val_csv, checkpoints (rolling + best by mean AUROC), early-stops.
     NOTE: official 200/500 reporting is intentionally NOT done here.
-    Wrapped by run_experiment(), which tees all console output to a per-run txt."""
+    Wrapped by run_experiment(), which tees all console output to a per-run txt.
+
+    Stage-aware (optional, all default to the original single-stage behavior):
+      ckpt_subdir       : subfolder under results/checkpoints to write this stage's
+                          checkpoints into ('' -> the flat folder; every existing run).
+      stage_tag         : labels the stage in the train/val CSV ('stage' column),
+                          the W&B namespace, the console banners, AND the key under
+                          which this stage's snapshot is nested inside the SINGLE
+                          shared training_summary.json (None -> flat, as before).
+      stage_header      : one-line stage description printed in the run header.
+      init_weights_from : path to a checkpoint whose MODEL weights (backbone + head)
+                          are loaded before training — used to seed the CheXpert
+                          fine-tune stage from the ChestX-ray14 pretrain best.pt."""
     experiment_dir = Path(experiment_dir)
     rep = cfg["reproducibility"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    wandb_prefix = f"{stage_tag}/" if stage_tag else ""
 
     print("#" * 70)
     print(f"# 🚀 run_experiment: {cfg.get('experiment', {}).get('name', '<unnamed>')}")
+    if stage_header:
+        print(f"# 🧬 {stage_header}")
     print(f"# 🖥️  device={device}  epochs={cfg['training']['epochs']}")
     print("#" * 70)
 
@@ -1249,16 +1302,39 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     # --- output layout ---
     out = cfg["output"]
     results_dir = experiment_dir / out["run_dir"]
+    # Each stage keeps its OWN checkpoints subfolder (ckpt_subdir); single-stage
+    # runs pass '' and write straight into results/checkpoints (unchanged).
     ckpt_dir = results_dir / out["checkpoints_dir"]
+    if ckpt_subdir:
+        ckpt_dir = ckpt_dir / ckpt_subdir
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # train/val CSVs + debug images + plots are SHARED across stages (rows stack,
+    # disambiguated by the 'stage' column); only checkpoints + the summary split.
     train_logger = CSVLogger(results_dir / out["train_log_csv"])
     val_logger = CSVLogger(results_dir / out["val_log_csv"])
     print(f"[paths] results -> {results_dir}")
+    print(f"[paths] checkpoints -> {ckpt_dir}")
 
     # --- data / model / optim ---
     train_loader, val_loader = make_loaders(cfg)
     model = model.to(device)
     print_model_summary(model, cfg)
+
+    # Seed this stage's model from a prior stage's weights (e.g. ChestX-ray14
+    # pretrain best.pt -> CheXpert fine-tune). Loaded into the un-compiled module
+    # BEFORE channels_last/compile so the plain state-dict keys match. Skipped when
+    # resuming (load_checkpoint below restores the full state, weights included).
+    if init_weights_from is not None and resume is None:
+        print("=" * 70)
+        print("🧬 [stage-init] initializing model from a previous stage's checkpoint")
+        print(f"   source : {init_weights_from}")
+        _ck = torch.load(init_weights_from, map_location=device, weights_only=False)
+        _unwrap(model).load_state_dict(_ck["model"])
+        print(f"   ✅ loaded full model (backbone + head)  "
+              f"(pretrain step={_ck.get('global_step')}, epoch={_ck.get('epoch')}, "
+              f"best_score={_ck.get('best_score')})")
+        print("=" * 70)
+        del _ck
 
     # performance options (CUDA-only)
     perf = cfg.get("performance", {})
@@ -1384,10 +1460,31 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             "updated": datetime.now().isoformat(timespec="seconds"),
         }
 
+    def _persist_summary(status: str):
+        """Write the best-so-far snapshot. Single-stage runs keep the original flat
+        JSON. Two-stage runs share ONE training_summary.json: each stage's snapshot
+        is nested under stages[<stage_tag>], so the file always holds BOTH stages
+        (merged, never overwriting the other stage's record)."""
+        snap = _summary(status)
+        if stage_tag is None:
+            _write_summary(summary_path, snap)
+            return
+        try:
+            doc = json.load(open(summary_path, encoding="utf-8")) if summary_path.exists() else {}
+            if not isinstance(doc.get("stages"), dict):
+                doc = {}
+        except Exception:
+            doc = {}
+        doc.setdefault("stages", {})[stage_tag] = snap
+        doc["experiment"] = snap["experiment"]
+        doc["updated"] = snap["updated"]
+        _write_summary(summary_path, doc)
+
     # --- validation + checkpoint + early-stop, shared by step- and epoch-eval ---
     def on_eval(epoch: int, gstep: int) -> bool:
         print("=" * 70)
-        print(f"🔎 VALIDATION START — epoch {epoch + 1}/{epochs}  step {gstep}  "
+        _stg = f"[{stage_tag}] " if stage_tag else ""
+        print(f"🔎 {_stg}VALIDATION START — epoch {epoch + 1}/{epochs}  step {gstep}  "
               f"({len(val_loader)} batches, {len(val_loader.dataset)} images) ...")
         val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device, amp, channels_last)
         macro = metrics["macro"]
@@ -1396,7 +1493,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         track["last_step"] = gstep
         _safe("val_log", val_logger.log,
               _flatten_val_row(epoch + 1, gstep, val_loss, metrics,
-                               cfg["tasks"], elapsed(), eta(gstep)))
+                               cfg["tasks"], elapsed(), eta(gstep), stage_tag))
 
         d_val_loss = _fmt_delta(val_loss, track["prev_val_loss"])   # vs last validation
         print("-" * 70)
@@ -1437,14 +1534,14 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         _safe("best-checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
               scheduler, scaler, epoch, gstep, track["best"], device, elapsed(),
               rolling=False, is_best=is_best, track=track)
-        _safe("summary", _write_summary, summary_path, _summary("running"))
+        _safe("summary", _persist_summary, "running")
         if log_fn is not None:            # W&B: same scores as the val CSV (no system stats)
-            wb = {"val/loss": val_loss}
-            wb.update({f"val/{k}": v for k, v in macro.items()})
+            wb = {f"{wandb_prefix}val/loss": val_loss}
+            wb.update({f"{wandb_prefix}val/{k}": v for k, v in macro.items()})
             for t in cfg["tasks"]:
                 pm = metrics["per_task"][t]
                 for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity"):
-                    wb[f"val/{key}/{t}"] = pm[key]
+                    wb[f"{wandb_prefix}val/{key}/{t}"] = pm[key]
             _safe("wandb", log_fn, wb, gstep)
         if persist_fn is not None:        # e.g. Modal volume.commit() -> live updates
             _safe("persist", persist_fn)
@@ -1464,7 +1561,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         _safe("checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
               scheduler, scaler, epoch, gstep, track["best"], device, elapsed(),
               rolling=True, is_best=False, track=track)
-        _safe("summary", _write_summary, summary_path, _summary("running"))
+        _safe("summary", _persist_summary, "running")
         if persist_fn is not None:
             _safe("persist", persist_fn)
         print(f"  💾 periodic checkpoint @ step {gstep} "
@@ -1474,7 +1571,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     stop = False
     for epoch in range(start_epoch, epochs):
         print("=" * 70)
-        print(f"📚 EPOCH {epoch + 1}/{epochs}")
+        _stg = f"  [{stage_tag}]" if stage_tag else ""
+        print(f"📚 EPOCH {epoch + 1}/{epochs}{_stg}")
         print("=" * 70)
         # only the first epoch after a mid-epoch resume fast-forwards already-done
         # batches; every later epoch starts clean.
@@ -1492,7 +1590,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             channels_last=channels_last,
             checkpoint_fn=save_periodic, checkpoint_every=ckpt_every,
             scheduler=(scheduler if sched_mode == "step" else None),
-            n_epochs=epochs, skip_batches=skip)
+            n_epochs=epochs, skip_batches=skip,
+            stage_tag=stage_tag, wandb_prefix=wandb_prefix)
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)
@@ -1507,7 +1606,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             break
 
     status = "early_stopped" if stop else "completed"
-    _safe("summary", _write_summary, summary_path, _summary(status))
+    _safe("summary", _persist_summary, status)
     if persist_fn is not None:
         _safe("persist", persist_fn)
     train_logger.close()
@@ -1518,6 +1617,127 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
           f"{fmt_duration(elapsed())} ({elapsed():.0f}s)")
     print("#" * 70)
     return track["best"]
+
+
+# -----------------------------------------------------------------------------
+# Two-stage training (optional): ChestX-ray14 pre-train -> CheXpert fine-tune.
+# Driven entirely by an optional `pretrain:` block in an experiment's config.yaml.
+# When that block is absent or pretrain.enable is false, _run_all_stages collapses
+# to a single _run_experiment call with the original defaults — so every existing
+# run is byte-for-byte unchanged.
+# -----------------------------------------------------------------------------
+
+def _build_pretrain_cfg(cfg: dict, pre: dict) -> dict:
+    """Derive the Stage-1 (ChestX-ray14) config from the experiment cfg + its
+    `pretrain` block. Everything not named in the block is INHERITED from cfg
+    (image geometry, augmentation, dataloader, performance, output, repro, modal,
+    wandb), so the only differences are the stage's data, tasks and (optionally)
+    its training/evaluation/labels/clahe overrides. The pretrain block itself is
+    dropped from the derived cfg so the pretrain stage can't recurse."""
+    pc = copy.deepcopy(cfg)
+    pc.pop("pretrain", None)
+    pc["tasks"] = list(pre["tasks"])                          # CXR14 column names
+    pc["paths"] = _deep_merge(cfg["paths"], pre.get("paths", {}))
+    for key in ("labels", "clahe", "training", "evaluation"):
+        if key in pre:
+            pc[key] = _deep_merge(cfg[key], pre[key])
+    return pc
+
+
+def _read_status(path: Path, stage: str = None):
+    """Read a status from training_summary.json (or None if missing/unreadable).
+    With `stage` given, read stages[<stage>].status from the unified two-stage
+    file; otherwise the flat top-level 'status'. Used to decide whether Stage 1 is
+    already complete (so a later run skips straight to fine-tuning)."""
+    try:
+        if Path(path).exists():
+            doc = json.load(open(path, encoding="utf-8"))
+            if stage is not None:
+                return (doc.get("stages") or {}).get(stage, {}).get("status")
+            return doc.get("status")
+    except Exception:
+        pass
+    return None
+
+
+def _run_all_stages(cfg: dict, model, experiment_dir, resume=None,
+                    persist_fn=None, log_fn=None):
+    """Orchestrate the run. Single-stage (no `pretrain` block) -> one plain
+    _run_experiment (unchanged behavior). Two-stage (`pretrain.enable: true`):
+
+        Stage 1  pre-train on ChestX-ray14  -> results/checkpoints/<stage_name>/
+        Stage 2  fine-tune on CheXpert      -> results/checkpoints/<finetune_stage_name>/
+
+    Stage 2 is seeded from Stage 1's best.pt (full model: backbone + head, since the
+    5 tasks map 1:1, Effusion == Pleural Effusion). Resume rules:
+      - top-level `resume` resumes the FINE-TUNE stage (Stage 1 assumed complete).
+      - `pretrain.resume` resumes the PRE-TRAIN stage.
+      - a finished Stage 1 (its summary status is completed/early_stopped) is
+        skipped automatically on a later run, going straight to fine-tuning."""
+    pre = cfg.get("pretrain") or {}
+    if not pre.get("enable", False):
+        # No pretraining: exactly the original single-stage run (flat checkpoints/,
+        # no 'stage' column, default summary) — every existing experiment unchanged.
+        return _run_experiment(cfg, model, experiment_dir, resume, persist_fn, log_fn)
+
+    experiment_dir = Path(experiment_dir)
+    out = cfg["output"]
+    results_dir = experiment_dir / out["run_dir"]
+    ckpt_root = results_dir / out["checkpoints_dir"]
+    pre_name = pre.get("stage_name", "pretrain_chestxray14")
+    ft_name = pre.get("finetune_stage_name", "finetune_chexpert")
+    best_name = out["best_name"]
+    # both stages share ONE training_summary.json (each nested under stages[<tag>]).
+    summary_path = results_dir / out.get("summary_json", "training_summary.json")
+    pre_resume = pre.get("resume")
+    pre_best = ckpt_root / pre_name / best_name
+
+    print("#" * 70)
+    print("# 🧬🧬  TWO-STAGE TRAINING ENABLED  🧬🧬")
+    print("#   Stage 1/2 : PRE-TRAIN on ChestX-ray14   -> checkpoints/{}/".format(pre_name))
+    print("#   Stage 2/2 : FINE-TUNE on CheXpert        -> checkpoints/{}/".format(ft_name))
+    print("#   handoff   : Stage-1 best.pt -> Stage-2 model init (backbone + head)")
+    print("#" * 70)
+
+    # ---- decide whether Stage 1 runs ----
+    pre_done = _read_status(summary_path, pre_name) in ("completed", "early_stopped")
+    if resume is not None and pre_resume is None:
+        run_stage1 = False
+        print(f"# ↪️  top-level resume='{resume}' set -> skipping Stage 1; "
+              f"resuming the FINE-TUNE stage.")
+    elif pre_done and pre_resume is None:
+        run_stage1 = False
+        print(f"# ✅ Stage 1 already complete (stages['{pre_name}'].status in "
+              f"training_summary.json); skipping pre-training, going to fine-tuning.")
+    else:
+        run_stage1 = True
+
+    # ---- Stage 1: ChestX-ray14 pre-training ----
+    if run_stage1:
+        pcfg = _build_pretrain_cfg(cfg, pre)
+        _run_experiment(
+            pcfg, model, experiment_dir, resume=pre_resume,
+            persist_fn=persist_fn, log_fn=log_fn,
+            ckpt_subdir=pre_name, stage_tag=pre_name,
+            stage_header="STAGE 1/2 — PRE-TRAIN on ChestX-ray14")
+
+    # ---- Stage 2: CheXpert fine-tuning ----
+    if resume is None:
+        # fresh fine-tune -> seed from Stage 1 best.pt
+        if not pre_best.exists():
+            raise FileNotFoundError(
+                f"Stage-1 best checkpoint not found: {pre_best}. Run/complete the "
+                f"ChestX-ray14 pre-training stage first (or set pretrain.resume).")
+        init_from = pre_best
+    else:
+        init_from = None        # resuming fine-tune: full state restored from its ckpt
+
+    return _run_experiment(
+        cfg, model, experiment_dir, resume=resume,
+        persist_fn=persist_fn, log_fn=log_fn,
+        ckpt_subdir=ft_name, stage_tag=ft_name,
+        stage_header="STAGE 2/2 — FINE-TUNE on CheXpert",
+        init_weights_from=init_from)
 
 
 def run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None):
@@ -1550,7 +1770,7 @@ def run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=Non
     sys.stderr = _Tee(orig_err, log_f)
     print(f"📝 capturing full console output of this run -> {cap_path}")
     try:
-        return _run_experiment(cfg, model, experiment_dir, resume, persist_fn, log_fn)
+        return _run_all_stages(cfg, model, experiment_dir, resume, persist_fn, log_fn)
     finally:
         sys.stdout, sys.stderr = orig_out, orig_err
         log_f.close()
@@ -1604,11 +1824,19 @@ def modal_resources(cfg: dict) -> dict:
 
 
 def remote_cfg(cfg: dict) -> dict:
-    """Copy of cfg with data paths repointed at the mounted Modal data volume."""
+    """Copy of cfg with data paths repointed at the mounted Modal data volume.
+    For a two-stage run, the pre-train stage's images/CSVs live elsewhere on the
+    SAME data volume, so its paths are repointed too (from pretrain.remote_data_root
+    / remote_data_dir). No-op for single-stage runs (pretrain block absent)."""
     rc = copy.deepcopy(cfg)
     m = cfg["modal"]
     rc["paths"]["data_root"] = m["remote_data_root"]
     rc["paths"]["data_dir"] = m["remote_data_dir"]
+    pre = rc.get("pretrain") or {}
+    if pre.get("enable"):
+        pp = pre.setdefault("paths", {})
+        pp["data_root"] = pre["remote_data_root"]
+        pp["data_dir"] = pre["remote_data_dir"]
     return rc
 
 
@@ -1666,7 +1894,12 @@ def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
     Outputs: results_dir/<out_subdir>/*.png  (one concept per file):
         loss_curves, mean_auroc, mean_auprc, per_task_auroc, per_task_auprc,
         macro_f1_precision_recall, training_diagnostics (lr/img-s/grad-norm).
-    """
+
+    Two-stage runs (pretrain.enable, logs carry a 'stage' column): the rows are
+    split by stage and each stage gets its OWN plots subfolder — exactly like the
+    checkpoints layout — so e.g. results/plots/pretrain_chestxray14/ and
+    results/plots/finetune_chexpert/. Single-stage runs are unchanged (flat
+    results/plots/)."""
     import matplotlib
     matplotlib.use("Agg")                 # headless: write files, never open a window
     import matplotlib.pyplot as plt
@@ -1675,8 +1908,6 @@ def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
     out = cfg["output"]
     tasks = cfg["tasks"]
     name = cfg.get("experiment", {}).get("name", "experiment")
-    plots_dir = results_dir / out_subdir
-    plots_dir.mkdir(parents=True, exist_ok=True)
 
     train_path = results_dir / out["train_log_csv"]
     val_path = results_dir / out["val_log_csv"]
@@ -1684,7 +1915,6 @@ def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
     print(f"[make_plots] {name}")
     print(f"  train log : {train_path}")
     print(f"  val   log : {val_path}")
-    print(f"  output    : {plots_dir}")
 
     train_df = pd.read_csv(train_path) if train_path.exists() else None
     val_df = pd.read_csv(val_path) if val_path.exists() else None
@@ -1693,120 +1923,161 @@ def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
     if val_df is None:
         print("  ⚠️  no val_log.csv — skipping validation-based plots")
 
-    bsteps = _epoch_boundary_steps(train_df) if train_df is not None else []
+    # ----- the actual plotting, for ONE (train_df, val_df) into ONE plots_dir -----
+    def _render(train_df, val_df, plots_dir, name):
+        plots_dir = Path(plots_dir)
+        plots_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  output    : {plots_dir}")
+        bsteps = _epoch_boundary_steps(train_df) if train_df is not None else []
+        saved = []
+
+        def _save(fig, fname):
+            path = plots_dir / fname
+            fig.tight_layout()
+            fig.savefig(path, dpi=dpi)
+            plt.close(fig)
+            saved.append(fname)
+            print(f"  ✅ {fname}")
+
+        # 1) loss curves — train (raw + smoothed) and validation, vs global step
+        def _plot_loss():
+            if train_df is None and val_df is None:
+                return
+            fig, ax = plt.subplots(figsize=(9, 5))
+            if train_df is not None:
+                ax.plot(train_df["step"], train_df["train_loss"], color="tab:blue",
+                        alpha=0.25, lw=0.8, label="train (raw)")
+                ax.plot(train_df["step"], _smooth(train_df["train_loss"], smooth_window),
+                        color="tab:blue", lw=1.8, label=f"train (smooth {smooth_window})")
+            if val_df is not None:
+                ax.plot(val_df["step"], val_df["val_loss"], color="tab:orange",
+                        marker="o", ms=4, lw=1.6, label="validation")
+            _vlines(ax, bsteps)
+            ax.set_xlabel("global step"); ax.set_ylabel("BCE loss")
+            ax.set_title(f"{name} — loss"); ax.legend(); ax.grid(True, alpha=0.3)
+            _save(fig, "loss_curves.png")
+
+        # 2/3) a single macro metric vs step (best point starred)
+        def _plot_macro_metric(col, title, fname, mode="max"):
+            if val_df is None or col not in val_df.columns:
+                return
+            fig, ax = plt.subplots(figsize=(9, 5))
+            ax.plot(val_df["step"], val_df[col], color="tab:green",
+                    marker="o", ms=4, lw=1.8)
+            _mark_extreme(ax, val_df["step"].values, val_df[col].values, mode)
+            _vlines(ax, bsteps)
+            ax.set_xlabel("global step"); ax.set_ylabel(col)
+            ax.set_title(f"{name} — {title}"); ax.grid(True, alpha=0.3)
+            _save(fig, fname)
+
+        # 4/5) per-task curves (one line per pathology) for a given metric prefix
+        def _plot_per_task(prefix, title, fname):
+            if val_df is None:
+                return
+            cols = [f"{prefix}/{t}" for t in tasks if f"{prefix}/{t}" in val_df.columns]
+            if not cols:
+                return
+            fig, ax = plt.subplots(figsize=(9, 5))
+            for t in tasks:
+                c = f"{prefix}/{t}"
+                if c in val_df.columns:
+                    ax.plot(val_df["step"], val_df[c], marker="o", ms=3, lw=1.5, label=t)
+            _vlines(ax, bsteps)
+            ax.set_xlabel("global step"); ax.set_ylabel(prefix.upper())
+            ax.set_title(f"{name} — {title}")
+            ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+            _save(fig, fname)
+
+        # 6) macro F1 / precision / recall together (all 0–1, one figure)
+        def _plot_macro_fpr():
+            if val_df is None:
+                return
+            series = [("mean_f1", "F1", "tab:purple"),
+                      ("mean_precision", "precision", "tab:red"),
+                      ("mean_recall", "recall", "tab:blue")]
+            series = [s for s in series if s[0] in val_df.columns]
+            if not series:
+                return
+            fig, ax = plt.subplots(figsize=(9, 5))
+            for col, lbl, color in series:
+                ax.plot(val_df["step"], val_df[col], marker="o", ms=3, lw=1.6,
+                        color=color, label=lbl)
+            _vlines(ax, bsteps)
+            ax.set_xlabel("global step"); ax.set_ylabel("score @ 0.5")
+            ax.set_title(f"{name} — macro F1 / precision / recall (threshold 0.5)")
+            ax.legend(); ax.grid(True, alpha=0.3)
+            _save(fig, "macro_f1_precision_recall.png")
+
+        # 7) training diagnostics: LR / throughput / grad-norm (3 stacked panels)
+        def _plot_diagnostics():
+            if train_df is None:
+                return
+            fig, axes = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
+            axes[0].plot(train_df["step"], train_df["lr"], color="tab:blue", lw=1.5)
+            axes[0].set_ylabel("learning rate"); axes[0].set_title(f"{name} — training diagnostics")
+            if "imgs_per_s" in train_df.columns:
+                axes[1].plot(train_df["step"], train_df["imgs_per_s"], color="tab:gray",
+                             alpha=0.3, lw=0.8)
+                axes[1].plot(train_df["step"], _smooth(train_df["imgs_per_s"], smooth_window),
+                             color="tab:green", lw=1.6)
+            axes[1].set_ylabel("images / sec")
+            if "grad_norm" in train_df.columns:
+                axes[2].plot(train_df["step"], train_df["grad_norm"], color="tab:gray",
+                             alpha=0.3, lw=0.8)
+                axes[2].plot(train_df["step"], _smooth(train_df["grad_norm"], smooth_window),
+                             color="tab:red", lw=1.6)
+            axes[2].set_ylabel("grad norm"); axes[2].set_xlabel("global step")
+            for ax in axes:
+                _vlines(ax, bsteps); ax.grid(True, alpha=0.3)
+            _save(fig, "training_diagnostics.png")
+
+        _safe("plot:loss", _plot_loss)
+        _safe("plot:mean_auroc", _plot_macro_metric,
+              "mean_auroc", "validation mean AUROC", "mean_auroc.png", "max")
+        _safe("plot:mean_auprc", _plot_macro_metric,
+              "mean_auprc", "validation mean AUPRC", "mean_auprc.png", "max")
+        _safe("plot:per_task_auroc", _plot_per_task, "auroc", "per-task AUROC", "per_task_auroc.png")
+        _safe("plot:per_task_auprc", _plot_per_task, "auprc", "per-task AUPRC", "per_task_auprc.png")
+        _safe("plot:macro_fpr", _plot_macro_fpr)
+        _safe("plot:diagnostics", _plot_diagnostics)
+
+        print(f"[make_plots] wrote {len(saved)} plot(s) -> {plots_dir}")
+        return saved
+
+    def _stage_slice(df, stage):
+        """Rows of df for one stage (None if absent/empty), so each stage plots
+        only its own curves with its own (reset) step axis."""
+        if df is None or "stage" not in df.columns:
+            return None
+        sub = df[df["stage"] == stage]
+        return sub if len(sub) else None
+
+    # ----- dispatch: per-stage subfolders for a two-stage run, else flat -----
+    pre = cfg.get("pretrain") or {}
+    has_stage_col = ((train_df is not None and "stage" in train_df.columns) or
+                     (val_df is not None and "stage" in val_df.columns))
     saved = []
+    if pre.get("enable") and has_stage_col:
+        # stage order: pretrain then fine-tune (as named in cfg); append any other
+        # stage values that happen to appear in the logs, preserving first-seen order.
+        ordered = [pre.get("stage_name", "pretrain_chestxray14"),
+                   pre.get("finetune_stage_name", "finetune_chexpert")]
+        seen = []
+        for df in (train_df, val_df):
+            if df is not None and "stage" in df.columns:
+                seen += [s for s in df["stage"].dropna().tolist()]
+        seen = list(dict.fromkeys(seen))
+        stages = [s for s in ordered if s in seen] + [s for s in seen if s not in ordered]
+        print(f"  two-stage run -> one plots subfolder per stage: {stages}")
+        for st in stages:
+            print("-" * 70)
+            print(f"  [stage: {st}]")
+            saved += [f"{st}/{f}" for f in _render(
+                _stage_slice(train_df, st), _stage_slice(val_df, st),
+                results_dir / out_subdir / st, f"{name} [{st}]")]
+    else:
+        saved = _render(train_df, val_df, results_dir / out_subdir, name)
 
-    def _save(fig, fname):
-        path = plots_dir / fname
-        fig.tight_layout()
-        fig.savefig(path, dpi=dpi)
-        plt.close(fig)
-        saved.append(fname)
-        print(f"  ✅ {fname}")
-
-    # 1) loss curves — train (raw + smoothed) and validation, vs global step
-    def _plot_loss():
-        if train_df is None and val_df is None:
-            return
-        fig, ax = plt.subplots(figsize=(9, 5))
-        if train_df is not None:
-            ax.plot(train_df["step"], train_df["train_loss"], color="tab:blue",
-                    alpha=0.25, lw=0.8, label="train (raw)")
-            ax.plot(train_df["step"], _smooth(train_df["train_loss"], smooth_window),
-                    color="tab:blue", lw=1.8, label=f"train (smooth {smooth_window})")
-        if val_df is not None:
-            ax.plot(val_df["step"], val_df["val_loss"], color="tab:orange",
-                    marker="o", ms=4, lw=1.6, label="validation")
-        _vlines(ax, bsteps)
-        ax.set_xlabel("global step"); ax.set_ylabel("BCE loss")
-        ax.set_title(f"{name} — loss"); ax.legend(); ax.grid(True, alpha=0.3)
-        _save(fig, "loss_curves.png")
-
-    # 2/3) a single macro metric vs step (best point starred)
-    def _plot_macro_metric(col, title, fname, mode="max"):
-        if val_df is None or col not in val_df.columns:
-            return
-        fig, ax = plt.subplots(figsize=(9, 5))
-        ax.plot(val_df["step"], val_df[col], color="tab:green",
-                marker="o", ms=4, lw=1.8)
-        _mark_extreme(ax, val_df["step"].values, val_df[col].values, mode)
-        _vlines(ax, bsteps)
-        ax.set_xlabel("global step"); ax.set_ylabel(col)
-        ax.set_title(f"{name} — {title}"); ax.grid(True, alpha=0.3)
-        _save(fig, fname)
-
-    # 4/5) per-task curves (one line per pathology) for a given metric prefix
-    def _plot_per_task(prefix, title, fname):
-        if val_df is None:
-            return
-        cols = [f"{prefix}/{t}" for t in tasks if f"{prefix}/{t}" in val_df.columns]
-        if not cols:
-            return
-        fig, ax = plt.subplots(figsize=(9, 5))
-        for t in tasks:
-            c = f"{prefix}/{t}"
-            if c in val_df.columns:
-                ax.plot(val_df["step"], val_df[c], marker="o", ms=3, lw=1.5, label=t)
-        _vlines(ax, bsteps)
-        ax.set_xlabel("global step"); ax.set_ylabel(prefix.upper())
-        ax.set_title(f"{name} — {title}")
-        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
-        _save(fig, fname)
-
-    # 6) macro F1 / precision / recall together (all 0–1, one figure)
-    def _plot_macro_fpr():
-        if val_df is None:
-            return
-        series = [("mean_f1", "F1", "tab:purple"),
-                  ("mean_precision", "precision", "tab:red"),
-                  ("mean_recall", "recall", "tab:blue")]
-        series = [s for s in series if s[0] in val_df.columns]
-        if not series:
-            return
-        fig, ax = plt.subplots(figsize=(9, 5))
-        for col, lbl, color in series:
-            ax.plot(val_df["step"], val_df[col], marker="o", ms=3, lw=1.6,
-                    color=color, label=lbl)
-        _vlines(ax, bsteps)
-        ax.set_xlabel("global step"); ax.set_ylabel("score @ 0.5")
-        ax.set_title(f"{name} — macro F1 / precision / recall (threshold 0.5)")
-        ax.legend(); ax.grid(True, alpha=0.3)
-        _save(fig, "macro_f1_precision_recall.png")
-
-    # 7) training diagnostics: LR / throughput / grad-norm (3 stacked panels)
-    def _plot_diagnostics():
-        if train_df is None:
-            return
-        fig, axes = plt.subplots(3, 1, figsize=(9, 9), sharex=True)
-        axes[0].plot(train_df["step"], train_df["lr"], color="tab:blue", lw=1.5)
-        axes[0].set_ylabel("learning rate"); axes[0].set_title(f"{name} — training diagnostics")
-        if "imgs_per_s" in train_df.columns:
-            axes[1].plot(train_df["step"], train_df["imgs_per_s"], color="tab:gray",
-                         alpha=0.3, lw=0.8)
-            axes[1].plot(train_df["step"], _smooth(train_df["imgs_per_s"], smooth_window),
-                         color="tab:green", lw=1.6)
-        axes[1].set_ylabel("images / sec")
-        if "grad_norm" in train_df.columns:
-            axes[2].plot(train_df["step"], train_df["grad_norm"], color="tab:gray",
-                         alpha=0.3, lw=0.8)
-            axes[2].plot(train_df["step"], _smooth(train_df["grad_norm"], smooth_window),
-                         color="tab:red", lw=1.6)
-        axes[2].set_ylabel("grad norm"); axes[2].set_xlabel("global step")
-        for ax in axes:
-            _vlines(ax, bsteps); ax.grid(True, alpha=0.3)
-        _save(fig, "training_diagnostics.png")
-
-    _safe("plot:loss", _plot_loss)
-    _safe("plot:mean_auroc", _plot_macro_metric,
-          "mean_auroc", "validation mean AUROC", "mean_auroc.png", "max")
-    _safe("plot:mean_auprc", _plot_macro_metric,
-          "mean_auprc", "validation mean AUPRC", "mean_auprc.png", "max")
-    _safe("plot:per_task_auroc", _plot_per_task, "auroc", "per-task AUROC", "per_task_auroc.png")
-    _safe("plot:per_task_auprc", _plot_per_task, "auprc", "per-task AUPRC", "per_task_auprc.png")
-    _safe("plot:macro_fpr", _plot_macro_fpr)
-    _safe("plot:diagnostics", _plot_diagnostics)
-
-    print(f"[make_plots] wrote {len(saved)} plot(s) -> {plots_dir}")
     print("=" * 70)
     return saved
 
@@ -1983,6 +2254,9 @@ def run_calibration(cfg, model, experiment_dir, device=None, checkpoint: str = "
     tasks = cfg["tasks"]
     results_dir = experiment_dir / out["run_dir"]
     ckpt_dir = results_dir / out["checkpoints_dir"]
+    _sub = finetune_ckpt_subdir(cfg)          # two-stage runs: the fine-tune subfolder
+    if _sub:
+        ckpt_dir = ckpt_dir / _sub
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("#" * 70)
@@ -2085,6 +2359,9 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
     tasks = cfg["tasks"]
     results_dir = experiment_dir / out["run_dir"]
     ckpt_dir = results_dir / out["checkpoints_dir"]
+    _sub = finetune_ckpt_subdir(cfg)          # two-stage runs: the fine-tune subfolder
+    if _sub:
+        ckpt_dir = ckpt_dir / _sub
     data_dir = Path(cfg["paths"]["data_dir"])
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if batch_size is None:

@@ -11,7 +11,7 @@
 # ----------------------------------------------------------------------------
 paths:
   data_root:    "D:/CheXpert-v1.0-small"
-  data_dir:     "d:/My Projects/chest-xray-bench/data"
+  data_dir:     "d:/My Projects/chest-xray-bench/data/chexpert"
   train_csv:    "01_train.csv"        # patient-grouped 90% (NLP labels)
   val_csv:      "01_val.csv"          # patient-grouped 10% (NLP labels, in-loop val)
   valid200_csv: "01_valid200.csv"     # official 200-study radiologist set (report only)
