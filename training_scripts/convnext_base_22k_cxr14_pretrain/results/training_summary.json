@@ -1,0 +1,52 @@
+{
+  "stages": {
+    "pretrain_chestxray14": {
+      "experiment": "convnext_base_22k_cxr14_pretrain",
+      "status": "early_stopped",
+      "monitor": "val_mean_auroc",
+      "mode": "max",
+      "best_value": 0.8789824026077545,
+      "best_step": 3600,
+      "best_epoch": 3,
+      "best_metrics": {
+        "mean_auroc": 0.8789824026077545,
+        "mean_auprc": 0.3420174151557108,
+        "mean_f1": 0.13540377858246486,
+        "mean_precision": 0.236537269910698,
+        "mean_recall": 0.09485135767790262,
+        "mean_specificity": 0.9928753696054384,
+        "val_loss": 0.1437560016254868
+      },
+      "last_step": 10200,
+      "total_steps": 12860,
+      "elapsed_sec": 7893.01,
+      "elapsed_human": "2h 11m",
+      "updated": "2026-06-26T18:20:09"
+    },
+    "finetune_chexpert": {
+      "experiment": "convnext_base_22k_cxr14_pretrain",
+      "status": "early_stopped",
+      "monitor": "val_mean_auroc",
+      "mode": "max",
+      "best_value": 0.8061061386006874,
+      "best_step": 5400,
+      "best_epoch": 3,
+      "best_metrics": {
+        "mean_auroc": 0.8061061386006874,
+        "mean_auprc": 0.608052098156183,
+        "mean_f1": 0.5152045818981368,
+        "mean_precision": 0.6195621483347462,
+        "mean_recall": 0.46947107288405643,
+        "mean_specificity": 0.8873993839585357,
+        "val_loss": 0.4371066505060146
+      },
+      "last_step": 10200,
+      "total_steps": 26870,
+      "elapsed_sec": 5593.27,
+      "elapsed_human": "1h 33m",
+      "updated": "2026-06-26T21:11:11"
+    }
+  },
+  "experiment": "convnext_base_22k_cxr14_pretrain",
+  "updated": "2026-06-26T21:11:11"
+}

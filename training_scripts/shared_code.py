@@ -2005,18 +2005,25 @@ def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
             ax.set_title(f"{name} — {title}"); ax.grid(True, alpha=0.3)
             _save(fig, fname)
 
-        # 4/5) per-task curves (one line per pathology) for a given metric prefix
+        # 4/5) per-task curves (one line per pathology) for a given metric prefix.
+        # Discover EVERY "{prefix}/<task>" column present, rather than only those whose
+        # name matches cfg["tasks"]. In a two-stage run the stages share one CSV but
+        # name the 5th task differently (NIH 'Effusion' vs CheXpert 'Pleural Effusion');
+        # the header is written once (by the first stage), so a fixed cfg-name lookup
+        # would drop that column and show only 4 tasks. We keep cfg-task order for the
+        # shared names and append any other present column (labelled by its own name).
         def _plot_per_task(prefix, title, fname):
             if val_df is None:
                 return
-            cols = [f"{prefix}/{t}" for t in tasks if f"{prefix}/{t}" in val_df.columns]
+            present = [c for c in val_df.columns if c.startswith(prefix + "/")]
+            cols = [f"{prefix}/{t}" for t in tasks if f"{prefix}/{t}" in present]
+            cols += [c for c in present if c not in cols]
             if not cols:
                 return
             fig, ax = plt.subplots(figsize=(9, 5))
-            for t in tasks:
-                c = f"{prefix}/{t}"
-                if c in val_df.columns:
-                    ax.plot(val_df["step"], val_df[c], marker="o", ms=3, lw=1.5, label=t)
+            for c in cols:
+                ax.plot(val_df["step"], val_df[c], marker="o", ms=3, lw=1.5,
+                        label=c.split("/", 1)[1])
             _vlines(ax, bsteps)
             ax.set_xlabel("global step"); ax.set_ylabel(prefix.upper())
             ax.set_title(f"{name} — {title}")
