@@ -1155,7 +1155,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                     channels_last: bool = False,
                     checkpoint_fn=None, checkpoint_every: int = 0,
                     scheduler=None, n_epochs: int = 0, skip_batches: int = 0,
-                    stage_tag: str = None, wandb_prefix: str = "") -> tuple:
+                    stage_tag: str = None, wandb_prefix: str = "",
+                    phase: str = None, wandb_step_offset: int = 0) -> tuple:
     """One epoch of training. Logs every step (loss/lr/grad_norm/throughput/elapsed/eta)
     and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop).
 
@@ -1227,9 +1228,14 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             # epochs via a function attribute); empty on the very first print.
             d_loss = _fmt_delta(cur_loss, getattr(train_one_epoch, "_last_print_loss", None))
             train_one_epoch._last_print_loss = cur_loss
-            print(f"  Epoch {epoch + 1}/{n_epochs}  epoch_step: {ep_step}/{n_batches}  "
-                  f"global_step: {global_step}/{total_steps}  "
-                  f"loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
+            # `phase` (e.g. "1/2") marks the two-stage phase on every step line, right
+            # after the epoch; empty for a single-stage run. The step print spans two
+            # lines (it got long) with a thin rule between consecutive step prints.
+            phase_tag = f"  (Phase: {phase})" if phase else ""
+            print("─" * 70)                         # thin continuous separator
+            print(f"  Epoch {epoch + 1}/{n_epochs}{phase_tag}  epoch_step: {ep_step}/{n_batches}  "
+                  f"global_step: {global_step}/{total_steps}")
+            print(f"     loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
                   f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}"
                   f"{_gpu_mem_report(device)}")
 
@@ -1238,7 +1244,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                 f"{wandb_prefix}train/loss": loss.item(), f"{wandb_prefix}train/lr": lr,
                 f"{wandb_prefix}train/grad_norm": float(grad_norm),
                 f"{wandb_prefix}train/imgs_per_s": imgs_per_s,
-            }, global_step)
+            }, global_step + wandb_step_offset)
 
         if debug_dir is not None and debug_every > 0 and global_step % debug_every == 0:
             _safe("debug_image", _save_debug_image, imgs, cfg, debug_dir,
@@ -1266,7 +1272,8 @@ def _fmt_delta(curr, prev) -> str:
 
 def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None,
                     *, ckpt_subdir: str = "", stage_tag: str = None,
-                    stage_header: str = None, init_weights_from=None):
+                    stage_header: str = None, init_weights_from=None, phase: str = None,
+                    wandb_state: dict = None):
     """End-to-end training for ONE stage. Identical machinery for every run; only
     the injected `model` and cfg overrides differ. Trains on the cfg's train_csv,
     validates on its val_csv, checkpoints (rolling + best by mean AUROC), early-stops.
@@ -1288,6 +1295,10 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     rep = cfg["reproducibility"]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     wandb_prefix = f"{stage_tag}/" if stage_tag else ""
+    # W&B step must be monotonic across the WHOLE run, but each stage's global_step
+    # restarts at 0. Offset this stage's W&B step past everything logged so far
+    # (carried in wandb_state["offset"]); CSV logs keep the raw per-stage step.
+    wandb_offset = int(wandb_state.get("offset", 0)) if wandb_state else 0
 
     print("#" * 70)
     print(f"# 🚀 run_experiment: {cfg.get('experiment', {}).get('name', '<unnamed>')}")
@@ -1542,7 +1553,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                 pm = metrics["per_task"][t]
                 for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity"):
                     wb[f"{wandb_prefix}val/{key}/{t}"] = pm[key]
-            _safe("wandb", log_fn, wb, gstep)
+            _safe("wandb", log_fn, wb, gstep + wandb_offset)
         if persist_fn is not None:        # e.g. Modal volume.commit() -> live updates
             _safe("persist", persist_fn)
         if is_best:
@@ -1591,7 +1602,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             checkpoint_fn=save_periodic, checkpoint_every=ckpt_every,
             scheduler=(scheduler if sched_mode == "step" else None),
             n_epochs=epochs, skip_batches=skip,
-            stage_tag=stage_tag, wandb_prefix=wandb_prefix)
+            stage_tag=stage_tag, wandb_prefix=wandb_prefix, phase=phase,
+            wandb_step_offset=wandb_offset)
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)
@@ -1616,6 +1628,10 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
           f"@ step {track['best_step']}  ⏱️  total train time = "
           f"{fmt_duration(elapsed())} ({elapsed():.0f}s)")
     print("#" * 70)
+    # advance the shared W&B step cursor so the NEXT stage logs strictly after this
+    # one (keeps the single W&B run's step monotonic across stages).
+    if wandb_state is not None:
+        wandb_state["offset"] = wandb_offset + global_step
     return track["best"]
 
 
@@ -1699,6 +1715,11 @@ def _run_all_stages(cfg: dict, model, experiment_dir, resume=None,
     print("#   handoff   : Stage-1 best.pt -> Stage-2 model init (backbone + head)")
     print("#" * 70)
 
+    # shared W&B step cursor: both stages log to ONE W&B run, but each stage's
+    # global_step restarts at 0 — so Stage 2's step is offset past Stage 1's to keep
+    # the run's step monotonic (W&B drops out-of-order steps otherwise).
+    wandb_state = {"offset": 0}
+
     # ---- decide whether Stage 1 runs ----
     pre_done = _read_status(summary_path, pre_name) in ("completed", "early_stopped")
     if resume is not None and pre_resume is None:
@@ -1718,8 +1739,9 @@ def _run_all_stages(cfg: dict, model, experiment_dir, resume=None,
         _run_experiment(
             pcfg, model, experiment_dir, resume=pre_resume,
             persist_fn=persist_fn, log_fn=log_fn,
-            ckpt_subdir=pre_name, stage_tag=pre_name,
-            stage_header="STAGE 1/2 — PRE-TRAIN on ChestX-ray14")
+            ckpt_subdir=pre_name, stage_tag=pre_name, phase="1/2",
+            stage_header="STAGE 1/2 — PRE-TRAIN on ChestX-ray14",
+            wandb_state=wandb_state)
 
     # ---- Stage 2: CheXpert fine-tuning ----
     if resume is None:
@@ -1735,9 +1757,9 @@ def _run_all_stages(cfg: dict, model, experiment_dir, resume=None,
     return _run_experiment(
         cfg, model, experiment_dir, resume=resume,
         persist_fn=persist_fn, log_fn=log_fn,
-        ckpt_subdir=ft_name, stage_tag=ft_name,
+        ckpt_subdir=ft_name, stage_tag=ft_name, phase="2/2",
         stage_header="STAGE 2/2 — FINE-TUNE on CheXpert",
-        init_weights_from=init_from)
+        init_weights_from=init_from, wandb_state=wandb_state)
 
 
 def run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=None, log_fn=None):
@@ -1823,11 +1845,24 @@ def modal_resources(cfg: dict) -> dict:
     )
 
 
+def pretrain_data_mount(cfg: dict):
+    """For a two-stage run whose ChestX-ray14 images live on their OWN Modal volume
+    (separate from chexpert-data — each volume has a 500k-inode cap), return
+    (volume_name, mount_path) so train.py can mount it alongside the data + runs
+    volumes. Returns None when there's no pretrain block, pretraining is disabled,
+    or no separate volume is declared (then the pretrain paths are assumed to sit
+    on an already-mounted volume). Single-stage runs always get None — unchanged."""
+    pre = cfg.get("pretrain") or {}
+    if pre.get("enable") and pre.get("data_volume"):
+        return pre["data_volume"], pre.get("data_mount", "/data_cxr14")
+    return None
+
+
 def remote_cfg(cfg: dict) -> dict:
     """Copy of cfg with data paths repointed at the mounted Modal data volume.
-    For a two-stage run, the pre-train stage's images/CSVs live elsewhere on the
-    SAME data volume, so its paths are repointed too (from pretrain.remote_data_root
-    / remote_data_dir). No-op for single-stage runs (pretrain block absent)."""
+    For a two-stage run, the pre-train stage's images/CSVs live on their own
+    volume, so its paths are repointed too (from pretrain.remote_data_root /
+    remote_data_dir). No-op for single-stage runs (pretrain block absent)."""
     rc = copy.deepcopy(cfg)
     m = cfg["modal"]
     rc["paths"]["data_root"] = m["remote_data_root"]
