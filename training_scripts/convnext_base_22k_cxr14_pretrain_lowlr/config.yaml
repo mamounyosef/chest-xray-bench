@@ -1,0 +1,240 @@
+# =============================================================================
+# config.yaml  —  experiment: convnext_base_22k_cxr14_pretrain_lowlr
+#   (ConvNeXt-B, timm fb_in22k_ft_in1k_384, CLAHE off, U-Ones, +ChestX-ray14 pretrain)
+# -----------------------------------------------------------------------------
+# Same as convnext_base_22k_cxr14_pretrain in EVERYTHING, except a gentler Stage-1
+# (ChestX-ray14) schedule: lr 1e-5, cosine floor 1e-7, 4 epochs (vs 1e-4 / 1e-6 /
+# 10). The Stage-2 (CheXpert) fine-tune block is unchanged. So this probes whether
+# a lighter-touch ChestX-ray14 pre-training transfers better to CheXpert.
+# Holds only what VARIES per experiment; common settings come from ../shared_config.yaml.
+#
+# Layout:  1) identity & run control   2) two-stage schedule (Stage 1)
+#          3) data & preprocessing (shared; labels = Stage 2)   4) training (Stage 2)
+#          5) infrastructure (Modal)
+# =============================================================================
+
+
+# #############################################################################
+# 1) EXPERIMENT IDENTITY & RUN CONTROL
+# #############################################################################
+
+experiment:
+  name: "convnext_base_22k_cxr14_pretrain_lowlr"
+
+model:
+  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-B
+  # pretrained on ImageNet-22k (@224) then fine-tuned on ImageNet-1k (@384).
+  # (Same weight scheme as convnext_tiny_22k, just the Base size. Distinct from
+  #  torchvision's IN-1k-only weights, and from timm's "in12k_*" tags which are an
+  #  11,821-class subset, NOT IN-22k.)
+  name: "convnext_base.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
+  pretrained: true                             # IN-22k->IN-1k weights (timm, see train.py)
+
+# Resume  —  continues the FINE-TUNE stage (Stage 2). The pre-train stage has its
+# own pretrain.resume in section 2. null/'best'/'last'/<step>/<path>. Restores
+# model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+resume: null
+
+
+# #############################################################################
+# 2) TWO-STAGE SCHEDULE  —  STAGE 1: pre-train on NIH ChestX-ray14
+# -----------------------------------------------------------------------------
+# ImageNet-22k->1k (timm weights, section 1) THEN ChestX-ray14 (here) THEN CheXpert
+# (Stage 2 = sections 3-4). This block is the ONLY thing that differs from the plain
+# convnext_base_22k run; enable:false (or deleting it) -> ordinary single-stage run.
+# When enabled, shared_code runs:
+#     Stage 1  pre-train on ChestX-ray14  -> results/checkpoints/<stage_name>/
+#     Stage 2  fine-tune on CheXpert      -> results/checkpoints/<finetune_stage_name>/
+# Stage 2's model is seeded from Stage 1's best.pt (full model: backbone + head,
+# since the 5 tasks map 1:1 — NIH "Effusion" == CheXpert "Pleural Effusion").
+# train_log.csv / val_log.csv / debugged_images / plots are SHARED (rows/images
+# stack; a 'stage' column tells them apart); only checkpoints split into subfolders
+# and both stages share ONE results/training_summary.json (nested per stage).
+# Calibration + evaluation always score the CheXpert (Stage 2) model only.
+# #############################################################################
+
+pretrain:
+  # --- control ---
+  enable: true
+  stage_name:          "pretrain_chestxray14"   # Stage-1 checkpoints subfolder + 'stage' tag
+  finetune_stage_name: "finetune_chexpert"      # Stage-2 checkpoints subfolder + 'stage' tag
+  # Resume the PRE-TRAIN stage (independent of the top-level `resume`). A finished
+  # Stage 1 is auto-skipped on a later run (its status in training_summary.json).
+  resume: null
+
+  # --- tasks ---
+  # ChestX-ray14 task columns, in the SAME order as `tasks` (shared_config.yaml)
+  # so the 5-logit head carries over by position. NIH "Effusion" == "Pleural Effusion".
+  tasks:
+    - Atelectasis
+    - Cardiomegaly
+    - Consolidation
+    - Edema
+    - Effusion
+
+  # --- data (local + Modal) ---
+  # Stage-1 data: NIH images (kagglehub cache) + the chestx_ray14 split CSVs.
+  # path_column='path' (NIH CSVs use lowercase 'path'; CheXpert uses 'Path').
+  paths:
+    data_root:   "C:/Users/mamou/.cache/kagglehub/datasets/nih-chest-xrays/data/versions/3"
+    data_dir:    "d:/My Projects/chest-xray-bench/data/chestx_ray14"
+    train_csv:   "01_train.csv"     # 82,257 imgs
+    val_csv:     "01_val.csv"       # 4,267 imgs (test split is intentionally ignored)
+    path_column: "path"
+  # Modal: ChestX-ray14 lives on its OWN volume (chexpert-data is at Modal's 500k-
+  # inode cap, so 112k more images don't fit there). train.py mounts it via these.
+  data_volume:      "chestxray14-data"           # separate Modal volume
+  data_mount:       "/data_cxr14"                # mounted here in the container
+  remote_data_root: "/data_cxr14"                # archive top-level is images/ -> /data_cxr14/images/...
+  remote_data_dir:  "/data_cxr14/chestxray14_splits"   # the two split CSVs
+
+  # --- hyperparameters (Stage 1 only; SEPARATE from the Stage-2 `training:` block
+  #     in section 4). Standard from-ImageNet recipe; everything else (image, aug,
+  #     dataloader, performance, ...) is inherited from the shared/Stage-2 config. ---
+  # NOTE: this run is the LOW-LR pre-training variant of convnext_base_22k_cxr14_pretrain:
+  # gentler Stage-1 schedule (lr 1e-5, cosine floor 1e-7) over fewer epochs (4).
+  # The Stage-2 (CheXpert) block in section 4 is unchanged from that run.
+  training:
+    epochs:        4
+    amp:           true
+    grad_clip:     null
+    optimizer:
+      lr:           1.0e-5
+      weight_decay: 1.0e-5
+    scheduler:
+      name:        "cosine"
+      warmup_epochs: 0.5     # fractional OK: 0.5 -> warm up over HALF a ChestX-ray14 epoch
+      min_lr:      1.0e-7
+      plateau_patience: 2
+    loss:
+      name: "bce_with_logits"
+      pos_weight: null
+    early_stopping:
+      enable:   true
+      monitor:  "val_mean_auroc"
+      mode:     "max"
+      patience: 6
+  evaluation:
+    metric: "mean_auroc"
+    eval_level: "image"
+    eval_every_epochs: null
+    eval_every_steps: 600
+
+
+# #############################################################################
+# 3) DATA & PREPROCESSING  —  shared by BOTH stages (labels = Stage 2 / CheXpert)
+# #############################################################################
+
+# Label policy  —  uncertain (-1) handling. "ones" | "zeros". Blank/NaN -> 0.
+# (Applies to the CheXpert fine-tune stage; ChestX-ray14 labels are pure binary.)
+labels:
+  u_policy: "ones"
+
+# CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
+# only difference is the architecture (ConvNeXt-B vs ResNet-50).
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         256
+  val_num_workers:        10
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+
+# #############################################################################
+# 4) TRAINING  —  STAGE 2: fine-tune on CheXpert  (+ shared performance knobs)
+# -----------------------------------------------------------------------------
+# Same recipe as the plain convnext_base_22k run, so this experiment is a clean
+# ablation: the ONLY added variable vs that baseline is the ChestX-ray14 pre-training
+# stage (section 2). Stage 1's hyperparameters live under pretrain.training.
+# #############################################################################
+
+# Performance  —  CUDA-only speedups (ignored on CPU), shared by both stages. Keep
+# identical across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+training:
+  epochs:        10
+  amp:           true        # mixed precision (A100)
+  grad_clip:     null        # max-norm, or null to disable
+
+  optimizer:                 # AdamW always
+    lr:           1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 1
+    min_lr:      1.0e-6
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    name: "bce_with_logits"  # multi-label binary cross-entropy on logits
+    pos_weight: null         # null = unweighted; or per-task list
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 8              # counted in VALIDATIONS, not epochs
+
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+
+
+# #############################################################################
+# 5) INFRASTRUCTURE  —  Modal cloud resources + CheXpert (Stage 2) volume layout
+# -----------------------------------------------------------------------------
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the CheXpert dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : CheXpert paths INSIDE the data volume;
+#       override paths.data_root / paths.data_dir when running on Modal.
+#   (The ChestX-ray14 / Stage-1 volume + remote paths live in section 2.)
+# #############################################################################
+
+modal:
+  gpu: "A100"               # A100-40GB: comfortable for ConvNeXt-B (~88M) @384x320, batch 64
+  cpu_cores: 8
+  memory_gb: 45
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY
