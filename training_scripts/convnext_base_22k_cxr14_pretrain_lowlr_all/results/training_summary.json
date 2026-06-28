@@ -1,0 +1,33 @@
+{
+  "experiment": "convnext_base_22k_cxr14_pretrain_lowlr_all",
+  "stages": {
+    "pretrain_chestxray14": {
+      "status": "completed",
+      "note": "Stage 1 (ChestX-ray14 pre-training) is IDENTICAL to convnext_base_22k_cxr14_pretrain_lowlr, so it is reused: that run's pretrain best.pt is uploaded to this run's results/checkpoints/pretrain_chestxray14/best.pt, and this 'completed' status makes the engine skip Stage 1 and seed the CheXpert (Stage 2) model from it. Both resume keys stay null."
+    },
+    "finetune_chexpert": {
+      "experiment": "convnext_base_22k_cxr14_pretrain_lowlr_all",
+      "status": "early_stopped",
+      "monitor": "val_mean_auroc",
+      "mode": "max",
+      "best_value": 0.8070371714762562,
+      "best_step": 7800,
+      "best_epoch": 3,
+      "best_metrics": {
+        "mean_auroc": 0.8070371714762562,
+        "mean_auprc": 0.607798624197817,
+        "mean_f1": 0.46347965932595814,
+        "mean_precision": 0.6467470324565968,
+        "mean_recall": 0.41375008633388966,
+        "mean_specificity": 0.9131436768379759,
+        "val_loss": 0.4357433815401886
+      },
+      "last_step": 12600,
+      "total_steps": 16122,
+      "elapsed_sec": 5703.38,
+      "elapsed_human": "1h 35m",
+      "updated": "2026-06-27T22:48:59"
+    }
+  },
+  "updated": "2026-06-27T22:48:59"
+}
