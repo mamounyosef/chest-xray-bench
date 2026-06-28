@@ -602,14 +602,38 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5, exclude_mask=Non
     return {"macro": macro, "per_task": per_task}
 
 
-def build_optimizer(model: nn.Module, cfg: dict) -> optim.Optimizer:
-    """AdamW from cfg['training']['optimizer'] (lr, weight_decay). Uses the fused
-    CUDA kernel when performance.fused_optimizer and the params are on CUDA."""
+def build_optimizer(model: nn.Module, cfg: dict, loss_fn=None) -> optim.Optimizer:
+    """Optimizer from cfg['training']['optimizer']. Defaults to AdamW (when 'name'
+    is absent or 'adamw' — every existing run); 'pesg' builds LibAUC's PESG, which
+    the AUC-margin loss requires.
+
+    AdamW : lr + weight_decay; fused CUDA kernel when performance.fused_optimizer
+            and the params are on CUDA.
+    PESG  : LibAUC's min-max optimizer for the AUC-margin loss. It jointly updates
+            the weights AND the loss's adversarial variables (a, b, alpha), so it
+            must be handed the SAME libauc loss object via `loss_fn`. Extra knobs
+            (mode/momentum/margin/epoch_decay) come from the optimizer block. PESG
+            reads its LR from param_groups, so the usual cosine/warmup scheduler
+            drives it exactly like it drives AdamW."""
     o = cfg["training"]["optimizer"]
-    fused = bool(cfg.get("performance", {}).get("fused_optimizer", False)) \
-        and next(model.parameters()).is_cuda
-    return optim.AdamW(model.parameters(), lr=o["lr"],
-                       weight_decay=o["weight_decay"], fused=fused)
+    name = str(o.get("name", "adamw")).lower()
+    if name == "adamw":
+        fused = bool(cfg.get("performance", {}).get("fused_optimizer", False)) \
+            and next(model.parameters()).is_cuda
+        return optim.AdamW(model.parameters(), lr=o["lr"],
+                           weight_decay=o["weight_decay"], fused=fused)
+    if name == "pesg":
+        from libauc.optimizers import PESG
+        # unwrap _AUCMLossWrapper -> the underlying libauc loss (holds a, b, alpha)
+        aucm = getattr(loss_fn, "aucm", loss_fn)
+        device = next(model.parameters()).device
+        return PESG(model.parameters(), loss_fn=aucm,
+                    lr=o["lr"], mode=str(o.get("mode", "sgd")).lower(),
+                    momentum=float(o.get("momentum", 0.9)),
+                    margin=float(o.get("margin", 1.0)),
+                    epoch_decay=float(o.get("epoch_decay", 2.0e-3)),
+                    weight_decay=o["weight_decay"], device=device)
+    raise ValueError(f"unknown optimizer: {name!r}")
 
 
 def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int):
@@ -675,16 +699,43 @@ class MixedTaskLoss(nn.Module):
         return total
 
 
+class _AUCMLossWrapper(nn.Module):
+    """Adapter so the engine keeps calling loss_fn(logits, targets) for the
+    AUC-margin loss. LibAUC's MultiLabelAUCMLoss expects PROBABILITIES, so this
+    applies sigmoid to the logits first (BCE, by contrast, eats raw logits). The
+    underlying libauc loss is exposed as `.aucm` so build_optimizer can hand the
+    SAME object — with its a/b/alpha min-max variables — to the PESG optimizer.
+    version 'v1' is the paper's AUCM; with auto=True it estimates each task's
+    positive prior per-batch, so no imratio needs to be supplied."""
+
+    def __init__(self, num_labels: int, margin: float = 1.0,
+                 version: str = "v1", device=None):
+        super().__init__()
+        from libauc.losses import MultiLabelAUCMLoss
+        self.aucm = MultiLabelAUCMLoss(num_labels=num_labels, margin=margin,
+                                       version=version, device=device)
+
+    def forward(self, logits, targets):
+        return self.aucm(torch.sigmoid(logits), targets)
+
+
 def build_loss(cfg: dict, device=None) -> nn.Module:
     """Loss for this cfg. Mixed-policy arm (any multiclass task) -> MixedTaskLoss
-    (per-task BCE + 3-class CE, summed). Otherwise the standard multi-label
-    BCE-with-logits, with an optional per-task pos_weight (list) moved onto
-    `device` so it lands on the same device as the logits."""
+    (per-task BCE + 3-class CE, summed). 'auc_margin' -> LibAUC MultiLabelAUCMLoss
+    (optimizes mean AUROC directly; pair with the PESG optimizer). Otherwise the
+    standard multi-label BCE-with-logits, with an optional per-task pos_weight
+    (list) moved onto `device` so it lands on the same device as the logits."""
     layout = task_layout(cfg)
     if layout["mixed"]:
         return MixedTaskLoss(layout)
     l = cfg["training"]["loss"]
     name = l["name"].lower()
+    if name == "auc_margin":
+        return _AUCMLossWrapper(
+            num_labels=num_output_logits(cfg),
+            margin=float(l.get("margin", 1.0)),
+            version=str(l.get("version", "v1")),
+            device=device)
     if name != "bce_with_logits":
         raise ValueError(f"unknown loss: {name!r}")
     pw = l.get("pos_weight")
@@ -1362,12 +1413,14 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     if do_compile:
         model = torch.compile(model, mode=perf.get("compile_mode", "default"))
 
-    optimizer = build_optimizer(model, cfg)
-    scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
+    # Loss BEFORE optimizer: PESG (AUC-margin) needs the loss object's a/b/alpha.
     loss_fn = build_loss(cfg, device)
+    optimizer = build_optimizer(model, cfg, loss_fn)
+    scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
     amp = bool(cfg["training"]["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=amp)
-    print(f"[setup] optimizer=AdamW  scheduler={cfg['training']['scheduler']['name']}  amp={amp}")
+    _opt_name = str(cfg["training"]["optimizer"].get("name", "adamw")).upper()
+    print(f"[setup] optimizer={_opt_name}  scheduler={cfg['training']['scheduler']['name']}  amp={amp}")
     print(f"[setup] channels_last={channels_last}  compile={do_compile}"
           f"{' (mode=' + perf.get('compile_mode', 'default') + ')' if do_compile else ''}"
           f"  fused_adamw={bool(perf.get('fused_optimizer')) and device.type == 'cuda'}"
@@ -1692,9 +1745,15 @@ def _run_all_stages(cfg: dict, model, experiment_dir, resume=None,
         skipped automatically on a later run, going straight to fine-tuning."""
     pre = cfg.get("pretrain") or {}
     if not pre.get("enable", False):
-        # No pretraining: exactly the original single-stage run (flat checkpoints/,
-        # no 'stage' column, default summary) — every existing experiment unchanged.
-        return _run_experiment(cfg, model, experiment_dir, resume, persist_fn, log_fn)
+        # No pretraining: the original single-stage run (flat checkpoints/, no
+        # 'stage' column, default summary) — every existing experiment unchanged.
+        # Optional `init_weights_from` (absent in every prior run) warm-starts the
+        # weights from ANOTHER run's checkpoint — e.g. the AUC-margin run seeded
+        # from the BCE-trained convnext_base_22k best.pt (LibAUC's recipe). Skipped
+        # on resume (load_checkpoint restores the full state instead).
+        return _run_experiment(
+            cfg, model, experiment_dir, resume, persist_fn, log_fn,
+            init_weights_from=(cfg.get("init_weights_from") if resume is None else None))
 
     experiment_dir = Path(experiment_dir)
     out = cfg["output"]
@@ -1814,7 +1873,7 @@ _MODAL_PIP = [
 ]
 
 
-def modal_image(python_version: str = "3.11"):
+def modal_image(python_version: str = "3.11", extra_pip=None, extra_pip_options: str = ""):
     """Build the Modal container image: pip deps + the whole training_scripts/
     source tree (code + YAML configs), excluding local run artifacts.
 
@@ -1822,15 +1881,22 @@ def modal_image(python_version: str = "3.11"):
     serialized=True (the eval/calibration scripts launched via `python ... +
     app.run()`), this MUST match the LOCAL interpreter's version, so those
     scripts pass their own version. Training (`modal run`) doesn't need a match
-    and keeps the 3.11 default."""
+    and keeps the 3.11 default.
+
+    extra_pip / extra_pip_options : optional, per-run extra packages installed in
+    a SECOND pip layer (so the shared base layer/image cache is unchanged for
+    every other run). The AUC-margin run uses this to add 'libauc' with
+    extra_pip_options='--no-deps' — libauc's deps (torch/numpy/sklearn/...) are
+    already in the base image, and --no-deps avoids pulling its heavy extras
+    (transformers, torch_geometric, ...) and any chance of touching torch."""
     import modal
-    return (
-        modal.Image.debian_slim(python_version=python_version)
-        .pip_install(*_MODAL_PIP)
-        .add_local_dir(
-            str(PKG_DIR), remote_path="/root/training_scripts",
-            ignore=["**/results/**", "**/train_config/**", "**/__pycache__/**"],
-        )
+    img = (modal.Image.debian_slim(python_version=python_version)
+           .pip_install(*_MODAL_PIP))
+    if extra_pip:
+        img = img.pip_install(*extra_pip, extra_options=extra_pip_options)
+    return img.add_local_dir(
+        str(PKG_DIR), remote_path="/root/training_scripts",
+        ignore=["**/results/**", "**/train_config/**", "**/__pycache__/**"],
     )
 
 
@@ -1872,6 +1938,10 @@ def remote_cfg(cfg: dict) -> dict:
         pp = pre.setdefault("paths", {})
         pp["data_root"] = pre["remote_data_root"]
         pp["data_dir"] = pre["remote_data_dir"]
+    # A warm-start checkpoint from another run lives on a Modal volume in the
+    # cloud; repoint to its in-container path when one is given.
+    if cfg.get("init_weights_from_remote"):
+        rc["init_weights_from"] = cfg["init_weights_from_remote"]
     return rc
 
 
