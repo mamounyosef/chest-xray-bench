@@ -169,8 +169,9 @@ _BINARY_POLICIES = ("ones", "zeros")
 def _check_policy(p, task: str) -> str:
     """Validate + normalize one task's policy string."""
     p = str(p).lower()
-    if p not in _BINARY_POLICIES and p != "multiclass":
-        raise ValueError(f"labels.per_task[{task!r}]={p!r} (expected ones|zeros|multiclass)")
+    if p not in _BINARY_POLICIES and p not in ("multiclass", "selftrained"):
+        raise ValueError(f"labels.per_task[{task!r}]={p!r} "
+                         f"(expected ones|zeros|multiclass|selftrained)")
     return p
 
 
@@ -259,9 +260,14 @@ def build_labels(df: pd.DataFrame, tasks: list, policies="ones") -> pd.DataFrame
         col = df[t]
         if pol == "multiclass":
             out[t] = col.replace(-1, 2).fillna(0)          # -1 -> unc(2); blank -> neg(0)
-        elif pol == "mask":
-            # certain-only training: uncertain (-1) -> NaN (IGNORED by the masked
-            # loss); blank -> 0 (certain negative). 0/1 pass through.
+        elif pol in ("mask", "selftrained"):
+            # uncertain (-1) -> NaN; blank -> 0 (certain negative); 0/1 pass through.
+            #   'mask'        : NaN cells are IGNORED by the masked loss.
+            #   'selftrained' : NaN cells are FILLED with the model's soft probability
+            #                   in CheXpertDataset (train only); on val they stay NaN
+            #                   and are handled by binarize_targets per the config
+            #                   flag labels.val_ignore_uncertain (default: scored as
+            #                   U-Ones, i.e. positive; or excluded if the flag is set).
             out[t] = col.fillna(0).replace(-1, np.nan)
         elif pol in _BINARY_POLICIES:
             enc = col.fillna(0)                            # blank -> 0
@@ -270,6 +276,13 @@ def build_labels(df: pd.DataFrame, tasks: list, policies="ones") -> pd.DataFrame
             raise ValueError(f"unknown policy {pol!r} for task {t!r}")
     target = pd.DataFrame(out, index=df.index)[list(tasks)]
     return target.astype("float32")
+
+
+def _val_ignore_uncertain(cfg: dict) -> bool:
+    """Whether validation/calibration/eval should DROP uncertain rows from the
+    metric. Config-driven via labels.val_ignore_uncertain (default False = keep
+    them, scored as U-Ones). See binarize_targets."""
+    return bool(cfg.get("labels", {}).get("val_ignore_uncertain", False))
 
 
 def logits_to_probs(logits: torch.Tensor, layout: dict) -> torch.Tensor:
@@ -287,21 +300,41 @@ def logits_to_probs(logits: torch.Tensor, layout: dict) -> torch.Tensor:
     return torch.stack(cols, dim=1)
 
 
-def binarize_targets(targets, layout: dict):
+def binarize_targets(targets, layout: dict, ignore_uncertain: bool = False):
     """Encoded targets (N, n_tasks) -> (y_true_binary, exclude_mask), both
-    (N, n_tasks). Binary columns pass through (already 0/1, nothing excluded).
-    Multiclass columns hold the class index {0,1,2}: ground truth = (idx == 1)
-    and uncertain (idx == 2) rows are flagged in exclude_mask (no binary truth ->
-    dropped from that task's metric). For an all-binary layout the mask is all
-    False and y is unchanged."""
+    (N, n_tasks). Binary 'ones'/'zeros' columns pass through (already 0/1 from
+    build_labels: uncertain mapped to 1/0 at encode time) -> kept as-is. The
+    only tasks whose VALIDATION handling this function decides are the ones that
+    leave uncertain un-binarized: 'multiclass' (class index 2) and
+    'mask'/'selftrained' (NaN on val, no soft target there).
+
+    `ignore_uncertain` controls those uncertain val cells:
+      False (DEFAULT): keep them, scored as POSITIVE (i.e. treat them as U-Ones
+        for the metric regardless of the training policy). multiclass class-2 and
+        NaN cells -> y_true = 1, nothing excluded. (ones/zeros already encode
+        their own 1/0, so this only re-routes multiclass/mask/selftrained.)
+      True: drop them from the metric via exclude_mask (multiclass class 2 and
+        NaN cells flagged; y_true set to 0 but ignored because excluded).
+
+    For an all-binary ('ones'/'zeros') layout there are no such cells, so the
+    flag has no effect: the mask is all-False and y is unchanged either way."""
     y = np.asarray(targets, dtype=float).copy()
-    excl = np.zeros(y.shape, dtype=bool)
+    nan_unc = np.isnan(y)                  # 'mask'/'selftrained' uncertain (val)
+    mc_unc = np.zeros_like(nan_unc)        # 'multiclass' uncertain (class idx 2)
     for k, pol in enumerate(layout["policies"]):
         if pol == "multiclass":
             col = y[:, k]
-            excl[:, k] = (col == 2)
+            mc_unc[:, k] = (col == 2)
             y[:, k] = (col == 1).astype(float)
-    return y, excl
+    unc = nan_unc | mc_unc
+    if ignore_uncertain:
+        y = np.nan_to_num(y, nan=0.0)      # excluded cells -> 0 (dropped via excl anyway)
+        return y, unc
+    # default: keep uncertain, score as positive (U-Ones for the metric).
+    y[nan_unc] = 1.0
+    y[mc_unc] = 1.0
+    y = np.nan_to_num(y, nan=1.0)          # any residual NaN -> positive (defensive)
+    return y, np.zeros_like(unc)
 
 
 def build_train_transforms(cfg: dict):
@@ -377,14 +410,48 @@ class CheXpertDataset(Dataset):
         self.paths = df[cfg["paths"].get("path_column", "Path")].tolist()
         self.layout = task_layout(cfg)            # per-task policy plan (binary or mixed)
         # .copy() -> writable array (silences the non-writable-tensor warning)
-        self.labels = torch.from_numpy(
-            build_labels(df, self.tasks, self.layout["policies"]).to_numpy().copy())
+        lab = build_labels(df, self.tasks, self.layout["policies"])
+        # 'selftrained' tasks: uncertain cells are NaN here -> fill (TRAIN only) with
+        # the self-trained soft probability for that (image, task), joined by path.
+        if split == "train" and "selftrained" in self.layout["policies"]:
+            self._fill_selftrained(df, lab, cfg)
+        self.labels = torch.from_numpy(lab.to_numpy().copy())
         self.use_clahe = bool(cfg["clahe"]["use_clahe"])
         self._clahe = (
             _get_clahe(cfg["clahe"]["clip_limit"], tuple(cfg["clahe"]["tile_grid"]))
             if self.use_clahe else None
         )
         self.train_transforms = build_train_transforms(cfg) if split == "train" else None
+
+    def _fill_selftrained(self, df, lab, cfg):
+        """In place: replace each 'selftrained' task's uncertain (NaN) train cells
+        with the self-trained SOFT probability for that (image, task), read from
+        labels.selftrained_csv (Path + one prob column per task) and joined on the
+        path column. A path missing from the CSV falls back to U-Ones (1.0)."""
+        pcol = cfg["paths"].get("path_column", "Path")
+        st_csv = Path(cfg["paths"]["data_dir"]) / cfg["labels"]["selftrained_csv"]
+        soft = pd.read_csv(st_csv)
+        soft = soft[~soft[pcol].duplicated(keep="first")].set_index(pcol)
+        df_paths = df[pcol].to_numpy()
+        st_tasks = [t for t, p in zip(self.tasks, self.layout["policies"])
+                    if p == "selftrained"]
+        n_filled = n_missing = 0
+        for t in st_tasks:
+            if t not in soft.columns:
+                raise ValueError(f"selftrained task {t!r} not a column in {st_csv}")
+            col = np.array(lab[t], dtype=float)                    # writable copy
+            nan_idx = np.where(np.isnan(col))[0]                    # uncertain cells
+            mapped = soft[t].reindex(df_paths).to_numpy()[nan_idx]  # soft prob, aligned
+            miss = np.isnan(mapped)
+            mapped[miss] = 1.0                                      # fallback: U-Ones
+            col[nan_idx] = mapped
+            lab[t] = col
+            n_filled += int((~miss).sum())
+            n_missing += int(miss.sum())
+        msg = f"[selftrained] filled {n_filled} uncertain cell(s) from {st_csv.name}"
+        if n_missing:
+            msg += f"  (WARNING: {n_missing} path(s) missing in CSV -> U-Ones=1)"
+        print(msg)
 
     def __len__(self):
         return len(self.paths)
@@ -696,11 +763,13 @@ def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int)
 
 class MixedTaskLoss(nn.Module):
     """Sum of per-task losses for a mixed-policy head. Each binary task contributes
-    BCE-with-logits on its single logit vs its 0/1 target; each multiclass task
-    contributes 3-class cross-entropy on its {neg,pos,unc} logits vs the class
-    index. Uncertain is a real CE class (kept in the loss); blanks were folded
-    into the negative class upstream by build_labels. Per-task losses are batch
-    means, summed over the tasks with equal weight ('sum of per-task losses')."""
+    BCE-with-logits on its single logit vs its 0/1 (or 'selftrained' SOFT in [0,1])
+    target; each multiclass task contributes 3-class cross-entropy on its
+    {neg,pos,unc} logits vs the class index. Uncertain is a real CE class (kept in
+    the loss); blanks were folded into the negative class upstream by build_labels.
+    A NaN binary target (a 'selftrained' task's uncertain VAL row — no soft label)
+    is masked out of that task's BCE. Per-task losses are batch means, summed over
+    the tasks with equal weight ('sum of per-task losses')."""
 
     def __init__(self, layout: dict):
         super().__init__()
@@ -714,7 +783,12 @@ class MixedTaskLoss(nn.Module):
             if pol == "multiclass":
                 total = total + F.cross_entropy(logits[:, sl], tgt.long())
             else:
-                total = total + F.binary_cross_entropy_with_logits(logits[:, sl.start], tgt)
+                lg = logits[:, sl.start]
+                m = ~torch.isnan(tgt)            # drop NaN (selftrained uncertain val)
+                if not bool(m.all()):
+                    lg, tgt = lg[m], tgt[m]
+                if tgt.numel() > 0:
+                    total = total + F.binary_cross_entropy_with_logits(lg, tgt)
         return total
 
 
@@ -1143,7 +1217,7 @@ def validate(model, val_loader, loss_fn, cfg, device, amp: bool,
         ps.append(logits_to_probs(logits, layout).float().detach().cpu().numpy())
     y_enc = np.concatenate(ys)
     p = np.concatenate(ps)
-    y_true, excl = binarize_targets(y_enc, layout)
+    y_true, excl = binarize_targets(y_enc, layout, _val_ignore_uncertain(cfg))
     val_loss = total_loss / max(1, n)
     metrics = compute_metrics(y_true, p, cfg["tasks"], exclude_mask=excl)
     return val_loss, metrics
@@ -2297,7 +2371,8 @@ def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
         n += bs
         ys.append(labels.detach().cpu().numpy())
         ps.append(logits_to_probs(logits, layout).float().detach().cpu().numpy())
-    y_true, excl = binarize_targets(np.concatenate(ys), layout)
+    y_true, excl = binarize_targets(np.concatenate(ys), layout,
+                                    _val_ignore_uncertain(cfg))
     return y_true, np.concatenate(ps), excl, total_loss / max(1, n)
 
 
@@ -2400,11 +2475,15 @@ def load_thresholds(results_dir: Path, cfg) -> tuple:
 
 def run_calibration(cfg, model, experiment_dir, device=None, checkpoint: str = "best",
                     amp: bool = False, batch_size: int = None, num_workers: int = 0,
-                    objective: str = "f1") -> dict:
+                    objective: str = "f1", ignore_uncertain: bool = False) -> dict:
     """Calibrate per-task thresholds on the validation set and SAVE them to
     results/thresholds.json (the frozen decision rule applied at test time).
     Prints the chosen thresholds + the val metrics they achieve. Returns the
     {task: threshold} dict.
+
+    ignore_uncertain : when True, uncertain (-1) validation labels are EXCLUDED
+    per task (the 'mask' policy) instead of following labels.u_policy — so the
+    thresholds (and the reported val metrics) are computed on CERTAIN cells only.
 
     NOTE: thresholds are model-specific — re-run this for every experiment /
     checkpoint. The PROCEDURE (max-F1 on 01_val.csv) is what stays identical
@@ -2430,12 +2509,21 @@ def run_calibration(cfg, model, experiment_dir, device=None, checkpoint: str = "
     print(f"[calibrate] checkpoint: {ckpt_path}  (step={ckpt.get('global_step')}, "
           f"epoch={ckpt.get('epoch')})")
 
+    # ignore_uncertain -> build val labels with the 'mask' policy so uncertain (-1)
+    # cells become NaN and are dropped per task by binarize_targets/exclude_mask.
+    cal_cfg = cfg
+    if ignore_uncertain:
+        cal_cfg = copy.deepcopy(cfg)
+        cal_cfg["labels"]["u_policy"] = "mask"
+        print("[calibrate] ignore_uncertain=True -> uncertain (-1) val labels EXCLUDED "
+              "per task (calibrating on certain cells only)")
+
     val_csv = Path(cfg["paths"]["data_dir"]) / cfg["paths"]["val_csv"]
     df_val = pd.read_csv(val_csv)
     thresholds, y_true, y_prob, excl = calibrate_thresholds(
-        cfg, model, df_val, device, amp, batch_size, num_workers)
+        cal_cfg, model, df_val, device, amp, batch_size, num_workers)
     payload, metrics = _threshold_payload(
-        cfg, thresholds, y_true, y_prob, excl, ckpt, ckpt_path, len(df_val), objective)
+        cal_cfg, thresholds, y_true, y_prob, excl, ckpt, ckpt_path, len(df_val), objective)
 
     # print a tidy per-task table (threshold + the val scores it yields)
     print("-" * 78)
