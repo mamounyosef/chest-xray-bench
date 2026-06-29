@@ -27,6 +27,8 @@ RUN_ON     = "modal"     # "modal" -> run on Modal GPU ; "local" -> this machine
 CHECKPOINT = "best"      # which checkpoint to calibrate: best | last | <int step> | path
 AMP        = False       # False -> full fp32 (calibration is cheap; keep it exact)
 OBJECTIVE  = "f1"        # threshold-selection objective (per-task, max-F1)
+IGNORE_UNCERTAIN = True  # True -> exclude uncertain (-1) val labels per task (this is a
+                         # certain-only model; set False to calibrate vs U-Ones val labels)
 # ===========================================================================
 
 # Windows consoles default to cp1252 and choke on the emoji in the logs; force
@@ -73,7 +75,8 @@ def build_model(cfg: dict) -> nn.Module:
 def run_local():
     model = build_model(cfg)
     sc.run_calibration(cfg, model, EXP_DIR,
-                       checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE)
+                       checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
+                       ignore_uncertain=IGNORE_UNCERTAIN)
 
 
 # -----------------------------------------------------------------------------
@@ -119,7 +122,8 @@ if _MODAL_OK:
         try:
             _sc.run_calibration(rcfg, model, out_dir,
                                 checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
-                                num_workers=int(rcfg["dataloader"]["val_num_workers"]))
+                                num_workers=int(rcfg["dataloader"]["val_num_workers"]),
+                                ignore_uncertain=IGNORE_UNCERTAIN)
         finally:
             _runs_vol.commit()                          # persist thresholds.json
 
