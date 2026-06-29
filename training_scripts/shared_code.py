@@ -205,11 +205,13 @@ def task_layout(cfg: dict) -> dict:
             raise ValueError("labels.u_policy='mixed' requires labels.per_task to "
                              f"name every task; missing: {missing}")
         policies = [_check_policy(per[t], t) for t in tasks]
-    elif u in _BINARY_POLICIES:
+    elif u in _BINARY_POLICIES or u == "mask":
         # binary default for all tasks; per_task (optional) overrides named tasks.
+        # 'mask' is a binary-WIDTH policy (1 logit/task) used for the TRAIN split
+        # only (uncertain -> NaN, ignored by the loss); see build_labels.
         policies = [_check_policy(per[t], t) if t in per else u for t in tasks]
     else:
-        raise ValueError(f"labels.u_policy={u!r} (expected ones|zeros|mixed)")
+        raise ValueError(f"labels.u_policy={u!r} (expected ones|zeros|mask|mixed)")
     widths = [3 if p == "multiclass" else 1 for p in policies]
     slices, off = [], 0
     for w in widths:
@@ -257,6 +259,10 @@ def build_labels(df: pd.DataFrame, tasks: list, policies="ones") -> pd.DataFrame
         col = df[t]
         if pol == "multiclass":
             out[t] = col.replace(-1, 2).fillna(0)          # -1 -> unc(2); blank -> neg(0)
+        elif pol == "mask":
+            # certain-only training: uncertain (-1) -> NaN (IGNORED by the masked
+            # loss); blank -> 0 (certain negative). 0/1 pass through.
+            out[t] = col.fillna(0).replace(-1, np.nan)
         elif pol in _BINARY_POLICIES:
             enc = col.fillna(0)                            # blank -> 0
             out[t] = enc.replace(-1, 1 if pol == "ones" else 0)
@@ -458,7 +464,20 @@ def make_loaders(cfg: dict):
     val_df = pd.read_csv(val_csv)
     print(f"  train rows: {len(train_df)}    val rows: {len(val_df)}")
 
-    train_ds = CheXpertDataset(train_df, cfg, split="train")
+    # Optional TRAIN-ONLY uncertainty policy (labels.train_u_policy). The val split
+    # always uses the global labels.u_policy, so validation/calibration/eval are
+    # unchanged. Used by the certain-only soft-label run: train_u_policy='mask'
+    # (uncertain -> NaN, dropped by the masked loss) while val stays U-Ones.
+    lab = cfg.get("labels", {})
+    tr_pol = lab.get("train_u_policy")
+    if tr_pol:
+        tr_cfg = copy.deepcopy(cfg)
+        tr_cfg["labels"]["u_policy"] = tr_pol
+        train_ds = CheXpertDataset(train_df, tr_cfg, split="train")
+        print(f"  [train-only override] u_policy '{lab.get('u_policy')}' -> "
+              f"'{tr_pol}' for the TRAIN split (val stays '{lab.get('u_policy')}')")
+    else:
+        train_ds = CheXpertDataset(train_df, cfg, split="train")
     val_ds = CheXpertDataset(val_df, cfg, split="val")
 
     dl = cfg["dataloader"]
@@ -719,6 +738,28 @@ class _AUCMLossWrapper(nn.Module):
         return self.aucm(torch.sigmoid(logits), targets)
 
 
+class MaskedBCEWithLogitsLoss(nn.Module):
+    """BCE-with-logits that IGNORES masked target entries (NaN). Used when the
+    TRAIN split masks uncertain (-1) labels (labels.train_u_policy='mask'): those
+    (sample, task) cells are NaN and dropped from the loss, so the mean is taken
+    over the VALID cells only. With no NaN present (e.g. the U-Ones val split, or
+    the official sets) it is exactly BCEWithLogitsLoss."""
+
+    def __init__(self, pos_weight=None):
+        super().__init__()
+        self.pos_weight = pos_weight        # already on the right device (build_loss)
+
+    def forward(self, logits, targets):
+        mask = ~torch.isnan(targets)
+        t = torch.nan_to_num(targets, nan=0.0)
+        per = F.binary_cross_entropy_with_logits(
+            logits, t, pos_weight=self.pos_weight, reduction="none")
+        per = per[mask]
+        if per.numel() == 0:                # whole batch masked -> 0 (keeps graph)
+            return logits.sum() * 0.0
+        return per.mean()
+
+
 def build_loss(cfg: dict, device=None) -> nn.Module:
     """Loss for this cfg. Mixed-policy arm (any multiclass task) -> MixedTaskLoss
     (per-task BCE + 3-class CE, summed). 'auc_margin' -> LibAUC MultiLabelAUCMLoss
@@ -744,6 +785,13 @@ def build_loss(cfg: dict, device=None) -> nn.Module:
         pos_weight = torch.tensor(pw, dtype=torch.float32)
         if device is not None:
             pos_weight = pos_weight.to(device)
+    # When the TRAIN split masks uncertain labels (labels.train_u_policy='mask'),
+    # its targets contain NaN -> use the masked BCE (a no-op on NaN-free batches,
+    # so val/eval are unchanged).
+    lab = cfg.get("labels", {})
+    train_pol = str(lab.get("train_u_policy", lab.get("u_policy", "ones"))).lower()
+    if train_pol == "mask":
+        return MaskedBCEWithLogitsLoss(pos_weight=pos_weight)
     return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 
