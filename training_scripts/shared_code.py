@@ -859,12 +859,16 @@ def build_loss(cfg: dict, device=None) -> nn.Module:
         pos_weight = torch.tensor(pw, dtype=torch.float32)
         if device is not None:
             pos_weight = pos_weight.to(device)
-    # When the TRAIN split masks uncertain labels (labels.train_u_policy='mask'),
-    # its targets contain NaN -> use the masked BCE (a no-op on NaN-free batches,
-    # so val/eval are unchanged).
+    # Use the masked BCE (a no-op on NaN-free batches, so plain binary val/eval
+    # are unchanged) whenever the targets can contain NaN:
+    #   - train_u_policy='mask'  : uncertain TRAIN cells are NaN (ignored by loss).
+    #   - any 'selftrained' task : uncertain VAL cells are NaN (no soft label there;
+    #     TRAIN cells are filled with soft probs, so they are valid soft targets).
+    # (A 'selftrained' task that also coexists with a multiclass task already takes
+    #  the MixedTaskLoss path above, which handles the same NaN masking per task.)
     lab = cfg.get("labels", {})
     train_pol = str(lab.get("train_u_policy", lab.get("u_policy", "ones"))).lower()
-    if train_pol == "mask":
+    if train_pol == "mask" or "selftrained" in layout["policies"]:
         return MaskedBCEWithLogitsLoss(pos_weight=pos_weight)
     return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
@@ -1129,6 +1133,13 @@ def print_config(cfg: dict):
     print(f"  metric (headline) : {ev['metric']}  (eval_level={ev['eval_level']})")
     print(f"  eval cadence      : every_epochs={ev['eval_every_epochs']}  "
           f"every_steps={ev['eval_every_steps']}")
+    _sched = ev.get("eval_schedule")
+    if _sched:
+        _thr = int(_sched["threshold_epoch"])
+        _bef = _sched.get("before_steps", ev.get("eval_every_steps"))
+        _aft = _sched.get("after_steps", ev.get("eval_every_steps"))
+        print(f"  eval schedule     : every {_bef} steps before epoch {_thr}, "
+              f"every {_aft} steps from epoch {_thr} on (inclusive)")
     print(f"  seed              : {rep['seed']}  deterministic={rep['deterministic']}")
     print(f"  checkpointing     : periodic every {out.get('checkpoint_every_steps', 0)} steps "
           f"(0=off) + best.pt at validation")
@@ -1433,6 +1444,27 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             if stop:
                 break
     return global_step, stop
+
+
+def _resolve_eval_every_steps(cfg: dict, epoch: int):
+    """Effective `eval_every_steps` for a 0-indexed `epoch`. Default is the flat
+    evaluation.eval_every_steps. If evaluation.eval_schedule is present, the step
+    cadence is PHASED by epoch so early training (where the model is clearly still
+    improving) validates rarely and later training validates often:
+        epochs BEFORE threshold_epoch     -> validate every `before_steps`
+        epoch threshold_epoch and onward  -> validate every `after_steps`
+    threshold_epoch is 1-indexed and INCLUSIVE (threshold_epoch=2 => epochs 2+ use
+    after_steps; epoch 1 uses before_steps). Missing before_/after_steps fall back
+    to the flat eval_every_steps. No schedule -> unchanged behavior."""
+    ev = cfg["evaluation"]
+    base = ev.get("eval_every_steps")
+    sched = ev.get("eval_schedule")
+    if not sched:
+        return base
+    thr = int(sched["threshold_epoch"])               # 1-indexed, inclusive
+    before = sched.get("before_steps", base)
+    after = sched.get("after_steps", base)
+    return after if (epoch + 1) >= thr else before
 
 
 def _fmt_delta(curr, prev) -> str:
@@ -1768,9 +1800,13 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         _samp = getattr(train_loader, "sampler", None)
         if hasattr(_samp, "set_epoch"):
             _samp.set_epoch(epoch, skip * int(train_loader.batch_size))
+        # phased validation cadence: resolve THIS epoch's eval_every_steps
+        # (evaluation.eval_schedule splits coarse early vs fine later; absent ->
+        # the flat ev_steps, so existing runs are unchanged).
+        ev_steps_epoch = _resolve_eval_every_steps(cfg, epoch)
         global_step, stop = train_one_epoch(
             model, train_loader, optimizer, loss_fn, scaler, device,
-            epoch, global_step, train_logger, amp, grad_clip, ev_steps, on_eval,
+            epoch, global_step, train_logger, amp, grad_clip, ev_steps_epoch, on_eval,
             console_log_every, elapsed, eta, total_steps, log_fn, wandb_log_every,
             cfg=cfg, debug_dir=debug_dir, debug_every=debug_every,
             channels_last=channels_last,

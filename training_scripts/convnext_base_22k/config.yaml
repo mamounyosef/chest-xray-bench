@@ -114,12 +114,21 @@ training:
 # Evaluation
 #   eval_every_epochs : validate + checkpoint every N epochs (or null)
 #   eval_every_steps  : also validate every N optimizer steps (or null)
+#   eval_schedule     : OPTIONAL phased step cadence — validate rarely early
+#       (model clearly still improving) and often later, to save compute.
+#       threshold_epoch is 1-indexed + INCLUSIVE: epochs before it validate every
+#       before_steps; epoch threshold_epoch and onward validate every after_steps.
+#       Omit the block for a flat eval_every_steps (unchanged behavior).
 # ----------------------------------------------------------------------------
 evaluation:
   metric: "mean_auroc"
   eval_level: "image"
   eval_every_epochs: null
   eval_every_steps: 600
+  eval_schedule:
+    threshold_epoch: 3       # epochs 1-2 coarse, epochs 3+ fine (inclusive)
+    before_steps: 1200       # epochs 1-2: validate every 1200 steps
+    after_steps:  600        # epochs 3+:  validate every 600 steps
 
 
 # ----------------------------------------------------------------------------
