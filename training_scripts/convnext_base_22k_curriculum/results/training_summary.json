@@ -1,0 +1,23 @@
+{
+  "experiment": "convnext_base_22k_curriculum",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.7984268520368563,
+  "best_step": 5400,
+  "best_epoch": 5,
+  "best_metrics": {
+    "mean_auroc": 0.7984268520368563,
+    "mean_auprc": 0.5980877782151359,
+    "mean_f1": 0.4189883709404385,
+    "mean_precision": 0.659992358523511,
+    "mean_recall": 0.37724169418454034,
+    "mean_specificity": 0.9221721917285128,
+    "val_loss": 0.4321131882617611
+  },
+  "last_step": 9600,
+  "total_steps": 16818,
+  "elapsed_sec": 3490.94,
+  "elapsed_human": "58m 11s",
+  "updated": "2026-06-30T12:35:43"
+}
