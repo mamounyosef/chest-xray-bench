@@ -595,6 +595,80 @@ def make_loaders(cfg: dict):
     return train_loader, val_loader
 
 
+def _build_train_loader(cfg: dict, train_df: pd.DataFrame):
+    """Build a TRAIN dataset + DataLoader for `train_df`. Shared by the curriculum
+    loaders so each phase honors the same train-only u_policy override,
+    ResumableSampler and seeded generator that make_loaders uses. Returns
+    (loader, dataset). (Mirrors make_loaders' train path; keep them in sync.)"""
+    lab = cfg.get("labels", {})
+    tr_pol = lab.get("train_u_policy")
+    if tr_pol:
+        tr_cfg = copy.deepcopy(cfg)
+        tr_cfg["labels"]["u_policy"] = tr_pol
+        train_ds = CheXpertDataset(train_df, tr_cfg, split="train")
+    else:
+        train_ds = CheXpertDataset(train_df, cfg, split="train")
+    dl = cfg["dataloader"]
+    g = torch.Generator()
+    g.manual_seed(cfg["reproducibility"]["seed"])
+    tr_nw = int(dl["num_workers"])
+    kw = dict(num_workers=tr_nw, pin_memory=bool(dl["pin_memory"]), worker_init_fn=seed_worker)
+    if tr_nw > 0:
+        kw.update(prefetch_factor=dl["prefetch_factor"],
+                  persistent_workers=bool(dl["persistent_workers"]))
+    sampler = ResumableSampler(len(train_ds), cfg["reproducibility"]["seed"])
+    loader = DataLoader(train_ds, batch_size=int(dl["batch_size"]), sampler=sampler,
+                        drop_last=bool(dl["drop_last"]), generator=g, **kw)
+    return loader, train_ds
+
+
+def make_curriculum_loaders(cfg: dict):
+    """Curriculum loaders: partition the TRAIN split by uncertainty and return
+    (loader_uncertain, loader_certain, val_loader, n_uncertain, n_certain).
+      loader_uncertain : rows with >=1 uncertain (-1) label among the cfg tasks
+                         (Phase A — the uncertain warm-up).
+      loader_certain   : the remaining rows (all 0/1/blank — Phase B).
+    val_loader is the standard validation loader (identical to make_loaders)."""
+    paths = cfg["paths"]
+    data_dir = Path(paths["data_dir"])
+    train_df = pd.read_csv(data_dir / paths["train_csv"])
+    val_df = pd.read_csv(data_dir / paths["val_csv"])
+    tasks = cfg["tasks"]
+    unc = (train_df[tasks] == -1).any(axis=1)        # row has >=1 uncertain cell
+    df_unc = train_df[unc].reset_index(drop=True)
+    df_cer = train_df[~unc].reset_index(drop=True)
+
+    print("=" * 70)
+    print("[curriculum] partitioning TRAIN split by uncertainty")
+    print("-" * 70)
+    print(f"  total train rows            : {len(train_df)}")
+    print(f"  Phase A (>=1 uncertain -1)  : {len(df_unc)} rows")
+    print(f"  Phase B (certain, 0/1 only) : {len(df_cer)} rows")
+    loader_A, ds_A = _build_train_loader(cfg, df_unc)
+    loader_B, ds_B = _build_train_loader(cfg, df_cer)
+
+    # validation loader — identical construction to make_loaders' val path.
+    val_ds = CheXpertDataset(val_df, cfg, split="val")
+    dl = cfg["dataloader"]
+    va_nw = int(dl.get("val_num_workers", int(dl["num_workers"])))
+    vkw = dict(num_workers=va_nw,
+               pin_memory=bool(dl.get("val_pin_memory", bool(dl["pin_memory"]))),
+               worker_init_fn=seed_worker)
+    if va_nw > 0:
+        vkw.update(prefetch_factor=dl.get("val_prefetch_factor", dl["prefetch_factor"]),
+                   persistent_workers=bool(dl.get("val_persistent_workers",
+                                                  bool(dl["persistent_workers"]))))
+    val_loader = DataLoader(val_ds, batch_size=int(dl.get("val_batch_size") or int(dl["batch_size"])),
+                            shuffle=False, drop_last=False, **vkw)
+
+    print("-" * 70)
+    print(f"  Phase A: {len(ds_A)} imgs -> {len(loader_A)} batches")
+    print(f"  Phase B: {len(ds_B)} imgs -> {len(loader_B)} batches")
+    print(f"  val    : {len(val_ds)} imgs -> {len(val_loader)} batches")
+    print("=" * 70)
+    return loader_A, loader_B, val_loader, len(df_unc), len(df_cer)
+
+
 # =============================================================================
 # Section 3 — Reproducibility, metrics, and optim builders
 # =============================================================================
@@ -722,7 +796,8 @@ def build_optimizer(model: nn.Module, cfg: dict, loss_fn=None) -> optim.Optimize
     raise ValueError(f"unknown optimizer: {name!r}")
 
 
-def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int):
+def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int,
+                    total_steps_override: int = None):
     """Build the LR scheduler. Returns (scheduler_or_None, mode):
         mode == "step"    -> step once per OPTIMIZER STEP (cosine / warmup)
         mode == "plateau" -> step once per validation with the monitored metric
@@ -735,7 +810,11 @@ def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int)
     s = cfg["training"]["scheduler"]
     name = s["name"].lower()
     epochs = cfg["training"]["epochs"]
-    total_steps = max(1, epochs * steps_per_epoch)
+    # `total_steps_override` lets a curriculum run (Phase A + Phase B over different-
+    # sized subsets, so steps/epoch differ) pass the true combined step budget while
+    # `steps_per_epoch` still sizes the warmup (measured in Phase-A steps).
+    total_steps = max(1, int(total_steps_override) if total_steps_override
+                      else epochs * steps_per_epoch)
 
     if name == "none":
         return None, None
@@ -1532,7 +1611,36 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     print(f"[paths] checkpoints -> {ckpt_dir}")
 
     # --- data / model / optim ---
-    train_loader, val_loader = make_loaders(cfg)
+    # Curriculum (optional): two phases over subsets of the SAME train CSV, sharing
+    # ONE optimizer + ONE cosine schedule (continuous). Phase A = the first
+    # phase_a_epochs on uncertain rows (no early stop); Phase B = the rest on
+    # certain rows (early stop). epoch_loaders maps each epoch -> its loader;
+    # cum_starts[e] is the global_step at epoch e's start (for resume + scheduling).
+    curr = cfg.get("curriculum") or {}
+    use_curriculum = bool(curr.get("enable"))
+    epoch_loaders = cum_starts = None
+    curr_total_steps = warmup_ref_spe = phase_a_epochs = None
+    if use_curriculum:
+        phase_a_epochs = int(curr.get("phase_a_epochs", 2))
+        total_epochs = int(cfg["training"]["epochs"])
+        phase_b_epochs = total_epochs - phase_a_epochs
+        if phase_b_epochs < 0:
+            raise ValueError(f"curriculum.phase_a_epochs ({phase_a_epochs}) exceeds "
+                             f"training.epochs ({total_epochs})")
+        loader_A, loader_B, val_loader, _n_unc, _n_cer = make_curriculum_loaders(cfg)
+        epoch_loaders = [loader_A] * phase_a_epochs + [loader_B] * phase_b_epochs
+        _epoch_steps = [len(l) for l in epoch_loaders]
+        cum_starts = [0]
+        for _c in _epoch_steps:
+            cum_starts.append(cum_starts[-1] + _c)
+        curr_total_steps = cum_starts[-1]
+        warmup_ref_spe = max(1, len(loader_A))      # warmup is measured in Phase-A steps
+        train_loader = loader_A                     # placeholder for incidental len()/refs
+        print(f"[curriculum] Phase A = {phase_a_epochs} epoch(s) on {_n_unc} uncertain rows "
+              f"(no early-stop); Phase B = {phase_b_epochs} epoch(s) on {_n_cer} certain rows "
+              f"(early-stop). combined step budget = {curr_total_steps}")
+    else:
+        train_loader, val_loader = make_loaders(cfg)
     model = model.to(device)
     print_model_summary(model, cfg)
 
@@ -1570,7 +1678,11 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     # Loss BEFORE optimizer: PESG (AUC-margin) needs the loss object's a/b/alpha.
     loss_fn = build_loss(cfg, device)
     optimizer = build_optimizer(model, cfg, loss_fn)
-    scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
+    if use_curriculum:
+        scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=warmup_ref_spe,
+                                                total_steps_override=curr_total_steps)
+    else:
+        scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
     amp = bool(cfg["training"]["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=amp)
     _opt_name = str(cfg["training"]["optimizer"].get("name", "adamw")).upper()
@@ -1610,8 +1722,16 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         # used saved_epoch + 1, which skipped the rest of the epoch for a mid-epoch
         # checkpoint.) start_epoch = completed full epochs; resume_skip = batches
         # already done within the current epoch (fast-forwarded in train_one_epoch).
-        start_epoch = global_step // steps_per_epoch
-        resume_skip = global_step % steps_per_epoch
+        if use_curriculum:
+            # epochs have different step-counts -> locate the epoch from cum_starts.
+            start_epoch = 0
+            while start_epoch < epochs and cum_starts[start_epoch + 1] <= global_step:
+                start_epoch += 1
+            resume_skip = global_step - cum_starts[min(start_epoch, epochs - 1)]
+            steps_per_epoch = _epoch_steps[min(start_epoch, epochs - 1)]
+        else:
+            start_epoch = global_step // steps_per_epoch
+            resume_skip = global_step % steps_per_epoch
         track["best"] = info["best_score"]
         # Restore the FULL early-stopping / best-so-far state so the patience
         # counter (no_improve), best_step/epoch, best_metrics and the delta
@@ -1624,7 +1744,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     console_log_every = int(out["console_log_every"])
     wandb_log_every = int(cfg.get("wandb", {}).get("log_every", 50))   # train-metric cadence
     ckpt_every = int(out.get("checkpoint_every_steps", 0) or 0)         # periodic rolling ckpt
-    total_steps = epochs * len(train_loader)     # ETA denominator (full schedule)
+    total_steps = curr_total_steps if use_curriculum else epochs * len(train_loader)  # ETA denom
     print(f"[checkpoint] periodic rolling checkpoint every "
           f"{ckpt_every if ckpt_every > 0 else 'OFF'} steps; best.pt at validation")
 
@@ -1772,7 +1892,10 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                   f"best {monitor}={track['best']:.4f}")
         print("-" * 70)
 
-        return bool(es_enable and track["no_improve"] >= es_patience)
+        # track["allow_stop"] is set False during curriculum Phase A so those
+        # warm-up epochs validate (log + best.pt) but can never end the run.
+        return bool(es_enable and track.get("allow_stop", True)
+                    and track["no_improve"] >= es_patience)
 
     # --- periodic rolling checkpoint, INDEPENDENT of validation ---
     def save_periodic(epoch: int, gstep: int):
@@ -1788,24 +1911,36 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     # --- epoch loop ---
     stop = False
     for epoch in range(start_epoch, epochs):
+        # curriculum: pick THIS epoch's loader and arm/disarm early stopping.
+        if use_curriculum:
+            cur_loader = epoch_loaders[epoch]
+            in_phase_a = epoch < phase_a_epochs
+            track["allow_stop"] = not in_phase_a            # Phase A never stops the run
+            if epoch == phase_a_epochs:                     # entering Phase B: fresh patience
+                track["no_improve"] = 0
+            _phase_tag = (f"  ▶ Phase A (uncertain warm-up)" if in_phase_a
+                          else f"  ▶ Phase B (certain, early-stop)")
+        else:
+            cur_loader = train_loader
+            _phase_tag = ""
         print("=" * 70)
         _stg = f"  [{stage_tag}]" if stage_tag else ""
-        print(f"📚 EPOCH {epoch + 1}/{epochs}{_stg}")
+        print(f"📚 EPOCH {epoch + 1}/{epochs}{_stg}{_phase_tag}")
         print("=" * 70)
         # only the first epoch after a mid-epoch resume fast-forwards already-done
         # batches; every later epoch starts clean.
         skip = resume_skip if epoch == start_epoch else 0
         # tell the sampler which epoch's permutation to draw and how many leading
         # samples to drop, so the workers never load already-trained batches.
-        _samp = getattr(train_loader, "sampler", None)
+        _samp = getattr(cur_loader, "sampler", None)
         if hasattr(_samp, "set_epoch"):
-            _samp.set_epoch(epoch, skip * int(train_loader.batch_size))
+            _samp.set_epoch(epoch, skip * int(cur_loader.batch_size))
         # phased validation cadence: resolve THIS epoch's eval_every_steps
         # (evaluation.eval_schedule splits coarse early vs fine later; absent ->
         # the flat ev_steps, so existing runs are unchanged).
         ev_steps_epoch = _resolve_eval_every_steps(cfg, epoch)
         global_step, stop = train_one_epoch(
-            model, train_loader, optimizer, loss_fn, scaler, device,
+            model, cur_loader, optimizer, loss_fn, scaler, device,
             epoch, global_step, train_logger, amp, grad_clip, ev_steps_epoch, on_eval,
             console_log_every, elapsed, eta, total_steps, log_fn, wandb_log_every,
             cfg=cfg, debug_dir=debug_dir, debug_every=debug_every,
