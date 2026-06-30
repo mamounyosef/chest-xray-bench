@@ -1,0 +1,195 @@
+# =============================================================================
+# config.yaml  —  experiment: convnext_base_22k_final_stage2_consolidation
+#   (FINAL best-setup STAGE 2: ConvNeXt-B, AUC-Margin loss, SINGLE disease: Consolidation)
+# -----------------------------------------------------------------------------
+# Per-disease Stage-2 model that maximizes AUROC for Consolidation ONLY (1-output head)
+# with the AUC-Margin loss (LibAUC) optimized by PESG. The BACKBONE is warm-started
+# from the Stage-1 epoch_2.pt checkpoint (convnext_base_22k_final_stage1); the 5-out
+# Stage-1 head is discarded and a fresh 1-out head is trained (init_weights_backbone_only).
+# AUC-M / PESG recipe (lr, margin, epoch_decay, AMP off, 6 epochs) follows the
+# convnext_base_22k_aucm run. Uncertainty for Consolidation: U-SelfTrained, soft labels THRESHOLDED at 0.0474 -> 0/1 (train); U-Ones on val.
+# Holds only what VARIES per experiment; common settings come from ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "convnext_base_22k_final_stage2_consolidation"
+
+model:
+  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-B
+  # pretrained on ImageNet-22k (@224) then fine-tuned on ImageNet-1k (@384).
+  # (Same weight scheme / SIZE as convnext_base_22k. Distinct from torchvision's
+  #  IN-1k-only weights, and from timm's "in12k_*" tags which are an 11,821-class
+  #  subset, NOT IN-22k.)
+  name: "convnext_base.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
+  pretrained: true                             # IN-22k->IN-1k weights (timm, see train.py)
+
+# ----------------------------------------------------------------------------
+# Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
+#   null     : fresh run
+#   "best"   : results/checkpoints/best.pt
+#   "last"   : newest rolling checkpoint
+#   <int>    : a specific step, e.g. 1200  ->  ckpt_step1200.pt
+#   <path>   : explicit checkpoint file path
+# Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Warm-start  —  seed THIS run's BACKBONE from the Stage-1 epoch_2.pt checkpoint
+# (convnext_base_22k_final_stage1), then optimize AUROC with AUCM. LibAUC recommends
+# initializing AUCM from a BCE-trained model; here that is the Stage-1 backbone. The
+# Stage-1 head is 5-output and is DISCARDED (init_weights_backbone_only: true) so this
+# per-disease run trains a fresh 1-output head. Loaded once at start; ignored on resume.
+#   init_weights_from        : LOCAL path (used by `python train.py`)
+#   init_weights_from_remote : in-container path on the Modal runs volume
+#                              (/runs/<run>/...); remote_cfg swaps it in on Modal.
+# Distinct from `resume`: this loads MODEL weights only (fresh optimizer/step/LR).
+# ----------------------------------------------------------------------------
+init_weights_from:        "d:/My Projects/chest-xray-bench/training_scripts/convnext_base_22k_final_stage1/results/checkpoints/epoch_2.pt"
+init_weights_from_remote: "/runs/convnext_base_22k_final_stage1/results/checkpoints/epoch_2.pt"
+init_weights_backbone_only: true   # discard the 5-out Stage-1 head; keep a fresh 1-out head
+
+# ----------------------------------------------------------------------------
+# Single-disease arm  —  this Stage-2 AUC-M model predicts ONLY Consolidation
+# (1-output head). Overrides the inherited 5-task list.
+# ----------------------------------------------------------------------------
+tasks: ["Consolidation"]
+
+# ----------------------------------------------------------------------------
+# Label policy  —  AUC-M (LibAUC) needs HARD 0/1 targets, not soft probs, so
+# Consolidation's self-trained soft labels are THRESHOLDED to 0/1.
+#   VAL   : u_policy "ones" -> uncertain -> 1 (clean binary for the AUC-M metric/loss;
+#           there are no soft val labels anyway).
+#   TRAIN : train_u_policy "selftrained" -> uncertain cells take the soft prob from
+#           selftrained_csv, then binarized at selftrained_threshold (soft >= thr -> 1).
+#   selftrained_threshold = 0.0474 is consol_only's F1-calibrated Consolidation
+#   threshold (convnext_base_22k_u_selftrain_consol_only/results/thresholds.json),
+#   frozen here as a literal for reproducibility.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "ones"                              # VAL: uncertain -> 1
+  train_u_policy: "selftrained"                 # TRAIN: uncertain -> soft prob (then thresholded)
+  selftrained_csv: "01_train_softlabels.csv"    # soft targets (Consolidation column)
+  selftrained_threshold: 0.0474                 # consol_only Consolidation F1 thr; soft>=thr -> 1
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
+# only difference is the architecture (ConvNeXt-B vs ResNet-50).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+# ----------------------------------------------------------------------------
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         512
+  val_num_workers:        10
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel — applies to AdamW only; IGNORED here
+#                     because this run uses PESG (kept true for parity, no effect).
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training  —  AUC-margin objective (LibAUC).
+# The ONLY differences vs convnext_base_22k are the loss, the optimizer (PESG,
+# required by AUCM), its learning rate, and AMP (off, matching LibAUC examples).
+# The LR SCHEDULE keeps the same SHAPE as the baseline (cosine, 1-epoch warmup,
+# min_lr = 1% of base); only the magnitude differs because PESG-SGD operates at
+# a much larger scale than AdamW. PESG reads its LR from param_groups, so the
+# usual cosine scheduler drives it normally.
+# ----------------------------------------------------------------------------
+training:
+  epochs:        6
+  amp:           false       # LibAUC examples run full precision; PESG + GradScaler untested
+  grad_clip:     null        # max-norm, or null to disable (PESG also clips internally)
+
+  optimizer:
+    name:         "pesg"     # LibAUC Proximal-Epoch SGD — REQUIRED by the AUCM loss
+    mode:         "sgd"      # PESG inner optimizer: "sgd" (momentum) or "adam"
+    lr:           0.075      # PESG-SGD scale (cf. AdamW 1e-4); between LibAUC's 0.1 and a gentler 0.05 for the warm start
+    momentum:     0.9
+    margin:       1.0        # PESG margin (matches the loss margin below)
+    epoch_decay:  2.0e-3     # PESG proximal-regularizer strength (gamma)
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 0.4       # fractional OK: warm up over 40% of the first epoch
+    min_lr:      7.5e-4      # 1% of base lr (cosine floor)
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    name:    "auc_margin"    # LibAUC MultiLabelAUCMLoss — optimizes mean AUROC directly
+    margin:  1.0             # squared-hinge margin
+    version: "v1"            # paper's AUCM; auto-estimates each task's positive prior per-batch
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 7             # counted in VALIDATIONS, not epochs
+
+# ----------------------------------------------------------------------------
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+
+
+# ----------------------------------------------------------------------------
+# Modal  —  cloud run resources + volume layout for THIS experiment.
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written; also holds the
+#                     convnext_base_22k checkpoint this run warm-starts from)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : paths INSIDE the data volume; these
+#       override paths.data_root / paths.data_dir when running on Modal.
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "A100"               # A100-40GB: comfortable for ConvNeXt-B (~88M) @384x320, batch 64
+  cpu_cores: 8
+  memory_gb: 45
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY
