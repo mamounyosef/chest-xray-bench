@@ -1,0 +1,190 @@
+# =============================================================================
+# config.yaml  —  experiment: convnext_base_22k_u_selftrain_all
+#   (ConvNeXt-B, timm fb_in22k_ft_in1k_384, CLAHE off, ALL-tasks U-SelfTrained)
+# -----------------------------------------------------------------------------
+# Identical to convnext_base_22k in EVERYTHING (model, data, seed 42, 384x320, BCE,
+# 10 epochs, lr 1e-4, AMP on) EXCEPT uncertainty is handled by U-SelfTrained for
+# EVERY pathology:
+#   Atelectasis      -> U-SelfTrained (binary; -1 -> SOFT prob from a prior model)
+#   Cardiomegaly     -> U-SelfTrained (binary; -1 -> SOFT prob from a prior model)
+#   Consolidation    -> U-SelfTrained (binary; -1 -> SOFT prob from a prior model)
+#   Edema            -> U-SelfTrained (binary; -1 -> SOFT prob from a prior model)
+#   Pleural Effusion -> U-SelfTrained (binary; -1 -> SOFT prob from a prior model)
+# All tasks are binary -> 5 output logits (no multiclass head). Each task's uncertain
+# TRAIN cells take its soft probability from convnext_base_22k_certain_only's labels;
+# on val those cells have no soft target (see val handling below). u_policy stays
+# "mixed" because that is the engine's per-task entry point (selftrained is only
+# valid inside per_task); with no multiclass task the head is still 5 plain logits.
+# Holds only what VARIES per experiment; common settings come from ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "convnext_base_22k_u_selftrain_all"
+
+model:
+  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-B
+  # pretrained on ImageNet-22k (@224) then fine-tuned on ImageNet-1k (@384).
+  # (Same weight scheme as convnext_tiny_22k, just the Base size. Distinct from
+  #  torchvision's IN-1k-only weights, and from timm's "in12k_*" tags which are an
+  #  11,821-class subset, NOT IN-22k.)
+  name: "convnext_base.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
+  pretrained: true                             # IN-22k->IN-1k weights (timm, see train.py)
+
+# ----------------------------------------------------------------------------
+# Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
+#   null     : fresh run
+#   "best"   : results/checkpoints/best.pt
+#   "last"   : newest rolling checkpoint
+#   <int>    : a specific step, e.g. 1200  ->  ckpt_step1200.pt
+#   <path>   : explicit checkpoint file path
+# Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Label policy  —  MIXED per-task uncertainty handling (this arm's whole point).
+#   u_policy: "mixed" switches the engine to a per-task output head. Each task:
+#     "ones" / "zeros"  : BINARY head (sigmoid + BCE); uncertain(-1) -> 1 / 0.
+#     "multiclass"      : 3-CLASS head {neg,pos,unc} (softmax + CE); at scoring
+#                         p_unc is dropped, prob renormalized to p_pos/(p_pos+p_neg).
+#     "selftrained"     : BINARY head; uncertain(-1) TRAIN cells take a SOFT target
+#                         (a probability in [0,1]) from selftrained_csv, joined by
+#                         path. On the val set (no soft labels) uncertain cells are
+#                         NaN and handled per val_ignore_uncertain below.
+#   Here EVERY task is "selftrained" -> all binary -> 5 logits (no multiclass head).
+#   Blank/NaN -> NEGATIVE (0) for all tasks. The engine routes the loss to the
+#   masked BCE (NaN val cells ignored; TRAIN soft probs are valid soft targets).
+#
+#   selftrained_csv : file (resolved against paths.data_dir, like the split CSVs)
+#     with the path column + one soft-probability column per task. Produced by
+#     convnext_base_22k_certain_only/label_uncertain.py. PREREQUISITE: that run
+#     must be trained + labeled and the CSV uploaded next to the splits
+#     (Modal: /data/splits/01_train_softlabels.csv) before THIS run can train.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "selftrained"  # binary, uncertain -> soft prob (train only)
+    Cardiomegaly:     "selftrained"  # binary, uncertain -> soft prob (train only)
+    Consolidation:    "selftrained"  # binary, uncertain -> soft prob (train only)
+    Edema:            "selftrained"  # binary, uncertain -> soft prob (train only)
+    Pleural Effusion: "selftrained"  # binary, uncertain -> soft prob (train only)
+  selftrained_csv: "01_train_softlabels.csv"   # soft targets for ALL 5 selftrained tasks
+
+  # val_ignore_uncertain : how the VALIDATION metric (and threshold calibration /
+  #   final eval) treats uncertain (-1) rows. Does NOT affect training.
+  #     false (DEFAULT) : KEEP uncertain rows, scored as POSITIVE (U-Ones for the
+  #                       metric), regardless of the per-task training policy. So
+  #                       'ones'/'zeros' keep their own 1/0, while 'multiclass'
+  #                       and 'selftrained' uncertain cells -> 1 on val.
+  #     true            : DROP uncertain rows from each task's metric (multiclass
+  #                       class-2 cells and selftrained/mask NaN cells excluded).
+  val_ignore_uncertain: false
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
+# only difference is the architecture (ConvNeXt-B vs ResNet-50).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+# ----------------------------------------------------------------------------
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         192
+  val_num_workers:        10
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+training:
+  epochs:        10
+  amp:           true        # mixed precision (A100)
+  grad_clip:     null        # max-norm, or null to disable
+
+  optimizer:                 # AdamW always
+    lr:           1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 1
+    min_lr:      1.0e-6
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    name: "bce_with_logits"  # multi-label binary cross-entropy on logits
+    pos_weight: null         # null = unweighted; or per-task list
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 8               # counted in VALIDATIONS, not epochs
+
+# ----------------------------------------------------------------------------
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+
+
+# ----------------------------------------------------------------------------
+# Modal  —  cloud run resources + volume layout for THIS experiment.
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : paths INSIDE the data volume; these
+#       override paths.data_root / paths.data_dir when running on Modal.
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "L4"                 # L4-24GB: fits ConvNeXt-B (~88M) @384x320, batch 64 (slower than A100)
+  cpu_cores: 8
+  memory_gb: 50
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY
