@@ -206,13 +206,15 @@ def task_layout(cfg: dict) -> dict:
             raise ValueError("labels.u_policy='mixed' requires labels.per_task to "
                              f"name every task; missing: {missing}")
         policies = [_check_policy(per[t], t) for t in tasks]
-    elif u in _BINARY_POLICIES or u == "mask":
+    elif u in _BINARY_POLICIES or u in ("mask", "selftrained"):
         # binary default for all tasks; per_task (optional) overrides named tasks.
-        # 'mask' is a binary-WIDTH policy (1 logit/task) used for the TRAIN split
-        # only (uncertain -> NaN, ignored by the loss); see build_labels.
+        # 'mask'/'selftrained' are binary-WIDTH policies (1 logit/task) used for the
+        # TRAIN split only (via labels.train_u_policy): 'mask' -> uncertain NaN ignored
+        # by the loss; 'selftrained' -> uncertain filled from the soft-label CSV (and
+        # optionally thresholded). See build_labels / CheXpertDataset._fill_selftrained.
         policies = [_check_policy(per[t], t) if t in per else u for t in tasks]
     else:
-        raise ValueError(f"labels.u_policy={u!r} (expected ones|zeros|mask|mixed)")
+        raise ValueError(f"labels.u_policy={u!r} (expected ones|zeros|mask|selftrained|mixed)")
     widths = [3 if p == "multiclass" else 1 for p in policies]
     slices, off = [], 0
     for w in widths:
@@ -435,6 +437,10 @@ class CheXpertDataset(Dataset):
         df_paths = df[pcol].to_numpy()
         st_tasks = [t for t, p in zip(self.tasks, self.layout["policies"])
                     if p == "selftrained"]
+        # Optional: binarize the soft labels to hard 0/1 at a per-task (or scalar)
+        # threshold. Used by the AUC-M stage (LibAUC's loss needs 0/1 targets, not
+        # soft probs): soft >= threshold -> 1 else 0. None -> keep the soft probs.
+        thr_cfg = cfg["labels"].get("selftrained_threshold")
         n_filled = n_missing = 0
         for t in st_tasks:
             if t not in soft.columns:
@@ -444,11 +450,15 @@ class CheXpertDataset(Dataset):
             mapped = soft[t].reindex(df_paths).to_numpy()[nan_idx]  # soft prob, aligned
             miss = np.isnan(mapped)
             mapped[miss] = 1.0                                      # fallback: U-Ones
+            thr = thr_cfg.get(t) if isinstance(thr_cfg, dict) else thr_cfg
+            if thr is not None:
+                mapped = (mapped >= float(thr)).astype(float)      # -> hard 0/1
             col[nan_idx] = mapped
             lab[t] = col
             n_filled += int((~miss).sum())
             n_missing += int(miss.sum())
-        msg = f"[selftrained] filled {n_filled} uncertain cell(s) from {st_csv.name}"
+        thr_msg = f" (thresholded at {thr_cfg})" if thr_cfg is not None else ""
+        msg = f"[selftrained] filled {n_filled} uncertain cell(s) from {st_csv.name}{thr_msg}"
         if n_missing:
             msg += f"  (WARNING: {n_missing} path(s) missing in CSV -> U-Ones=1)"
         print(msg)
@@ -898,13 +908,18 @@ class MaskedBCEWithLogitsLoss(nn.Module):
     over the VALID cells only. With no NaN present (e.g. the U-Ones val split, or
     the official sets) it is exactly BCEWithLogitsLoss."""
 
-    def __init__(self, pos_weight=None):
+    def __init__(self, pos_weight=None, label_smoothing: float = 0.0):
         super().__init__()
         self.pos_weight = pos_weight        # already on the right device (build_loss)
+        self.label_smoothing = float(label_smoothing)   # 0 -> off
 
     def forward(self, logits, targets):
         mask = ~torch.isnan(targets)
         t = torch.nan_to_num(targets, nan=0.0)
+        if self.label_smoothing > 0:
+            # pull every (non-NaN) target toward 0.5 by eps: t' = t(1-eps) + 0.5*eps.
+            # applied to ALL binary targets (hard 0/1 AND soft self-trained probs).
+            t = t * (1.0 - self.label_smoothing) + 0.5 * self.label_smoothing
         per = F.binary_cross_entropy_with_logits(
             logits, t, pos_weight=self.pos_weight, reduction="none")
         per = per[mask]
@@ -947,8 +962,11 @@ def build_loss(cfg: dict, device=None) -> nn.Module:
     #  the MixedTaskLoss path above, which handles the same NaN masking per task.)
     lab = cfg.get("labels", {})
     train_pol = str(lab.get("train_u_policy", lab.get("u_policy", "ones"))).lower()
-    if train_pol == "mask" or "selftrained" in layout["policies"]:
-        return MaskedBCEWithLogitsLoss(pos_weight=pos_weight)
+    ls = float(l.get("label_smoothing", 0.0) or 0.0)    # 0 -> off (every existing run)
+    # MaskedBCE is also used as the SMOOTHED-BCE path: with no NaN it is exactly BCE,
+    # and it is the only BCE variant here that applies label smoothing.
+    if train_pol == "mask" or "selftrained" in layout["policies"] or ls > 0:
+        return MaskedBCEWithLogitsLoss(pos_weight=pos_weight, label_smoothing=ls)
     return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
 
@@ -1323,11 +1341,12 @@ def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
                     epoch: int, global_step: int, best_score: float,
                     device, elapsed_sec: float,
                     rolling: bool = False, is_best: bool = False,
-                    track: dict = None):
-    """Write a fully-resumable checkpoint. Two independent triggers:
+                    track: dict = None, name: str = None):
+    """Write a fully-resumable checkpoint. Independent triggers:
       rolling=True : write ckpt_step{N}.pt and prune to keep_last_n  (periodic)
       is_best=True : (over)write best.pt                              (at validation)
-    Both can be true; either writes the same complete state.
+      name=<file> : (over)write that exact filename, never pruned     (e.g. epoch_2.pt)
+    Any combination can be set; each writes the same complete state.
     `track` is the full early-stopping / best-so-far tracking dict (no_improve,
     best_step/epoch, best_metrics, delta baselines); it is saved verbatim so a
     resumed run continues the early-stopping counter exactly where it left off."""
@@ -1355,6 +1374,8 @@ def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
             old.unlink(missing_ok=True)
     if is_best:
         torch.save(state, ckpt_dir / out["best_name"])
+    if name:
+        torch.save(state, ckpt_dir / name)         # persistent named ckpt (not pruned)
 
 
 def load_checkpoint(resume, model, ckpt_dir: Path, optimizer=None, scheduler=None,
@@ -1653,10 +1674,24 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         print("🧬 [stage-init] initializing model from a previous stage's checkpoint")
         print(f"   source : {init_weights_from}")
         _ck = torch.load(init_weights_from, map_location=device, weights_only=False)
-        _unwrap(model).load_state_dict(_ck["model"])
-        print(f"   ✅ loaded full model (backbone + head)  "
-              f"(pretrain step={_ck.get('global_step')}, epoch={_ck.get('epoch')}, "
-              f"best_score={_ck.get('best_score')})")
+        if cfg.get("init_weights_backbone_only"):
+            # Discard the source head and keep a FRESH head (e.g. a 5-output Stage-1
+            # model -> a 1-output per-disease Stage-2 model). Load only the keys that
+            # exist with a MATCHING shape; the mismatched head stays randomly init'd.
+            _src, _dst = _ck["model"], _unwrap(model).state_dict()
+            _keep = {k: v for k, v in _src.items()
+                     if k in _dst and v.shape == _dst[k].shape}
+            _dropped = [k for k in _src if k not in _keep]
+            _unwrap(model).load_state_dict(_keep, strict=False)
+            print(f"   ✅ loaded BACKBONE only ({len(_keep)} tensors; fresh head — "
+                  f"dropped {len(_dropped)} mismatched key(s): {_dropped[:4]}"
+                  f"{'...' if len(_dropped) > 4 else ''})  "
+                  f"(src step={_ck.get('global_step')}, epoch={_ck.get('epoch')})")
+        else:
+            _unwrap(model).load_state_dict(_ck["model"])
+            print(f"   ✅ loaded full model (backbone + head)  "
+                  f"(pretrain step={_ck.get('global_step')}, epoch={_ck.get('epoch')}, "
+                  f"best_score={_ck.get('best_score')})")
         print("=" * 70)
         del _ck
 
@@ -1953,6 +1988,19 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)
+
+        # persistent epoch-end checkpoint(s) for configured epochs (1-indexed), e.g.
+        # output.save_epoch_checkpoints: [2] -> epoch_2.pt (a later stage's warm-start
+        # seed). Saved regardless of validation; never pruned by the rolling logic.
+        _save_eps = [int(e) for e in (out.get("save_epoch_checkpoints") or [])]
+        if (epoch + 1) in _save_eps:
+            _name = f"epoch_{epoch + 1}.pt"
+            _safe("epoch-checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
+                  scheduler, scaler, epoch, global_step, track["best"], device, elapsed(),
+                  track=track, name=_name)
+            print(f"  💾 saved persistent epoch checkpoint -> {ckpt_dir / _name}")
+            if persist_fn is not None:
+                _safe("persist", persist_fn)
 
         # plateau steps once per epoch on the monitored metric; "step"-mode
         # schedulers (cosine/warmup) are stepped inside train_one_epoch.
