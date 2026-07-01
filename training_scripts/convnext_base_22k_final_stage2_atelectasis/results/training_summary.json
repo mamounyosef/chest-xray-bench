@@ -1,0 +1,23 @@
+{
+  "experiment": "convnext_base_22k_final_stage2_atelectasis",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.7233141703879848,
+  "best_step": 600,
+  "best_epoch": 1,
+  "best_metrics": {
+    "mean_auroc": 0.7233141703879848,
+    "mean_auprc": 0.511470539865014,
+    "mean_f1": 0.5148514851485149,
+    "mean_precision": 0.4972566232951873,
+    "mean_recall": 0.5337371697795726,
+    "mean_specificity": 0.7562514250969066,
+    "val_loss": 0.16212200511812538
+  },
+  "last_step": 4200,
+  "total_steps": 16122,
+  "elapsed_sec": 3669.3,
+  "elapsed_human": "1h 01m",
+  "updated": "2026-06-30T21:09:45"
+}

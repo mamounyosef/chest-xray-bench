@@ -1,0 +1,23 @@
+{
+  "experiment": "convnext_base_22k_final_stage2_cardiomegaly",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8712000536638921,
+  "best_step": 1200,
+  "best_epoch": 1,
+  "best_metrics": {
+    "mean_auroc": 0.8712000536638921,
+    "mean_auprc": 0.6186944437258173,
+    "mean_f1": 0.5697600609369049,
+    "mean_precision": 0.4639239197849907,
+    "mean_recall": 0.7381578947368421,
+    "mean_specificity": 0.8385429638854296,
+    "val_loss": 0.05798161508369196
+  },
+  "last_step": 4800,
+  "total_steps": 16122,
+  "elapsed_sec": 4283.15,
+  "elapsed_human": "1h 11m",
+  "updated": "2026-06-30T21:19:59"
+}
