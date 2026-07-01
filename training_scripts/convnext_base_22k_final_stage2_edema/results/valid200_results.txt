@@ -1,0 +1,17 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : convnext_base_22k_final_stage2_edema
+  checkpoint : /runs/convnext_base_22k_final_stage2_edema/results/checkpoints/best.pt
+  images     : 234    device: cuda    amp: False
+  use_clahe  : False    u_policy: ones    val_loss: 0.10231
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.9248        mean AUPRC : 0.7962
+    mean F1    : 0.6916    mean precision: 0.5968    mean recall: 0.8222    mean spec: 0.8677
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Edema               0.301  0.9248  0.7962  0.6916  0.5968  0.8222  0.8677      45
+======================================================================================

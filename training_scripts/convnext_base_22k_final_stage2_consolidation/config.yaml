@@ -154,7 +154,7 @@ training:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 7             # counted in VALIDATIONS, not epochs
+    patience: 6             # counted in VALIDATIONS, not epochs
 
 # ----------------------------------------------------------------------------
 # Evaluation
@@ -166,6 +166,10 @@ evaluation:
   eval_level: "image"
   eval_every_epochs: null
   eval_every_steps: 600
+  eval_schedule:             # phased cadence: validate rarely in epoch 1, often after
+    threshold_epoch: 2       # epoch 1 coarse, epochs 2+ fine (inclusive)
+    before_steps: 1200       # epoch 1: validate every 1200 steps
+    after_steps:  600        # epochs 2+: validate every 600 steps
 
 
 # ----------------------------------------------------------------------------

@@ -1,0 +1,17 @@
+======================================================================================
+OFFICIAL EVAL — test500   (01_test500.csv)
+======================================================================================
+  experiment : convnext_base_22k_final_stage2_consolidation
+  checkpoint : /runs/convnext_base_22k_final_stage2_consolidation/results/checkpoints/best.pt
+  images     : 668    device: cuda    amp: False
+  use_clahe  : False    u_policy: ones    val_loss: 0.04354
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8543        mean AUPRC : 0.3936
+    mean F1    : 0.2109    mean precision: 0.1197    mean recall: 0.8857    mean spec: 0.6398
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Consolidation       0.506  0.8543  0.3936  0.2109  0.1197  0.8857  0.6398      35
+======================================================================================

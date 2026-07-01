@@ -1,0 +1,41 @@
+{
+  "experiment": "convnext_base_22k_final_stage2_pleural_effusion",
+  "set": "test500",
+  "csv": "01_test500.csv",
+  "checkpoint": "/runs/convnext_base_22k_final_stage2_pleural_effusion/results/checkpoints/best.pt",
+  "checkpoint_step": 1200,
+  "checkpoint_epoch": 0,
+  "n_images": 668,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "01_val.csv",
+  "thresholds": {
+    "Pleural Effusion": 0.3894476890563965
+  },
+  "use_clahe": false,
+  "u_policy": "ones",
+  "val_loss": 0.14003486833172643,
+  "macro": {
+    "mean_auroc": 0.9374239659367397,
+    "mean_auprc": 0.8089391024119779,
+    "mean_f1": 0.5750636132315521,
+    "mean_precision": 0.4139194139194139,
+    "mean_recall": 0.9416666666666667,
+    "mean_specificity": 0.708029197080292
+  },
+  "per_task": {
+    "Pleural Effusion": {
+      "auroc": 0.9374239659367397,
+      "auprc": 0.8089391024119779,
+      "f1": 0.5750636132315521,
+      "precision": 0.4139194139194139,
+      "recall": 0.9416666666666667,
+      "specificity": 0.708029197080292,
+      "n_pos": 120,
+      "n_excluded": 0,
+      "threshold": 0.3894476890563965
+    }
+  },
+  "evaluated_at": "2026-07-01T09:07:15"
+}

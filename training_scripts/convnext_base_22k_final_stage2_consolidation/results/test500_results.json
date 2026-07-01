@@ -1,0 +1,41 @@
+{
+  "experiment": "convnext_base_22k_final_stage2_consolidation",
+  "set": "test500",
+  "csv": "01_test500.csv",
+  "checkpoint": "/runs/convnext_base_22k_final_stage2_consolidation/results/checkpoints/best.pt",
+  "checkpoint_step": 1200,
+  "checkpoint_epoch": 0,
+  "n_images": 668,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "01_val.csv",
+  "thresholds": {
+    "Consolidation": 0.5056405067443848
+  },
+  "use_clahe": false,
+  "u_policy": "ones",
+  "val_loss": 0.04354173498239346,
+  "macro": {
+    "mean_auroc": 0.8542541187090951,
+    "mean_auprc": 0.3936199285588174,
+    "mean_f1": 0.2108843537414966,
+    "mean_precision": 0.11969111969111969,
+    "mean_recall": 0.8857142857142857,
+    "mean_specificity": 0.6398104265402843
+  },
+  "per_task": {
+    "Consolidation": {
+      "auroc": 0.8542541187090951,
+      "auprc": 0.3936199285588174,
+      "f1": 0.2108843537414966,
+      "precision": 0.11969111969111969,
+      "recall": 0.8857142857142857,
+      "specificity": 0.6398104265402843,
+      "n_pos": 35,
+      "n_excluded": 0,
+      "threshold": 0.5056405067443848
+    }
+  },
+  "evaluated_at": "2026-07-01T09:05:12"
+}
