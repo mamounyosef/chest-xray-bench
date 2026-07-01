@@ -47,6 +47,7 @@ FULL_MODELS = [
 # runs keep their fine-tune best.pt in a stage subfolder.
 CKPT_SUBPATH = {
     "convnext_large_22k_cxr14_pretrain": "finetune_chexpert/best.pt",
+    "convnext_base_22k_cxr14_pretrain_lowlr_all": "finetune_chexpert/best.pt",
 }
 
 # Per-class thresholds for the F1/precision/recall/specificity of the ENSEMBLE come

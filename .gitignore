@@ -2,6 +2,7 @@
 debugged_images/
 checkpoints/
 train_config/
+ensembling_results/
 
 modal_commants.txt
 # Byte-compiled / optimized / DLL files

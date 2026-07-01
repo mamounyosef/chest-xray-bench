@@ -1,6 +1,7 @@
 # =============================================================================
 # config.yaml  —  experiment: convnext_base_22k_aucm_no_ce
-#   (ConvNeXt-B, timm fb_in22k_ft_in1k_384, CLAHE off, U-Ones, AUC-margin loss)
+#   (ConvNeXt-B, timm fb_in22k_ft_in1k_384, CLAHE off, U-Ones + Consolidation
+#    U-SelfTrained, AUC-margin loss)
 # -----------------------------------------------------------------------------
 # Identical to convnext_base_22k_aucm in EVERYTHING (AUCM loss + PESG, lr 0.075,
 # 6 epochs, batch 64, AMP off) EXCEPT there is NO cross-entropy warm-start: AUCM
@@ -43,10 +44,37 @@ resume: null
 # ----------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------
-# Label policy  —  uncertain (-1) handling. "ones" | "zeros". Blank/NaN -> 0.
+# Label policy  —  MIXED per-task uncertainty, aligned with convnext_base_22k_final_stage1
+# so every run from here on shares the SAME target scheme: U-Ones for four
+# pathologies, U-SelfTrained for Consolidation.
+#   Atelectasis      -> U-Ones        (binary; -1 -> 1)
+#   Cardiomegaly     -> U-Ones        (binary; -1 -> 1)
+#   Consolidation    -> U-SelfTrained (binary; -1 -> soft prob from selftrained_csv)
+#   Edema            -> U-Ones        (binary; -1 -> 1)
+#   Pleural Effusion -> U-Ones        (binary; -1 -> 1)
+# All tasks are binary -> 5 plain logits (no multiclass head), so build_loss stays
+# on the auc_margin path (layout["mixed"] is False; that flag only trips on a
+# 3-class task). u_policy "mixed" is just the engine's per-task entry point.
+#
+# selftrained_threshold : AUC-M (MultiLabelAUCMLoss) needs HARD 0/1 targets, but
+#   U-SelfTrained yields SOFT probabilities. So Consolidation's soft train labels
+#   are binarized at 0.0474 (the SAME threshold the Stage-2 AUC-M runs use) BEFORE
+#   they reach the loss. (Under a BCE run this threshold would be omitted and the
+#   soft probs used directly — but AUCM is not defined for soft targets.)
+# val_ignore_uncertain false : keep uncertain val rows, scored as U-Ones for the
+#   metric (matches final_stage1). Does NOT affect training.
 # ----------------------------------------------------------------------------
 labels:
-  u_policy: "ones"
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"         # binary, uncertain -> 1
+    Cardiomegaly:     "ones"         # binary, uncertain -> 1
+    Consolidation:    "selftrained"  # binary, uncertain -> soft prob (train only), binarized below
+    Edema:            "ones"         # binary, uncertain -> 1
+    Pleural Effusion: "ones"         # binary, uncertain -> 1
+  selftrained_csv: "01_train_softlabels.csv"   # soft targets for the selftrained task (Consolidation)
+  selftrained_threshold: 0.0474                # binarize the soft Consolidation labels to 0/1 for AUC-M
+  val_ignore_uncertain: false
 
 # ----------------------------------------------------------------------------
 # CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
@@ -71,7 +99,7 @@ dataloader:
   persistent_workers: true
   drop_last:          false
   # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
-  val_batch_size:         256
+  val_batch_size:         512
   val_num_workers:        10
   val_pin_memory:         true
   val_prefetch_factor:    4
@@ -125,12 +153,15 @@ training:
     name:    "auc_margin"    # LibAUC MultiLabelAUCMLoss — optimizes mean AUROC directly
     margin:  1.0             # squared-hinge margin
     version: "v1"            # paper's AUCM; auto-estimates each task's positive prior per-batch
+    label_smoothing: 0.05    # INERT here: build_loss's auc_margin path never reads this
+                             # (label smoothing is a BCE-only knob). Kept for cross-run
+                             # config consistency with convnext_base_22k_final_stage1.
 
   early_stopping:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 10             # counted in VALIDATIONS, not epochs
+    patience: 6             # counted in VALIDATIONS, not epochs
 
 # ----------------------------------------------------------------------------
 # Evaluation
@@ -142,6 +173,10 @@ evaluation:
   eval_level: "image"
   eval_every_epochs: null
   eval_every_steps: 600
+  eval_schedule:
+    threshold_epoch: 3       # epochs 1-2 coarse, epochs 3+ fine (inclusive)
+    before_steps: 1200       # epochs 1-2: validate every 1200 steps
+    after_steps:  600        # epochs 3+:  validate every 600 steps
 
 
 # ----------------------------------------------------------------------------
