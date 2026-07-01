@@ -22,7 +22,8 @@ import statistics
 from datetime import datetime
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+OUT_DIR = Path(__file__).resolve().parent        # training_scripts/others (outputs go here)
+RUNS_DIR = OUT_DIR.parent                          # training_scripts (the run folders live here)
 
 # disease -> its Stage-2 run folder (each model predicts ONLY this class)
 RUNS = {
@@ -38,7 +39,7 @@ METRICS = ["auroc", "auprc", "f1", "precision", "recall", "specificity"]
 
 def _load_class_metrics(run: str, split: str, disease: str) -> dict:
     """Read one model's results JSON and return ITS OWN class's metric row."""
-    f = HERE / run / "results" / f"{split}_results.json"
+    f = RUNS_DIR / run / "results" / f"{split}_results.json"
     if not f.exists():
         raise FileNotFoundError(f"missing {f} — run evaluate.py for {run} first")
     d = json.load(open(f, encoding="utf-8"))
@@ -99,8 +100,8 @@ def main():
     if not summary["splits"]:
         raise SystemExit("no results found — evaluate the 5 Stage-2 runs first.")
 
-    out_json = HERE / "final_stage2_summary.json"
-    out_txt = HERE / "final_stage2_summary.txt"
+    out_json = OUT_DIR / "final_stage2_summary.json"
+    out_txt = OUT_DIR / "final_stage2_summary.txt"
     json.dump(summary, open(out_json, "w", encoding="utf-8"), indent=2)
     txt = _render_txt(summary)
     open(out_txt, "w", encoding="utf-8").write(txt)

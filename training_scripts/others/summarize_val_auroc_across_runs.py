@@ -1,6 +1,6 @@
 """
-summarize_val_auroc.py
-======================
+summarize_val_auroc_across_runs.py
+==================================
 Scan every run folder under training_scripts/ and print each run's mean AUROC on
 the validation set (valid200), into ONE txt file that is REWRITTEN every run.
 
@@ -9,19 +9,20 @@ single combined row (the mean over the five) is taken from
 final_stage2_summary.json (produced by aggregate_final_stage2.py).
 
 Output (overwritten each run):
-    training_scripts/val_auroc_summary.txt
+    training_scripts/others/val_auroc_summary_across_runs.txt
 
-Run:  python training_scripts/summarize_val_auroc.py
+Run:  python training_scripts/others/summarize_val_auroc_across_runs.py
 """
 
 import json
 from datetime import datetime
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+OUT_DIR = Path(__file__).resolve().parent          # training_scripts/others (outputs here)
+RUNS_DIR = OUT_DIR.parent                            # training_scripts (run folders here)
 SET = "valid200"                      # validation set to read (valid200 | test500)
-OUT = HERE / "val_auroc_summary.txt"
-STAGE2_SUMMARY = HERE / "final_stage2_summary.json"
+OUT = OUT_DIR / "val_auroc_summary_across_runs.txt"
+STAGE2_SUMMARY = OUT_DIR / "final_stage2_summary.json"
 
 # the five per-disease Stage-2 runs are collapsed into ONE combined row, not listed
 STAGE2_RUNS = {
@@ -57,7 +58,7 @@ def _stage2_combined():
 
 def main():
     rows = []                                    # (name, auroc)
-    for run_dir in sorted(p for p in HERE.iterdir() if p.is_dir()):
+    for run_dir in sorted(p for p in RUNS_DIR.iterdir() if p.is_dir()):
         if run_dir.name in STAGE2_RUNS:
             continue                             # collapsed below, not listed here
         auroc = _run_auroc(run_dir)
