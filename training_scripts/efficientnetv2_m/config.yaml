@@ -1,0 +1,166 @@
+# =============================================================================
+# config.yaml  —  experiment: efficientnetv2_m
+#   (EfficientNetV2-M, timm in21k_ft_in1k, CLAHE off, U-Ones + label smoothing 0.05)
+# -----------------------------------------------------------------------------
+# Same setup as convnext_base_22k in EVERYTHING (CLAHE off, U-Ones, seed 42,
+# 384x320 input, BCE, 10 epochs, lr 1e-4, cosine, AMP on, A100, eval_schedule)
+# with ONE modelling addition and one efficiency knob:
+#   (1) label smoothing eps=0.05 on the BCE targets (training.loss.label_smoothing),
+#       identical to convnext_base_22k_final_stage1;
+#   (2) val_batch_size 512 (from final_stage1) for faster validation.
+# There is NO two-stage training here, so it does NOT save an epoch_2.pt
+# (no output.save_epoch_checkpoints). Only the ARCHITECTURE differs from
+# convnext_base_22k: EfficientNetV2-M (~55M) instead of ConvNeXt-B.
+#
+# Weights: ImageNet-21k pretrained (@224) -> ImageNet-1k fine-tuned (@384),
+# loaded via timm (NOT torchvision). This is the same 21k->1k pretraining scheme
+# as the ConvNeXt-B run (which is 22k->1k), and the native fine-tune resolution
+# (384) matches our 384x320 input.
+# Holds only what VARIES per experiment; common settings come from ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "efficientnetv2_m"
+
+model:
+  # timm model id WITH explicit pretrained tag. "in21k_ft_in1k" = EfficientNetV2-M
+  # pretrained on ImageNet-21k (@224) then fine-tuned on ImageNet-1k (@384). The
+  # 'tf_' prefix marks the TensorFlow-ported weights (the only in21k EffNetV2-M in
+  # timm). Native train res 384 (test 480) -> a good fit for our 384x320 input.
+  name: "tf_efficientnetv2_m.in21k_ft_in1k"   # timm id (NOT torchvision)
+  pretrained: true                            # IN-21k->IN-1k weights (timm, see train.py)
+
+# ----------------------------------------------------------------------------
+# Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
+#   null     : fresh run
+#   "best"   : results/checkpoints/best.pt
+#   "last"   : newest rolling checkpoint
+#   <int>    : a specific step, e.g. 1200  ->  ckpt_step1200.pt
+#   <path>   : explicit checkpoint file path
+# Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Label policy  —  uncertain (-1) handling. "ones" | "zeros". Blank/NaN -> 0.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "ones"
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
+# only difference is the architecture (EfficientNetV2-M vs ResNet-50).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+# ----------------------------------------------------------------------------
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         512
+  val_num_workers:        10
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+training:
+  epochs:        10
+  amp:           true        # mixed precision (A100)
+  grad_clip:     null        # max-norm, or null to disable
+
+  optimizer:                 # AdamW always
+    lr:           1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 1
+    min_lr:      1.0e-6
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    name: "bce_with_logits"  # multi-label binary cross-entropy on logits
+    pos_weight: null         # null = unweighted; or per-task list
+    label_smoothing: 0.05    # eps: pull EVERY non-NaN target toward 0.5 (t(1-eps)+0.5eps)
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 10              # counted in VALIDATIONS, not epochs
+
+# ----------------------------------------------------------------------------
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+#   eval_schedule     : OPTIONAL phased step cadence — validate rarely early
+#       (model clearly still improving) and often later, to save compute.
+#       threshold_epoch is 1-indexed + INCLUSIVE: epochs before it validate every
+#       before_steps; epoch threshold_epoch and onward validate every after_steps.
+#       Omit the block for a flat eval_every_steps (unchanged behavior).
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+  eval_schedule:
+    threshold_epoch: 3       # epochs 1-2 coarse, epochs 3+ fine (inclusive)
+    before_steps: 1200       # epochs 1-2: validate every 1200 steps
+    after_steps:  600        # epochs 3+:  validate every 600 steps
+
+
+# ----------------------------------------------------------------------------
+# Modal  —  cloud run resources + volume layout for THIS experiment.
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : paths INSIDE the data volume; these
+#       override paths.data_root / paths.data_dir when running on Modal.
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "A100"               # A100-40GB: comfortable for EfficientNetV2-M (~55M) @384x320, batch 64
+  cpu_cores: 8
+  memory_gb: 50
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY

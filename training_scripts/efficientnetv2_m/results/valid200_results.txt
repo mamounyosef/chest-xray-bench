@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : efficientnetv2_m
+  checkpoint : /runs/efficientnetv2_m/results/checkpoints/best.pt
+  images     : 234    device: cuda    amp: False
+  use_clahe  : False    u_policy: ones    val_loss: 0.44450
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8567        mean AUPRC : 0.6577
+    mean F1    : 0.6026    mean precision: 0.5997    mean recall: 0.7625    mean spec: 0.7825
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.241  0.8166  0.6231  0.6900  0.5750  0.8625  0.6688      80
+    Cardiomegaly        0.312  0.8145  0.7272  0.5000  0.9583  0.3382  0.9940      68
+    Consolidation       0.207  0.8218  0.3302  0.4255  0.2778  0.9091  0.6119      33
+    Edema               0.275  0.9224  0.7777  0.6842  0.5652  0.8667  0.8413      45
+    Pleural Effusion    0.360  0.9084  0.8305  0.7134  0.6222  0.8358  0.7964      67
+======================================================================================

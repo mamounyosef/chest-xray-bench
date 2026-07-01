@@ -1,0 +1,23 @@
+{
+  "experiment": "efficientnetv2_m",
+  "status": "running",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.802034893377184,
+  "best_step": 7800,
+  "best_epoch": 3,
+  "best_metrics": {
+    "mean_auroc": 0.802034893377184,
+    "mean_auprc": 0.6008823392917522,
+    "mean_f1": 0.46347087514142044,
+    "mean_precision": 0.6417698071420566,
+    "mean_recall": 0.4102892143779207,
+    "mean_specificity": 0.916726494106866,
+    "val_loss": 0.4703440515657994
+  },
+  "last_step": 11400,
+  "total_steps": 26870,
+  "elapsed_sec": 4724.26,
+  "elapsed_human": "1h 18m",
+  "updated": "2026-07-01T17:34:33"
+}
