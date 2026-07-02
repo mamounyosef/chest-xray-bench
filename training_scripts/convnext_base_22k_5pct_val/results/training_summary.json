@@ -1,0 +1,23 @@
+{
+  "experiment": "convnext_base_22k_5pct_val",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8044607416239241,
+  "best_step": 7800,
+  "best_epoch": 3,
+  "best_metrics": {
+    "mean_auroc": 0.8044607416239241,
+    "mean_auprc": 0.604523032147722,
+    "mean_f1": 0.4899266216311184,
+    "mean_precision": 0.634895267564912,
+    "mean_recall": 0.4540486470773474,
+    "mean_specificity": 0.9029613897448125,
+    "val_loss": 0.4306291604887876
+  },
+  "last_step": 12000,
+  "total_steps": 28380,
+  "elapsed_sec": 3605.26,
+  "elapsed_human": "1h 00m",
+  "updated": "2026-07-02T13:37:29"
+}
