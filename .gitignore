@@ -226,3 +226,5 @@ __marimo__/
 test.ipynb
 README_notes.txt
 modal_commands.txt
+modal_download_chexpert_native.py   # contains a live AIMI SAS credential
+modal_download_chexpert_native.py

@@ -123,7 +123,19 @@ def load_config(experiment_dir, config_name: str = "config.yaml",
 
 def resolve_path(rel: str, cfg: dict) -> Path | None:
     """Resolve a CSV `Path` to a real file. train/valid live under data_root;
-    the full-res test images live one level up — so try both bases."""
+    the full-res test images live one level up — so try both bases.
+
+    Optional config-driven FILE rerouting (paths.path_remap): substitute a prefix
+    in `rel` purely for locating the image on disk — e.g. the split CSVs say
+    'CheXpert-v1.0-small/...' but the NATIVE full-res tree is 'CheXpert-v1.0/...'.
+    The CSV `Path` string itself (and any join key built from it, e.g. the
+    selftrained soft-label merge) is NOT touched; only the resolved filesystem
+    path changes. Cost is one prefix check per image — negligible vs decode/resize.
+    """
+    remap = (cfg.get("paths") or {}).get("path_remap") or {}
+    src, dst = remap.get("from"), remap.get("to")
+    if src and rel.startswith(src):
+        rel = dst + rel[len(src):]
     data_root = Path(cfg["paths"]["data_root"])
     for base in (data_root.parent, data_root):
         p = base / rel
