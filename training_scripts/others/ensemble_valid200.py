@@ -28,7 +28,7 @@ from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
-SET    = "valid200"      # scored split — "valid200" or "test500"
+SET    = "test500"      # scored split — "valid200" or "test500"
 BATCH_SIZE = 256        # inference batch size for EVERY member (None -> each run's
                         # own dataloader.val_batch_size). valid200 is 200 imgs, so
                         # any value >=200 is one batch; lower it only to cap VRAM.
