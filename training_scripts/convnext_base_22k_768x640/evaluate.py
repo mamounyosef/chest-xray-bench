@@ -73,10 +73,11 @@ def build_model(cfg: dict) -> nn.Module:
 # Local execution (RUN_ON = "local"): scores using the local dataset + the
 # checkpoint already in this folder's results/.
 # -----------------------------------------------------------------------------
-def run_local():
+def run_local(eval_sets=("valid200", "test500")):
     model = build_model(cfg)
     sc.evaluate_official(cfg, model, EXP_DIR,
-                         checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE)
+                         checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
+                         eval_sets=eval_sets)
 
 
 # -----------------------------------------------------------------------------
@@ -108,7 +109,7 @@ if _MODAL_OK:
         serialized=True,
         **sc.modal_resources(cfg),
     )
-    def evaluate_remote():
+    def evaluate_remote(eval_sets=("valid200", "test500")):
         import sys as _sys
         from pathlib import Path as _P
         if "/root/training_scripts" not in _sys.path:
@@ -123,20 +124,32 @@ if _MODAL_OK:
         try:
             _sc.evaluate_official(rcfg, model, out_dir,
                                   checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
-                                  num_workers=int(rcfg["dataloader"]["val_num_workers"]))
+                                  num_workers=int(rcfg["dataloader"]["val_num_workers"]),
+                                  eval_sets=eval_sets)
         finally:
             _runs_vol.commit()                          # persist result files
 
 
 if __name__ == "__main__":
+    import argparse
+    _parser = argparse.ArgumentParser(description="Score the checkpoint on the official sets.")
+    _parser.add_argument("--sets", choices=["both", "valid200", "test500"], default="both",
+                         help="which official set(s) to evaluate (default: both). Each set "
+                              "writes its own <set>_results files, so '--sets test500' won't "
+                              "touch existing valid200 results.")
+    _args = _parser.parse_args()
+    _EVAL_SETS = {"both": ("valid200", "test500"),
+                  "valid200": ("valid200",),
+                  "test500": ("test500",)}[_args.sets]
+
     if RUN_ON == "modal":
         if not _MODAL_OK:
             raise SystemExit("RUN_ON='modal' but the modal package isn't installed "
                              "(pip install modal), or set RUN_ON='local'.")
         with modal.enable_output():                     # stream remote logs locally
             with app.run():                             # ephemeral app (== `modal run`)
-                evaluate_remote.remote()
+                evaluate_remote.remote(_EVAL_SETS)
     elif RUN_ON == "local":
-        run_local()
+        run_local(_EVAL_SETS)
     else:
         raise SystemExit(f"RUN_ON must be 'modal' or 'local', got {RUN_ON!r}")
