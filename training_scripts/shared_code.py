@@ -2823,7 +2823,7 @@ def _render_report_txt(report: dict) -> str:
 def evaluate_official(cfg: dict, model, experiment_dir, device=None,
                       checkpoint: str = "best", amp: bool = False,
                       batch_size: int = None, num_workers: int = 0,
-                      objective: str = "f1"):
+                      objective: str = "f1", eval_sets=("valid200", "test500")):
     """Load `checkpoint` (default best.pt) and score it on the official sets
     (valid200 + test500) INDEPENDENTLY, applying the FROZEN per-task thresholds
     from results/thresholds.json (calibrated on the validation set). If that file
@@ -2880,8 +2880,12 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
           + "  ".join(f"{t}={thr_map[t]:.3f}" for t in tasks))
 
     loss_fn = build_loss(cfg, device)
-    sets = [("valid200", cfg["paths"]["valid200_csv"]),
-            ("test500", cfg["paths"]["test500_csv"])]
+    # each set writes its own <set>_results.{json,txt}, so scoring a subset (e.g.
+    # ("test500",)) leaves the other set's existing files untouched.
+    _all_sets = {"valid200": cfg["paths"]["valid200_csv"],
+                 "test500":  cfg["paths"]["test500_csv"]}
+    sets = [(n, _all_sets[n]) for n in eval_sets if n in _all_sets]
+    print(f"[eval] scoring sets: {[n for n, _ in sets]}")
 
     reports = {}
     for set_name, csv_name in sets:

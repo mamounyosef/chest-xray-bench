@@ -1,6 +1,6 @@
 """
-ensemble_valid200.py
-====================
+ensample.py
+===========
 Probability-averaging ENSEMBLE, scored on the valid200 split ONLY (never test500).
 
 Each member loads its own best.pt, runs inference with its OWN cfg (its own
@@ -17,10 +17,10 @@ overlap — so it's specified as one line for convenience.)
 Writes (overwritten each run):
 Each run writes into its OWN timestamped subfolder (so different ensembles don't
 overwrite each other):
-    local :  training_scripts/others/ensembling_results/<timestamp>/ensemble_valid200_summary.{json,txt}
-    modal :  /runs/ensembling_results/<timestamp>/ensemble_valid200_summary.{json,txt}  (fetch after)
+    local :  training_scripts/others/ensembling_results/<timestamp>/ensemble_<SET>_summary.{json,txt}
+    modal :  /runs/ensembling_results/<timestamp>/ensemble_<SET>_summary.{json,txt}  (fetch after)
 
-Run:  python training_scripts/others/ensemble_valid200.py   (honours RUN_ON below)
+Run:  python training_scripts/others/ensample.py   (honours RUN_ON below)
 """
 
 import sys
@@ -29,6 +29,8 @@ from pathlib import Path
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
 SET    = "test500"      # scored split — "valid200" or "test500"
+GPU    = "A100-80GB"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
+                        # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 256        # inference batch size for EVERY member (None -> each run's
                         # own dataloader.val_batch_size). valid200 is 200 imgs, so
                         # any value >=200 is one batch; lower it only to cap VRAM.
@@ -41,6 +43,7 @@ FULL_MODELS = [
     "convnext_tiny",
     "convnext_large_22k_cxr14_pretrain",
     "efficientnetv2_m",
+    "convnext_base_22k_768x640",
 ]
 
 # Per-run checkpoint file under results/checkpoints/ (default "best.pt"). Two-stage
@@ -288,15 +291,29 @@ if _MODAL_OK and modal.is_local():
     _ref_cfg = sc.load_config(PKG_ROOT / FULL_MODELS[0], verbose=False)
     app = modal.App(f"ensemble-{SET}")
     _image = sc.modal_image(python_version=f"{sys.version_info.major}.{sys.version_info.minor}")
-    _data_vol = modal.Volume.from_name(_ref_cfg["modal"]["data_volume"], create_if_missing=True)
     _runs_vol = modal.Volume.from_name(_ref_cfg["modal"]["runs_volume"], create_if_missing=True)
+
+    # Mount EVERY distinct data volume any member uses, each at its own mount point,
+    # so members resolve images at their own remote_data_root. Members can live on
+    # different volumes (e.g. small-res runs -> chexpert-data /data; native-res runs
+    # -> chexpert-native-data /data_native), so one mount is not enough.
+    _all_runs = list(FULL_MODELS) + (list(STAGE2_GROUP.values()) if USE_STAGE2 else [])
+    _volumes = {_ref_cfg["modal"]["runs_mount"]: _runs_vol}
+    for _run in _all_runs:
+        _mc = sc.load_config(PKG_ROOT / _run, verbose=False)["modal"]
+        _mount, _vname = _mc["data_mount"], _mc["data_volume"]
+        if _mount not in _volumes:
+            _volumes[_mount] = modal.Volume.from_name(_vname, create_if_missing=True)
+
+    _resources = sc.modal_resources(_ref_cfg)
+    if GPU:
+        _resources["gpu"] = GPU          # explicit GPU override (see CONFIG at top)
 
     @app.function(
         image=_image,
-        volumes={_ref_cfg["modal"]["data_mount"]: _data_vol,
-                 _ref_cfg["modal"]["runs_mount"]: _runs_vol},
+        volumes=_volumes,
         serialized=True,
-        **sc.modal_resources(_ref_cfg),
+        **_resources,
     )
     def ensemble_remote():
         # Self-contained: import everything INSIDE so nothing from __main__ (which
@@ -309,7 +326,7 @@ if _MODAL_OK and modal.is_local():
             if _p not in _sys.path:
                 _sys.path.insert(0, _p)
         import shared_code as _sc
-        import ensemble_valid200 as _E          # mounted; app not rebuilt (is_local False)
+        import ensample as _E                   # mounted; app not rebuilt (is_local False)
         runs_mount = _P("/runs")
 
         def load_cfg(run):
