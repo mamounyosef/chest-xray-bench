@@ -1,7 +1,8 @@
 ==============================================================================
 Mean AUROC per run  —  set=valid200
-generated: 2026-07-01T14:07:46
+generated: 2026-07-04T17:12:23
 ==============================================================================
+  0.8854   convnext_base_22k_768x640
   0.8808   convnext_base_22k_final_stage1
   0.8799   convnext_base_22k_u_selftrain_consol_only
   0.8792   final_stage2 (mean of 5 per-disease models)
@@ -17,7 +18,9 @@ generated: 2026-07-01T14:07:46
   0.8631   convnext_base_22k_certain_only
   0.8628   convnext_base_22k_cxr14_pretrain
   0.8625   convnext_tiny_22k
+  0.8603   convnext_base_22k_5pct_val
   0.8570   swin_base_22k
+  0.8567   efficientnetv2_m
   0.8566   densenet121
   0.8540   densenet201
   0.8535   convnext_small
@@ -31,4 +34,5 @@ generated: 2026-07-01T14:07:46
   0.8390   resnet50_with_clahe
   0.8381   resnet50_without_clahe
   0.8307   resnet50_u_zeros
+  0.8286   convnext_base_22k_aucm_no_ce
 ==============================================================================

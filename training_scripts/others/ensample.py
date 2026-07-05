@@ -28,7 +28,7 @@ from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
-SET    = "test500"      # scored split — "valid200" or "test500"
+SET    = "valid200"      # scored split — "valid200" or "test500"
 GPU    = "A100-80GB"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 256        # inference batch size for EVERY member (None -> each run's
@@ -37,13 +37,8 @@ BATCH_SIZE = 256        # inference batch size for EVERY member (None -> each ru
 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
-    "convnext_base_22k_final_stage1",
-    "densenet121",
-    "swin_base_22k",
-    "convnext_tiny",
-    "convnext_large_22k_cxr14_pretrain",
-    "efficientnetv2_m",
     "convnext_base_22k_768x640",
+    "convnext_base_22k_final_stage1",
 ]
 
 # Per-run checkpoint file under results/checkpoints/ (default "best.pt"). Two-stage
