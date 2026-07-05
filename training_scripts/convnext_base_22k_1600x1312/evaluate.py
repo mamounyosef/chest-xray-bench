@@ -30,7 +30,7 @@ RUN_ON     = "modal"     # "modal" -> run on Modal GPU ; "local" -> this machine
 CHECKPOINT = "best"      # which checkpoint to score: best | last | <int step> | path
 AMP        = False       # False -> full fp32 for the cleanest final metrics
 OBJECTIVE  = "f1"        # threshold objective if thresholds.json must be (re)calibrated
-BATCH_SIZE = 128         # eval batch size (overrides config's val_batch_size for scoring)
+BATCH_SIZE = 192         # eval batch size (overrides config's val_batch_size for scoring)
 # ===========================================================================
 
 # Windows consoles default to cp1252 and choke on the emoji in the logs; force
