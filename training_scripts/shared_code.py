@@ -382,7 +382,13 @@ def build_train_transforms(cfg: dict):
 def preprocess(rel: str, cfg: dict, use_clahe: bool = False,
                train_transforms=None, clahe=None) -> torch.Tensor:
     """One image: grayscale -> [CLAHE] -> resize_pad -> tensor -> [augment] ->
-    3-channel -> /255 -> ImageNet-normalize. Returns (C, H, W) float32."""
+    then EITHER (image.gpu_normalize, default) return a 1-channel uint8 tensor and
+    defer /255 + 3-channel + ImageNet-normalize to the GPU (see prepare_batch) —
+    4x smaller host->device transfer and /dev/shm footprint — OR (gpu_normalize
+    off) finish on CPU and return the normalized (C,H,W) float32 as before.
+
+    Augmentation stays here on the same float[0,1] tensor either way, so the two
+    paths are numerically equivalent apart from a uint8 round-trip (negligible)."""
     img_cfg = cfg["image"]
     out_w, out_h = img_cfg["width"], img_cfg["height"]
     interp = getattr(cv2, img_cfg["interpolation"])
@@ -401,6 +407,9 @@ def preprocess(rel: str, cfg: dict, use_clahe: bool = False,
     t = torch.from_numpy(img).unsqueeze(0).float().div_(255.0)      # (1,H,W) in [0,1]
     if train_transforms is not None:
         t = train_transforms(t)                                     # augment pre-normalize
+    if img_cfg.get("gpu_normalize", True):
+        # Defer channel-expand + normalize to the GPU: send raw 1-channel uint8.
+        return t.mul_(255.0).round_().clamp_(0, 255).to(torch.uint8)   # (1,H,W) uint8
     ch = img_cfg.get("channels", 3)
     if ch == 3:
         t = t.repeat(3, 1, 1)                                       # grayscale -> 3ch
@@ -408,6 +417,30 @@ def preprocess(rel: str, cfg: dict, use_clahe: bool = False,
     std = torch.tensor(img_cfg["norm_std"][:t.shape[0]]).view(-1, 1, 1)
     t = (t - mean) / std
     return t.float()                                               # (C,H,W) float32
+
+
+def prepare_batch(imgs: torch.Tensor, cfg: dict, device, channels_last: bool) -> torch.Tensor:
+    """Move an image batch to `device` and, when the dataset emitted raw uint8
+    (image.gpu_normalize), finish preprocessing ON THE GPU: uint8[0,255] -> float
+    /255 -> expand to `image.channels` -> ImageNet-normalize. This is where the
+    high-res /dev/shm + transfer savings come from (uint8 is 4x smaller than the
+    float32 the CPU used to ship). When the dataset already returned normalized
+    float32 (gpu_normalize off) this is just .to(device) (+ channels_last), so
+    every call site works unchanged regardless of the flag. Normalization runs in
+    fp32 here, BEFORE any autocast region, so AMP never halves the constants."""
+    imgs = imgs.to(device, non_blocking=True)
+    if imgs.dtype == torch.uint8:                                   # raw -> normalize on GPU
+        img_cfg = cfg["image"]
+        ch = int(img_cfg.get("channels", 3))
+        imgs = imgs.float().div_(255.0)
+        if imgs.shape[1] == 1 and ch > 1:
+            imgs = imgs.repeat(1, ch, 1, 1)                         # grayscale -> ch channels
+        mean = torch.as_tensor(img_cfg["norm_mean"][:ch], device=device).view(1, -1, 1, 1)
+        std = torch.as_tensor(img_cfg["norm_std"][:ch], device=device).view(1, -1, 1, 1)
+        imgs = imgs.sub_(mean).div_(std)
+    if channels_last:
+        imgs = imgs.to(memory_format=torch.channels_last)
+    return imgs
 
 
 class CheXpertDataset(Dataset):
@@ -1323,9 +1356,7 @@ def validate(model, val_loader, loss_fn, cfg, device, amp: bool,
     total_loss, n = 0.0, 0
     ys, ps = [], []
     for imgs, labels in val_loader:
-        imgs = imgs.to(device, non_blocking=True)
-        if channels_last:
-            imgs = imgs.to(memory_format=torch.channels_last)
+        imgs = prepare_batch(imgs, cfg, device, channels_last)   # to GPU + (uint8) normalize
         labels = labels.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=amp):
             logits = model(imgs)
@@ -1493,9 +1524,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         if (ep_micro - 1) % accum == 0:
             optimizer.zero_grad(set_to_none=True)
             win_imgs, win_t0 = 0, time.time()
-        imgs = imgs.to(device, non_blocking=True)
-        if channels_last:
-            imgs = imgs.to(memory_format=torch.channels_last)
+        imgs = prepare_batch(imgs, cfg, device, channels_last)   # to GPU + (uint8) normalize
         labels = labels.to(device, non_blocking=True)
 
         with torch.autocast(device_type=device.type, enabled=amp):
@@ -2629,9 +2658,7 @@ def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
     total_loss, n = 0.0, 0
     ys, ps = [], []
     for imgs, labels in loader:
-        imgs = imgs.to(device, non_blocking=True)
-        if channels_last:
-            imgs = imgs.to(memory_format=torch.channels_last)
+        imgs = prepare_batch(imgs, cfg, device, channels_last)   # to GPU + (uint8) normalize
         labels = labels.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=amp):
             logits = model(imgs)

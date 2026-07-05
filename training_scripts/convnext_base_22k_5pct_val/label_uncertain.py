@@ -135,9 +135,7 @@ def soft_label(cfg, model, experiment_dir, out_csv, *,
                         num_workers=num_workers, pin_memory=(device.type == "cuda"))
     probs = []
     for imgs, _ in loader:
-        imgs = imgs.to(device, non_blocking=True)
-        if channels_last:
-            imgs = imgs.to(memory_format=torch.channels_last)
+        imgs = sc.prepare_batch(imgs, cfg, device, channels_last)   # to GPU + (uint8) normalize
         with torch.autocast(device_type=device.type, enabled=amp):
             logits = model(imgs)
         probs.append(sc.logits_to_probs(logits, layout).float().cpu().numpy())

@@ -26,7 +26,7 @@ model:
 #   <path>   : explicit checkpoint file path
 # Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
 # ----------------------------------------------------------------------------
-resume: 7500
+resume: 8100
 
 # ----------------------------------------------------------------------------
 # Label policy  —  MIXED per-task uncertainty handling (this arm's whole point).
@@ -91,18 +91,19 @@ clahe:
 # validation never drops samples.)
 # ----------------------------------------------------------------------------
 dataloader:
-  # --- train loader (prefetch 2 to cap host RAM at this resolution) ---
+  # --- train loader (many workers to keep the fast GPU fed at native res; prefetch
+  #     kept at 2 — buffer depth beyond 2 adds ~no throughput, only /dev/shm) ---
   batch_size:         32        # x grad_accum_steps 2 = effective batch 64 (see training)
-  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  num_workers:        18        # decode parallelism = the real GPU-feed lever here
   pin_memory:         true
-  prefetch_factor:    4
+  prefetch_factor:    2
   persistent_workers: true
   drop_last:          false
   # --- validation loader (no_grad forward fits a big GPU batch, but each collated
   #     batch travels through /dev/shm worker->main; at 1600x1312 one image is ~25MB
-  #     so batch*workers*prefetch must stay well under shared memory) ---
+  #     so batch*workers*prefetch must stay well under shared memory / RAM) ---
   val_batch_size:         80
-  val_num_workers:        6
+  val_num_workers:        18
   val_pin_memory:         true
   val_prefetch_factor:    2
   val_persistent_workers: true
@@ -211,8 +212,8 @@ paths:
 # ----------------------------------------------------------------------------
 modal:
   gpu: "B200"               # 141GB for batch 64 at this resolution
-  cpu_cores: 12             # match the 16 dataloader workers for native decode
-  memory_gb: 155
+  cpu_cores: 16             # match the 16 dataloader workers for native decode
+  memory_gb: 120            # Modal backs /dev/shm with RAM; headroom for 16 workers x prefetch 2
   timeout_seconds: 86400      # 24 hours
   data_volume: "chexpert-native-data"   # NATIVE full-res tree (own volume)
   runs_volume: "chexpert-runs"

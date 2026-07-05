@@ -39,6 +39,12 @@ image:
   channels: 3
   norm_mean: [0.485, 0.456, 0.406]
   norm_std:  [0.229, 0.224, 0.225]
+  # gpu_normalize: dataset ships raw 1-channel uint8 and the GPU does /255 +
+  # channel-expand + ImageNet-normalize (see prepare_batch). 4x smaller host->GPU
+  # transfer + /dev/shm than shipping float32 — the fix for high-res OOM/shm. Augmentation
+  # still runs in the worker, so results match the CPU path bar a uint8 round (negligible).
+  # Set false to normalize on CPU (ship float32) — kept only as an escape hatch.
+  gpu_normalize: true
 
 # ----------------------------------------------------------------------------
 # Augmentation  —  TRAIN SPLIT ONLY. Each aug rolls its OWN independent p.
@@ -107,5 +113,5 @@ output:
   console_capture_dir: "train_config"
   console_log_every: 20
   checkpoint_every_steps: 300
-  keep_last_n: 5
+  keep_last_n: 8
   # keep_last_n lives in each experiment's config.yaml (output: keep_last_n)
