@@ -1462,49 +1462,78 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
     the total step budget aligned."""
     model.train()
     clip = grad_clip if grad_clip else math.inf      # inf -> measure norm, no clip
+    # Gradient accumulation: run `accum` micro-batches, summing their (1/accum-
+    # scaled) grads, then do ONE optimizer step. Effective batch = batch_size*accum.
+    # A "step" — global_step, LR-schedule tick, eval / checkpoint cadence, ETA,
+    # per-epoch step count — is an OPTIMIZER step (one effective batch), NOT a
+    # micro-batch. So halving batch_size + accum 2 keeps the step counts and total
+    # budget identical to a full batch-64 run; only the loader iterates 2x as often.
+    accum = max(1, int((cfg or {}).get("training", {}).get("grad_accum_steps", 1)))
+    opt_steps_per_epoch = math.ceil(len(loader) / accum)   # optimizer steps this epoch
+    if accum > 1:
+        print(f"  gradient accumulation: {accum} micro-batches/optimizer-step "
+              f"(effective batch = {accum}x the loader batch_size); "
+              f"{len(loader)} micro-batches -> {opt_steps_per_epoch} steps/epoch")
+    grad_norm = torch.tensor(0.0)                    # last measured norm (for logging)
     stop = False
     n_batches = len(loader)
-    # The ResumableSampler has already dropped the first `skip_batches` batches at
-    # the index level (workers never loaded them), so enumerate() starts directly
-    # at the resume point. We only OFFSET the displayed per-epoch batch number so
-    # the logs still read as batch (skip_batches+1) .. n_batches.
+    # `skip_batches` is in MICRO-batches (resume_skip optimizer steps * accum), so it
+    # always lands on an accumulation-window boundary and the sampler fast-forward
+    # stays aligned. Displayed per-epoch step numbers are in OPTIMIZER steps.
     if skip_batches > 0:
         print(f"  ⏩ resuming mid-epoch: sampler fast-forwarded past the first "
-              f"{skip_batches}/{n_batches} already-trained batches (no reload) — "
-              f"training continues at batch {skip_batches + 1}.")
+              f"{skip_batches}/{n_batches} already-trained micro-batches "
+              f"({skip_batches // accum}/{opt_steps_per_epoch} optimizer steps) — "
+              f"training continues at micro-batch {skip_batches + 1}.")
 
+    win_imgs, win_t0 = 0, time.time()    # images + wall-clock of the current window
     for i, (imgs, labels) in enumerate(loader, start=1):
-        ep_step = i + skip_batches       # 1-indexed batch number within the FULL epoch
-        t0 = time.time()
+        ep_micro = i + skip_batches      # 1-indexed MICRO-batch number within the epoch
+        # Start of a new accumulation window -> clear grads + start the window timer.
+        if (ep_micro - 1) % accum == 0:
+            optimizer.zero_grad(set_to_none=True)
+            win_imgs, win_t0 = 0, time.time()
         imgs = imgs.to(device, non_blocking=True)
         if channels_last:
             imgs = imgs.to(memory_format=torch.channels_last)
         labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp):
             logits = model(imgs)
             loss = loss_fn(logits, labels)
 
-        # NaN/Inf guard: skip this batch's update instead of crashing the run.
+        # NaN/Inf guard: skip this micro-batch's contribution instead of crashing.
+        # (Grads already accumulated in this window are discarded at the next
+        # window's zero_grad, so no corruption.)
         if not torch.isfinite(loss):
             print(f"  ⚠️  non-finite loss ({loss.item()}) at step ~{global_step + 1}; "
-                  f"skipping this batch")
-            optimizer.zero_grad(set_to_none=True)
+                  f"skipping this micro-batch")
             continue
 
-        scaler.scale(loss).backward()
+        # 1/accum keeps the summed grad an AVERAGE over the effective batch.
+        scaler.scale(loss / accum).backward()
+        win_imgs += imgs.size(0)
+
+        # Optimizer step only on an accumulation boundary (or the epoch's last batch,
+        # so a trailing partial window still updates). Everything below — the step
+        # counter, LR tick, logging, eval, checkpoints — runs ONCE PER OPTIMIZER STEP.
+        is_boundary = (ep_micro % accum == 0) or (i == n_batches)
+        if not is_boundary:
+            continue
+
         scaler.unscale_(optimizer)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
         scaler.step(optimizer)
         scaler.update()
-        if scheduler is not None:        # cosine/warmup: step once per optimizer step
+        if scheduler is not None:        # cosine/warmup: one tick per optimizer step
             scheduler.step()
 
         global_step += 1
-        dt = time.time() - t0
+        ep_step = math.ceil(ep_micro / accum)    # 1-indexed OPTIMIZER step within epoch
+        is_first = (ep_step == 1)
+        dt = time.time() - win_t0                # wall-clock for the whole effective batch
         lr = optimizer.param_groups[0]["lr"]
-        imgs_per_s = imgs.size(0) / dt if dt > 0 else 0.0
+        imgs_per_s = win_imgs / dt if dt > 0 else 0.0
         el = elapsed_fn()
         eta = eta_fn(global_step)
         train_row = {"step": global_step, "epoch": epoch + 1}   # 1-indexed for humans
@@ -1518,7 +1547,7 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             "imgs_per_s": round(imgs_per_s, 1), "sec_per_step": round(dt, 4),
         })
         _safe("train_log", train_logger.log, train_row)
-        if global_step % console_log_every == 0 or i == 1:
+        if global_step % console_log_every == 0 or is_first:
             cur_loss = loss.item()
             # delta vs the previous CONSOLE-printed train loss (persists across
             # epochs via a function attribute); empty on the very first print.
@@ -1529,13 +1558,13 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             # lines (it got long) with a thin rule between consecutive step prints.
             phase_tag = f"  (Phase: {phase})" if phase else ""
             print("─" * 70)                         # thin continuous separator
-            print(f"  Epoch {epoch + 1}/{n_epochs}{phase_tag}  epoch_step: {ep_step}/{n_batches}  "
+            print(f"  Epoch {epoch + 1}/{n_epochs}{phase_tag}  epoch_step: {ep_step}/{opt_steps_per_epoch}  "
                   f"global_step: {global_step}/{total_steps}")
             print(f"     loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
                   f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}"
                   f"{_gpu_mem_report(device)}")
 
-        if log_fn is not None and (global_step % wandb_log_every == 0 or i == 1):
+        if log_fn is not None and (global_step % wandb_log_every == 0 or is_first):
             _safe("wandb", log_fn, {
                 f"{wandb_prefix}train/loss": loss.item(), f"{wandb_prefix}train/lr": lr,
                 f"{wandb_prefix}train/grad_norm": float(grad_norm),
@@ -1662,12 +1691,14 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                              f"training.epochs ({total_epochs})")
         loader_A, loader_B, val_loader, _n_unc, _n_cer = make_curriculum_loaders(cfg)
         epoch_loaders = [loader_A] * phase_a_epochs + [loader_B] * phase_b_epochs
-        _epoch_steps = [len(l) for l in epoch_loaders]
+        # step counts are in OPTIMIZER steps (micro-batches / grad_accum_steps).
+        _accum = max(1, int(cfg["training"].get("grad_accum_steps", 1)))
+        _epoch_steps = [math.ceil(len(l) / _accum) for l in epoch_loaders]
         cum_starts = [0]
         for _c in _epoch_steps:
             cum_starts.append(cum_starts[-1] + _c)
         curr_total_steps = cum_starts[-1]
-        warmup_ref_spe = max(1, len(loader_A))      # warmup is measured in Phase-A steps
+        warmup_ref_spe = max(1, math.ceil(len(loader_A) / _accum))   # warmup in Phase-A steps
         train_loader = loader_A                     # placeholder for incidental len()/refs
         print(f"[curriculum] Phase A = {phase_a_epochs} epoch(s) on {_n_unc} uncertain rows "
               f"(no early-stop); Phase B = {phase_b_epochs} epoch(s) on {_n_cer} certain rows "
@@ -1729,7 +1760,11 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=warmup_ref_spe,
                                                 total_steps_override=curr_total_steps)
     else:
-        scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=len(train_loader))
+        # steps_per_epoch is in OPTIMIZER steps so the cosine/warmup span matches the
+        # effective-batch step budget when gradient accumulation is on.
+        _accum = max(1, int(cfg["training"].get("grad_accum_steps", 1)))
+        scheduler, sched_mode = build_scheduler(
+            optimizer, cfg, steps_per_epoch=math.ceil(len(train_loader) / _accum))
     amp = bool(cfg["training"]["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=amp)
     _opt_name = str(cfg["training"]["optimizer"].get("name", "adamw")).upper()
@@ -1752,8 +1787,11 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     summary_path = results_dir / out.get("summary_json", "training_summary.json")
 
     # --- resumable state ---
+    # global_step / steps_per_epoch are in OPTIMIZER steps (effective batches); with
+    # gradient accumulation one optimizer step = grad_accum_steps micro-batches.
+    grad_accum = max(1, int(cfg["training"].get("grad_accum_steps", 1)))
     start_epoch, global_step, resume_skip = 0, 0, 0
-    steps_per_epoch = len(train_loader)
+    steps_per_epoch = math.ceil(len(train_loader) / grad_accum)
     prior_elapsed = 0.0          # wall-clock seconds accumulated before this process
     track = {"best": (-math.inf if mode == "max" else math.inf),
              "no_improve": 0, "last_monitor": 0.0,
@@ -1791,7 +1829,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     console_log_every = int(out["console_log_every"])
     wandb_log_every = int(cfg.get("wandb", {}).get("log_every", 50))   # train-metric cadence
     ckpt_every = int(out.get("checkpoint_every_steps", 0) or 0)         # periodic rolling ckpt
-    total_steps = curr_total_steps if use_curriculum else epochs * len(train_loader)  # ETA denom
+    total_steps = curr_total_steps if use_curriculum else epochs * steps_per_epoch  # ETA denom (optimizer steps)
     print(f"[checkpoint] periodic rolling checkpoint every "
           f"{ckpt_every if ckpt_every > 0 else 'OFF'} steps; best.pt at validation")
 
@@ -1975,8 +2013,9 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         print(f"📚 EPOCH {epoch + 1}/{epochs}{_stg}{_phase_tag}")
         print("=" * 70)
         # only the first epoch after a mid-epoch resume fast-forwards already-done
-        # batches; every later epoch starts clean.
-        skip = resume_skip if epoch == start_epoch else 0
+        # batches; every later epoch starts clean. resume_skip is in OPTIMIZER steps,
+        # so the sampler/train loop (which count MICRO-batches) skip resume_skip*accum.
+        skip = (resume_skip * grad_accum) if epoch == start_epoch else 0
         # tell the sampler which epoch's permutation to draw and how many leading
         # samples to drop, so the workers never load already-trained batches.
         _samp = getattr(cur_loader, "sampler", None)
