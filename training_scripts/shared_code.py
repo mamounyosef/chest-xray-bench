@@ -2652,8 +2652,18 @@ def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
     multiclass tasks (all-False for a binary arm)."""
     layout = task_layout(cfg)
     ds = CheXpertDataset(df, cfg, split="val")
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, drop_last=False,
-                        num_workers=num_workers, pin_memory=(device.type == "cuda"))
+    # Match the config's validation loader settings (val_* keys). prefetch_factor /
+    # persistent_workers are only valid when num_workers > 0, so a 0-worker eval
+    # (the default on Windows/local) is unaffected.
+    dl = cfg["dataloader"]
+    pin = bool(dl.get("val_pin_memory", dl.get("pin_memory", True))) and device.type == "cuda"
+    _kwargs = dict(batch_size=batch_size, shuffle=False, drop_last=False,
+                   num_workers=num_workers, pin_memory=pin)
+    if num_workers > 0:
+        _kwargs["prefetch_factor"] = int(dl.get("val_prefetch_factor",
+                                               dl.get("prefetch_factor", 2)))
+        _kwargs["persistent_workers"] = bool(dl.get("val_persistent_workers", False))
+    loader = DataLoader(ds, **_kwargs)
     model.eval()
     total_loss, n = 0.0, 0
     ys, ps = [], []

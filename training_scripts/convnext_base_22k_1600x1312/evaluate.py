@@ -30,6 +30,7 @@ RUN_ON     = "modal"     # "modal" -> run on Modal GPU ; "local" -> this machine
 CHECKPOINT = "best"      # which checkpoint to score: best | last | <int step> | path
 AMP        = False       # False -> full fp32 for the cleanest final metrics
 OBJECTIVE  = "f1"        # threshold objective if thresholds.json must be (re)calibrated
+BATCH_SIZE = 128         # eval batch size (overrides config's val_batch_size for scoring)
 # ===========================================================================
 
 # Windows consoles default to cp1252 and choke on the emoji in the logs; force
@@ -77,6 +78,8 @@ def run_local(eval_sets=("valid200", "test500")):
     model = build_model(cfg)
     sc.evaluate_official(cfg, model, EXP_DIR,
                          checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
+                         batch_size=BATCH_SIZE,
+                         num_workers=int(cfg["dataloader"]["val_num_workers"]),
                          eval_sets=eval_sets)
 
 
@@ -124,6 +127,7 @@ if _MODAL_OK:
         try:
             _sc.evaluate_official(rcfg, model, out_dir,
                                   checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
+                                  batch_size=BATCH_SIZE,
                                   num_workers=int(rcfg["dataloader"]["val_num_workers"]),
                                   eval_sets=eval_sets)
         finally:
