@@ -57,16 +57,16 @@ clahe:
 dataloader:
   # --- train loader ---
   batch_size:         64
-  num_workers:        16        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  num_workers:        24       # 8 physical cores x2 vCPU on Modal -> 16 workers
   pin_memory:         true
-  prefetch_factor:    4
+  prefetch_factor:    3
   persistent_workers: true
   drop_last:          false
   # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
   val_batch_size:         256
-  val_num_workers:        10
+  val_num_workers:        18
   val_pin_memory:         true
-  val_prefetch_factor:    4
+  val_prefetch_factor:    3
   val_persistent_workers: true
 
 # ----------------------------------------------------------------------------
@@ -109,7 +109,7 @@ training:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 10              # counted in VALIDATIONS, not epochs
+    patience: 6              # counted in VALIDATIONS, not epochs
 
 # ----------------------------------------------------------------------------
 # Evaluation
@@ -146,7 +146,7 @@ evaluation:
 # ----------------------------------------------------------------------------
 modal:
   gpu: "A100"               # A100-40GB: comfortable for ConvNeXt-B (~88M) @384x320, batch 64
-  cpu_cores: 8
+  cpu_cores: 16
   memory_gb: 50
   timeout_seconds: 28800      # 8 hours
   data_volume: "chexpert-data"

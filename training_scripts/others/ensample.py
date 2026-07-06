@@ -155,18 +155,26 @@ def _fetch_results_from_modal(runs_volume: str, remote_sub: str, local_base: Pat
     """Pull the run's freshly written <timestamp> folder off the runs volume down to
     local `others/ensembling_results/`, so a Modal ensemble ends up on disk exactly
     like a local one. `remote_sub` is the volume-relative POSIX path the remote
-    function returned (e.g. 'ensembling_results/2026-07-06_14-30-05'); the local copy
-    lands at local_base/<remote_sub>. Uses the same `modal volume get` you'd run by
-    hand, invoked as `python -m modal` so it works regardless of PATH."""
+    function returned (e.g. 'ensembling_results/2026-07-06_14-30-05').
+
+    IMPORTANT: `modal volume get` maps each downloaded file to
+    (local_destination / entry_path.relative_to(remote_path.parent)) ONLY when
+    local_destination already exists AS A DIRECTORY; otherwise it writes EVERY file
+    to local_destination itself (last write wins -> a single file, not a folder). So
+    we pass the PARENT dir (which we pre-create) as the destination and let modal
+    recreate the <ts>/ subfolder + its files under it. Invoked via `python -m modal`
+    so it works regardless of PATH."""
     import subprocess
-    remote_posix = remote_sub.replace("\\", "/")          # volume paths are POSIX
-    local_dest = local_base / remote_posix                # others/ensembling_results/<ts>
-    local_dest.parent.mkdir(parents=True, exist_ok=True)  # ensembling_results/ must exist
+    from pathlib import PurePosixPath
+    remote_posix = remote_sub.replace("\\", "/")               # e.g. ensembling_results/<ts>
+    dest_parent = local_base / PurePosixPath(remote_posix).parent   # others/ensembling_results
+    dest_parent.mkdir(parents=True, exist_ok=True)             # MUST exist as a dir (see above)
+    final_dir = dest_parent / PurePosixPath(remote_posix).name      # others/ensembling_results/<ts>
     cmd = [sys.executable, "-m", "modal", "volume", "get",
-           runs_volume, remote_posix, str(local_dest)]
-    print(f"[fetch] modal volume get {runs_volume} {remote_posix} -> {local_dest}")
+           runs_volume, remote_posix, str(dest_parent)]
+    print(f"[fetch] modal volume get {runs_volume} {remote_posix} -> {dest_parent}")
     subprocess.run(cmd, check=True)
-    print(f"[fetch] downloaded ensemble results -> {local_dest}")
+    print(f"[fetch] downloaded ensemble results -> {final_dir}")
 
 
 def _predict(cfg: dict, ckpt_path: Path, df, device) -> np.ndarray:

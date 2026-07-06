@@ -1,0 +1,23 @@
+{
+  "experiment": "coatnet_1_12k",
+  "status": "running",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8025880475078948,
+  "best_step": 13200,
+  "best_epoch": 5,
+  "best_metrics": {
+    "mean_auroc": 0.8025880475078948,
+    "mean_auprc": 0.6022837568884395,
+    "mean_f1": 0.48499161837619187,
+    "mean_precision": 0.6005220488207945,
+    "mean_recall": 0.4592761510486074,
+    "mean_specificity": 0.8962329770196664,
+    "val_loss": 0.44140721296764796
+  },
+  "last_step": 16200,
+  "total_steps": 26870,
+  "elapsed_sec": 6853.07,
+  "elapsed_human": "1h 54m",
+  "updated": "2026-07-06T19:54:56"
+}
