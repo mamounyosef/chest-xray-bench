@@ -18,7 +18,11 @@ Writes (overwritten each run):
 Each run writes into its OWN timestamped subfolder (so different ensembles don't
 overwrite each other):
     local :  training_scripts/others/ensembling_results/<timestamp>/ensemble_<SET>_summary.{json,txt}
-    modal :  /runs/ensembling_results/<timestamp>/ensemble_<SET>_summary.{json,txt}  (fetch after)
+    modal :  /runs/ensembling_results/<timestamp>/ensemble_<SET>_summary.{json,txt}
+On a Modal run the freshly written <timestamp> folder is AUTOMATICALLY pulled back
+down to training_scripts/others/ensembling_results/<timestamp>/ (via `modal volume
+get`) as soon as the remote run finishes, so local + remote stay in sync with no
+manual fetch.
 
 Run:  python training_scripts/others/ensample.py   (honours RUN_ON below)
 """
@@ -29,14 +33,15 @@ from pathlib import Path
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
 SET    = "valid200"      # scored split — "valid200" or "test500"
-GPU    = "A100-80GB"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
+GPU    = "B200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
-BATCH_SIZE = 256        # inference batch size for EVERY member (None -> each run's
+BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each run's
                         # own dataloader.val_batch_size). valid200 is 200 imgs, so
                         # any value >=200 is one batch; lower it only to cap VRAM.
 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
+    "convnext_base_22k_1600x1312",
     "convnext_base_22k_768x640",
     "convnext_base_22k_final_stage1",
 ]
@@ -47,6 +52,17 @@ CKPT_SUBPATH = {
     "convnext_large_22k_cxr14_pretrain": "finetune_chexpert/best.pt",
     "convnext_base_22k_cxr14_pretrain_lowlr_all": "finetune_chexpert/best.pt",
 }
+
+# Extra members from SPECIFIC checkpoints — each entry is its own separate 5-class
+# member, ADDED on top of FULL_MODELS. Lets you ensemble several checkpoints of the
+# SAME run as independent voters (e.g. best.pt via FULL_MODELS + step 7500 here).
+#   Each entry: {"run": <run name>, "checkpoint": <"best" | "last" | <int step> | filename>}
+#   resolved in that run's checkpoints dir like `resume` (7500 -> ckpt_step7500.pt;
+#   two-stage subfolder from CKPT_SUBPATH honored). Labeled "<run> @ step<N>" so it
+#   never collides with the plain "<run>" best.pt member. Empty list = off.
+CHECKPOINT_MEMBERS = [
+    {"run": "convnext_base_22k_1600x1312", "checkpoint": 7500},
+]
 
 # Per-class thresholds for the F1/precision/recall/specificity of the ENSEMBLE come
 # from this run's results/thresholds.json (AUROC/AUPRC stay threshold-free). Missing
@@ -61,7 +77,7 @@ RUN_TAG = ""
 
 # The five per-disease Stage-2 models, as ONE composite member (one entry).
 # Set USE_STAGE2 = False to drop it from the ensemble.
-USE_STAGE2 = True
+USE_STAGE2 = False
 STAGE2_GROUP = {
     "Atelectasis":      "convnext_base_22k_final_stage2_atelectasis",
     "Cardiomegaly":     "convnext_base_22k_final_stage2_cardiomegaly",
@@ -134,8 +150,26 @@ def _dummy_loss(logits, targets):
     return logits.sum() * 0.0        # we only need probabilities, not the loss
 
 
+def _fetch_results_from_modal(runs_volume: str, remote_sub: str, local_base: Path):
+    """Pull the run's freshly written <timestamp> folder off the runs volume down to
+    local `others/ensembling_results/`, so a Modal ensemble ends up on disk exactly
+    like a local one. `remote_sub` is the volume-relative POSIX path the remote
+    function returned (e.g. 'ensembling_results/2026-07-06_14-30-05'); the local copy
+    lands at local_base/<remote_sub>. Uses the same `modal volume get` you'd run by
+    hand, invoked as `python -m modal` so it works regardless of PATH."""
+    import subprocess
+    remote_posix = remote_sub.replace("\\", "/")          # volume paths are POSIX
+    local_dest = local_base / remote_posix                # others/ensembling_results/<ts>
+    local_dest.parent.mkdir(parents=True, exist_ok=True)  # ensembling_results/ must exist
+    cmd = [sys.executable, "-m", "modal", "volume", "get",
+           runs_volume, remote_posix, str(local_dest)]
+    print(f"[fetch] modal volume get {runs_volume} {remote_posix} -> {local_dest}")
+    subprocess.run(cmd, check=True)
+    print(f"[fetch] downloaded ensemble results -> {local_dest}")
+
+
 def _predict(cfg: dict, ckpt_path: Path, df, device) -> np.ndarray:
-    """Probabilities (N, len(cfg tasks)) for one run's best.pt over `df`."""
+    """Probabilities (N, len(cfg tasks)) for one checkpoint (ckpt_path) over `df`."""
     model = build_model_generic(cfg).to(device).eval()
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     sc._unwrap(model).load_state_dict(ck["model"])
@@ -150,11 +184,20 @@ def _predict(cfg: dict, ckpt_path: Path, df, device) -> np.ndarray:
     return y_prob
 
 
+def _ckpt_member_label(run: str, checkpoint) -> str:
+    """Distinct member label for a specific checkpoint (never collides with the plain
+    '<run>' best.pt member): '<run> @ step7500' for an int, '<run> @ <spec>' else."""
+    if isinstance(checkpoint, int) or (isinstance(checkpoint, str) and checkpoint.isdigit()):
+        return f"{run} @ step{int(checkpoint)}"
+    return f"{run} @ {checkpoint}"
+
+
 def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
     """Core routine. `load_cfg(run)` -> that run's cfg (data paths already correct
-    for this environment); `ckpt_path_of(run)` -> its best.pt path; `thr_json` ->
-    a thresholds.json whose per-class thresholds are used for F1/precision/recall/
-    specificity (AUROC/AUPRC are threshold-free)."""
+    for this environment); `ckpt_path_of(run, checkpoint=None)` -> a checkpoint path
+    (None -> that run's best.pt/CKPT_SUBPATH; else a specific best|last|<step>|file);
+    `thr_json` -> a thresholds.json whose per-class thresholds are used for F1/
+    precision/recall/specificity (AUROC/AUPRC are threshold-free)."""
     import json, pandas as pd
     from datetime import datetime
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -191,6 +234,14 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
                 df, device, _dummy_loss, amp=False, channels_last=False,
                 batch_size=8, num_workers=0)
             y_true = yt
+
+    # --- extra members from specific checkpoints (each its own 5-class voter) ---
+    for spec in CHECKPOINT_MEMBERS:
+        run, ckpt = spec["run"], spec["checkpoint"]
+        cfg = load_cfg(run)
+        label = _ckpt_member_label(run, ckpt)
+        print(f"[member] {label} ...")
+        members[label] = _predict(cfg, ckpt_path_of(run, ckpt), df, device)
 
     # --- Stage-2 composite (one member, per-class dedicated model) ---
     if USE_STAGE2:
@@ -260,12 +311,16 @@ def run_local():
     def load_cfg(run):
         return sc.load_config(PKG_ROOT / run, verbose=False)
 
-    def ckpt_path_of(run):
-        p = PKG_ROOT / run / "results" / "checkpoints" / CKPT_SUBPATH.get(run, "best.pt")
-        if not p.exists():
-            raise FileNotFoundError(f"missing {p} — fetch this run's best.pt first "
-                                    f"(or use RUN_ON='modal')")
-        return p
+    def ckpt_path_of(run, checkpoint=None):
+        base = PKG_ROOT / run / "results" / "checkpoints"
+        sub = CKPT_SUBPATH.get(run, "best.pt")            # file, maybe in a stage subfolder
+        if checkpoint is None:                            # default member = CKPT_SUBPATH file
+            p = base / sub
+            if not p.exists():
+                raise FileNotFoundError(f"missing {p} — fetch this run's best.pt first "
+                                        f"(or use RUN_ON='modal')")
+            return p
+        return sc._resolve_resume(checkpoint, base / Path(sub).parent)   # honor stage subfolder
 
     thr_json = PKG_ROOT / THRESHOLDS_FROM / "results" / "thresholds.json"
     out_dir = _out_subdir(Path(__file__).resolve().parent)   # others/ensembling_results/<stamp>
@@ -292,7 +347,9 @@ if _MODAL_OK and modal.is_local():
     # so members resolve images at their own remote_data_root. Members can live on
     # different volumes (e.g. small-res runs -> chexpert-data /data; native-res runs
     # -> chexpert-native-data /data_native), so one mount is not enough.
-    _all_runs = list(FULL_MODELS) + (list(STAGE2_GROUP.values()) if USE_STAGE2 else [])
+    _all_runs = (list(FULL_MODELS)
+                 + [m["run"] for m in CHECKPOINT_MEMBERS]
+                 + (list(STAGE2_GROUP.values()) if USE_STAGE2 else []))
     _volumes = {_ref_cfg["modal"]["runs_mount"]: _runs_vol}
     for _run in _all_runs:
         _mc = sc.load_config(PKG_ROOT / _run, verbose=False)["modal"]
@@ -327,14 +384,21 @@ if _MODAL_OK and modal.is_local():
         def load_cfg(run):
             return _sc.remote_cfg(_sc.load_config(_P("/root/training_scripts") / run, verbose=False))
 
-        def ckpt_path_of(run):
-            return runs_mount / run / "results" / "checkpoints" / _E.CKPT_SUBPATH.get(run, "best.pt")
+        def ckpt_path_of(run, checkpoint=None):
+            base = runs_mount / run / "results" / "checkpoints"
+            sub = _E.CKPT_SUBPATH.get(run, "best.pt")
+            if checkpoint is None:
+                return base / sub
+            return _sc._resolve_resume(checkpoint, base / _P(sub).parent)   # honor stage subfolder
 
         thr_json = runs_mount / _E.THRESHOLDS_FROM / "results" / "thresholds.json"
+        out_dir = _E._out_subdir(runs_mount)         # /runs/ensembling_results/<timestamp>
         try:
-            _E.run_ensemble(load_cfg, ckpt_path_of, _E._out_subdir(runs_mount), thr_json)
+            _E.run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_json)
         finally:
-            _runs_vol.commit()
+            _runs_vol.commit()                        # persist before the local fetch reads it
+        # hand the volume-relative POSIX subpath back so the launcher can download it
+        return out_dir.relative_to(runs_mount).as_posix()
 
 
 if __name__ == "__main__":
@@ -343,7 +407,11 @@ if __name__ == "__main__":
             raise SystemExit("RUN_ON='modal' but modal isn't installed; set RUN_ON='local'.")
         with modal.enable_output():
             with app.run():
-                ensemble_remote.remote()
+                remote_sub = ensemble_remote.remote()   # volume-relative POSIX subpath
+        # remote run + volume commit are done; pull the results folder down locally.
+        if remote_sub:
+            _fetch_results_from_modal(_ref_cfg["modal"]["runs_volume"], remote_sub,
+                                      Path(__file__).resolve().parent)
     elif RUN_ON == "local":
         run_local()
     else:

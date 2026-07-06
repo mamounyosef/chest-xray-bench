@@ -13,7 +13,19 @@ the SAME target merges them into one tree:  /data_native/CheXpert-v1.0/{train,va
 (-> use remote_data_root=/data_native/CheXpert-v1.0 in a training config).
 
 Extraction uses bsdtar (libarchive; fast, zip64/>4GB safe), unar as a fallback.
-It commits the volume after EACH zip so progress survives a restart.
+
+The four zips write DISJOINT paths (batch 1 -> valid/ + CSVs; batches 2-4 -> three
+disjoint parts of train/), so they are extracted IN PARALLEL — one container per
+zip, fanned out with .map. Wall time drops from the SUM of all zips (~438 GiB) to
+roughly the LARGEST single zip (~185 GiB). Each container extracts its one zip,
+commits (progress survives a restart), then optionally deletes that zip.
+
+Space notes (relevant because they run concurrently):
+  * Modal Volume auto-grows — no manual pre-allocation. During a keep-zips run it
+    holds the zips (~438 GiB) AND the extracted tree (~438 GiB) at once (~875 GiB
+    peak). --delete-zips drops each zip right after it extracts, lowering the peak.
+  * ephemeral_disk is PER container (not shared): each of the 4 parallel containers
+    gets its own scratch, sized to cover the largest single zip with headroom.
 
 Run (extract only, keep the zips):
     modal run modal_extract_native.py
@@ -43,69 +55,80 @@ def _human(n: float) -> str:
         n /= 1024
 
 
+@app.function(image=image, volumes={MOUNT: vol})
+def list_zips():
+    """Enumerate the .zip archives on the volume (skip azcopy .azDownload-* partials)
+    so the local entrypoint can fan out one container per zip."""
+    import os
+    vol.reload()
+    src = f"{MOUNT}/{SRC_SUBDIR}"
+    if not os.path.isdir(src):
+        print(f"[extract] ⚠️ '{src}' not found. {MOUNT} contains: {sorted(os.listdir(MOUNT))}")
+        return []
+    zips = sorted(f for f in os.listdir(src)
+                  if f.lower().endswith(".zip") and not f.startswith(".azDownload-"))
+    if not zips:
+        print(f"[extract] no .zip files under {src}. Contents: {sorted(os.listdir(src))}")
+    return zips
+
+
 @app.function(
     image=image,
     volumes={MOUNT: vol},
     timeout=12 * 3600,
-    ephemeral_disk=1024 * 1024,   # 1 TiB scratch (bsdtar buffering headroom)
+    cpu=2,                        # bsdtar is single-threaded per archive; 2 is plenty
+    ephemeral_disk=512 * 1024,    # 512 GiB = Modal's per-container minimum (covers the 185 GiB zip)
 )
-def extract_all(delete_zips: bool):
+def extract_one(name: str, delete_zips: bool):
+    """Extract ONE zip straight into the volume and commit. Runs in its own container
+    (one per zip via .map), so the 4 zips extract concurrently. Disjoint output paths
+    => no cross-container conflict on the shared volume."""
     import os
     import subprocess
     import time
 
     vol.reload()
-    src = f"{MOUNT}/{SRC_SUBDIR}"
-    if not os.path.isdir(src):
-        print(f"[extract] ⚠️ '{src}' not found. {MOUNT} contains: {sorted(os.listdir(MOUNT))}")
-        return
+    zpath = f"{MOUNT}/{SRC_SUBDIR}/{name}"
+    zsize = os.path.getsize(zpath)
+    print(f"[extract] START {name}  ({_human(zsize)})  -> {MOUNT}/{EXPECTED_ROOT}")
+    t0 = time.time()
+    # bsdtar first, then unar. subprocess list args -> spaces in names are safe.
+    attempts = [
+        ["bsdtar", "-x", "-f", zpath, "-C", MOUNT],
+        ["unar", "-quiet", "-force-overwrite", "-output-directory", MOUNT, zpath],
+    ]
+    ok = None
+    for cmd in attempts:
+        print(f"[extract]   {name}: trying {cmd[0]} ...")
+        rc = subprocess.run(cmd).returncode
+        if rc == 0:
+            ok = cmd[0]
+            break
+        print(f"[extract]   {name}: {cmd[0]} failed (rc={rc}); trying next ...")
+    if ok is None:
+        raise RuntimeError(f"extraction of {name!r} failed with all tools; aborting.")
+    print(f"[extract]   {name}: done via {ok} in {time.time() - t0:.0f}s")
 
-    # clean .zip archives only (skip azcopy's .azDownload-* partials, if any linger)
-    zips = sorted(f for f in os.listdir(src)
-                  if f.lower().endswith(".zip") and not f.startswith(".azDownload-"))
-    if not zips:
-        print(f"[extract] no .zip files under {src}. Contents: {sorted(os.listdir(src))}")
-        return
-    print(f"[extract] target = {MOUNT}/{EXPECTED_ROOT}  (merging {len(zips)} zip(s))")
+    if delete_zips:
+        os.remove(zpath)
+        print(f"[extract]   {name}: removed  (reclaimed {_human(zsize)})")
 
-    for i, name in enumerate(zips, 1):
-        zpath = f"{src}/{name}"
-        zsize = os.path.getsize(zpath)
-        print(f"\n[extract] ({i}/{len(zips)}) {name}  ({_human(zsize)})")
-        t0 = time.time()
-        # bsdtar first, then unar. subprocess list args -> spaces in names are safe.
-        attempts = [
-            ["bsdtar", "-x", "-f", zpath, "-C", MOUNT],
-            ["unar", "-quiet", "-force-overwrite", "-output-directory", MOUNT, zpath],
-        ]
-        ok = None
-        for cmd in attempts:
-            print(f"[extract]   trying {cmd[0]} ...")
-            rc = subprocess.run(cmd).returncode
-            if rc == 0:
-                ok = cmd[0]
-                break
-            print(f"[extract]   {cmd[0]} failed (rc={rc}); trying next ...")
-        if ok is None:
-            raise RuntimeError(f"extraction of {name!r} failed with all tools; aborting.")
-        print(f"[extract]   done via {ok} in {time.time() - t0:.0f}s")
+    print(f"[extract]   {name}: committing volume (persist progress)...")
+    vol.commit()
+    return name
 
-        if delete_zips:
-            os.remove(zpath)
-            print(f"[extract]   removed {name}  (reclaimed {_human(zsize)})")
 
-        print("[extract]   committing volume (persist progress)...")
-        vol.commit()
-
-    # summary: count images under the merged root
+@app.function(image=image, volumes={MOUNT: vol})
+def summarize():
+    """Count images under the merged root after all zips have extracted."""
+    import os
+    vol.reload()
     root = f"{MOUNT}/{EXPECTED_ROOT}"
     print(f"\n[extract] {MOUNT} now contains: {sorted(os.listdir(MOUNT))[:12]}")
     if not os.path.isdir(root):
         print(f"[extract] ⚠️ expected '{root}' not found — check the zips' top-level "
               f"folder name; set remote_data_root to whatever landed under {MOUNT}.")
-        vol.commit()
         return
-
     per = {}
     for split in ("train", "valid", "test"):
         sp = f"{root}/{split}"
@@ -116,10 +139,16 @@ def extract_all(delete_zips: bool):
         per[split] = c
     print(f"[extract] jpg per split under {EXPECTED_ROOT}/: {per}  (total {sum(per.values()):,})")
     print(f"[extract] top-level of {EXPECTED_ROOT}/: {sorted(os.listdir(root))[:12]}")
-    vol.commit()
-    print("[extract] committed — done ✅")
+    print("[extract] done ✅")
 
 
 @app.local_entrypoint()
 def main(delete_zips: bool = False):
-    extract_all.remote(delete_zips)
+    zips = list_zips.remote()
+    if not zips:
+        return
+    print(f"[extract] fanning out {len(zips)} zip(s) in parallel (one container each)")
+    # one container per zip, all concurrent; block until every extraction finishes.
+    for _ in extract_one.map(zips, [delete_zips] * len(zips)):
+        pass
+    summarize.remote()
