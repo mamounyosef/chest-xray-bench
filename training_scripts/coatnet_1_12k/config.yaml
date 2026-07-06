@@ -1,27 +1,42 @@
-
 # =============================================================================
-# config.yaml  —  experiment: convnext_base_22k
-#   (ConvNeXt-B, timm fb_in22k_ft_in1k_384, CLAHE off, U-Ones)
+# config.yaml  —  experiment: coatnet_1_12k
+#   (ARCHITECTURE arm: CoAtNet-1 (~42M) swapped in for ConvNeXt-B; otherwise the
+#    IDENTICAL best-setup — BCE + label smoothing 0.05, U-Ones except Consolidation
+#    = U-SelfTrained, seed 42, 384x320, 10 ep, lr 1e-4, cosine, AMP on.)
 # -----------------------------------------------------------------------------
-# Identical to the convnext_tiny_22k run in EVERYTHING (CLAHE off, U-Ones, seed
-# 42, 384x320 input on OUR data, same pretraining scheme) — only the model SIZE
-# differs: Base instead of Tiny. Weights are ImageNet-22k pretrained (@224) ->
-# ImageNet-1k fine-tuned (@384), loaded via timm (NOT torchvision — see
-# train.py). GPU bumped to A100-40GB for the larger (~88M) backbone. Holds only
-# what VARIES per experiment; common settings come from ../shared_config.yaml.
+# This is convnext_base_22k_final_stage1 with ONE thing changed: the backbone. It
+# is a SINGLE continuous stage — there is NO Stage-2 AUC-M run seeded from it, so
+# the epoch_2.pt seed (output.save_epoch_checkpoints: [2]) is DROPPED. Everything
+# else (data, uncertainty scheme, loss, schedule, eval cadence) is held identical
+# so the ONLY difference vs the ConvNeXt arm is CoAtNet-1 vs ConvNeXt-B.
+# -----------------------------------------------------------------------------
+# Uncertainty: U-Ones for every pathology EXCEPT Consolidation = U-SelfTrained:
+#   Atelectasis      -> U-Ones        (binary, sigmoid + BCE; -1 -> 1)
+#   Cardiomegaly     -> U-Ones        (binary, sigmoid + BCE; -1 -> 1)
+#   Consolidation    -> U-SelfTrained (binary; -1 -> SOFT prob from a prior model)
+#   Edema            -> U-Ones        (binary, sigmoid + BCE; -1 -> 1)
+#   Pleural Effusion -> U-Ones        (binary, sigmoid + BCE; -1 -> 1)
+# All tasks are binary -> 5 output logits (no multiclass head). Consolidation's
+# uncertain TRAIN cells take its soft probability from convnext_base_22k_certain_only's
+# labels; on val those cells have no soft target (see val handling below). u_policy
+# stays "mixed" because that is the engine's per-task entry point (selftrained is only
+# valid inside per_task); with no multiclass task the head is still 5 plain logits.
+# Holds only what VARIES per experiment; common settings come from ../shared_config.yaml.
 # =============================================================================
 
 experiment:
-  name: "convnext_base_22k"
+  name: "coatnet_1_12k"
 
 model:
-  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-B
-  # pretrained on ImageNet-22k (@224) then fine-tuned on ImageNet-1k (@384).
-  # (Same weight scheme as convnext_tiny_22k, just the Base size. Distinct from
-  #  torchvision's IN-1k-only weights, and from timm's "in12k_*" tags which are an
-  #  11,821-class subset, NOT IN-22k.)
-  name: "convnext_base.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
-  pretrained: true                             # IN-22k->IN-1k weights (timm, see train.py)
+  # timm model id WITH explicit pretrained tag. "sw_in12k_ft_in1k" = CoAtNet-1
+  # (rmlp variant, ~42M) pretrained on ImageNet-12k then fine-tuned on ImageNet-1k
+  # (both @224). NOTE: no CoAtNet is pretrained on the FULL IN-22k, and no CoAtNet-1
+  # exists at 384 — so unlike the ConvNeXt arm (fb_in22k_ft_in1k_384) this is IN-12k
+  # (the 11,821-class subset) @224. The "rmlp" (relative-position-MLP) variant is
+  # required: it regenerates its position bias for any grid, so train.py rebuilds it
+  # at this run's 384x320 (via img_size) and the pretrained weights still load cleanly.
+  name: "coatnet_rmlp_1_rw2_224.sw_in12k_ft_in1k"   # timm id (NOT torchvision)
+  pretrained: true                                  # IN-12k->IN-1k weights (timm, see train.py)
 
 # ----------------------------------------------------------------------------
 # Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
@@ -35,10 +50,44 @@ model:
 resume: null
 
 # ----------------------------------------------------------------------------
-# Label policy  —  uncertain (-1) handling. "ones" | "zeros". Blank/NaN -> 0.
+# Label policy  —  MIXED per-task uncertainty handling (this arm's whole point).
+#   u_policy: "mixed" switches the engine to a per-task output head. Each task:
+#     "ones" / "zeros"  : BINARY head (sigmoid + BCE); uncertain(-1) -> 1 / 0.
+#     "multiclass"      : 3-CLASS head {neg,pos,unc} (softmax + CE); at scoring
+#                         p_unc is dropped, prob renormalized to p_pos/(p_pos+p_neg).
+#     "selftrained"     : BINARY head; uncertain(-1) TRAIN cells take a SOFT target
+#                         (a probability in [0,1]) from selftrained_csv, joined by
+#                         path. On the val set (no soft labels) uncertain cells are
+#                         NaN and handled per val_ignore_uncertain below.
+#   Here only Consolidation is "selftrained", the rest U-Ones -> all binary -> 5 logits.
+#   Blank/NaN -> NEGATIVE (0) for all tasks. The engine routes the loss to the
+#   masked BCE (NaN val cells ignored; TRAIN soft probs are valid soft targets).
+#
+#   selftrained_csv : file (resolved against paths.data_dir, like the split CSVs)
+#     with the path column + one soft-probability column per task. Produced by
+#     convnext_base_22k_certain_only/label_uncertain.py. PREREQUISITE: that run
+#     must be trained + labeled and the CSV uploaded next to the splits
+#     (Modal: /data/splits/01_train_softlabels.csv) before THIS run can train.
 # ----------------------------------------------------------------------------
 labels:
-  u_policy: "ones"
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"         # binary, uncertain -> 1
+    Cardiomegaly:     "ones"         # binary, uncertain -> 1
+    Consolidation:    "selftrained"  # binary, uncertain -> soft prob (train only)
+    Edema:            "ones"         # binary, uncertain -> 1
+    Pleural Effusion: "ones"         # binary, uncertain -> 1
+  selftrained_csv: "01_train_softlabels.csv"   # soft targets for the selftrained task (Consolidation)
+
+  # val_ignore_uncertain : how the VALIDATION metric (and threshold calibration /
+  #   final eval) treats uncertain (-1) rows. Does NOT affect training.
+  #     false (DEFAULT) : KEEP uncertain rows, scored as POSITIVE (U-Ones for the
+  #                       metric), regardless of the per-task training policy. So
+  #                       'ones'/'zeros' keep their own 1/0, while 'multiclass'
+  #                       and 'selftrained' uncertain cells -> 1 on val.
+  #     true            : DROP uncertain rows from each task's metric (multiclass
+  #                       class-2 cells and selftrained/mask NaN cells excluded).
+  val_ignore_uncertain: false
 
 # ----------------------------------------------------------------------------
 # CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
@@ -63,7 +112,7 @@ dataloader:
   persistent_workers: true
   drop_last:          false
   # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
-  val_batch_size:         256
+  val_batch_size:         512
   val_num_workers:        10
   val_pin_memory:         true
   val_prefetch_factor:    4
@@ -104,12 +153,14 @@ training:
   loss:
     name: "bce_with_logits"  # multi-label binary cross-entropy on logits
     pos_weight: null         # null = unweighted; or per-task list
+    label_smoothing: 0.05    # eps: pull EVERY non-NaN target toward 0.5 (t(1-eps)+0.5eps),
+                             # applied to hard 0/1 AND the soft Consolidation cells.
 
   early_stopping:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 10              # counted in VALIDATIONS, not epochs
+    patience: 7               # counted in VALIDATIONS, not epochs
 
 # ----------------------------------------------------------------------------
 # Evaluation
@@ -131,7 +182,11 @@ evaluation:
     before_steps: 1200       # epochs 1-2: validate every 1200 steps
     after_steps:  600        # epochs 3+:  validate every 600 steps
 
-
+# ----------------------------------------------------------------------------
+# Output  —  no per-experiment overrides. SINGLE-STAGE run: unlike
+# convnext_base_22k_final_stage1 there is no Stage-2 AUC-M run to seed, so the
+# persistent epoch_2.pt (output.save_epoch_checkpoints: [2]) is intentionally
+# DROPPED. All output keys come from ../shared_config.yaml.
 # ----------------------------------------------------------------------------
 # Modal  —  cloud run resources + volume layout for THIS experiment.
 #   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
@@ -145,7 +200,7 @@ evaluation:
 #       override paths.data_root / paths.data_dir when running on Modal.
 # ----------------------------------------------------------------------------
 modal:
-  gpu: "A100"               # A100-40GB: comfortable for ConvNeXt-B (~88M) @384x320, batch 64
+  gpu: "A100"               # A100-40GB: ample for CoAtNet-1 (~42M, smaller than ConvNeXt-B) @384x320, batch 64
   cpu_cores: 8
   memory_gb: 50
   timeout_seconds: 28800      # 8 hours

@@ -62,6 +62,7 @@ CKPT_SUBPATH = {
 #   never collides with the plain "<run>" best.pt member. Empty list = off.
 CHECKPOINT_MEMBERS = [
     {"run": "convnext_base_22k_1600x1312", "checkpoint": 7500},
+    {"run": "convnext_base_22k_1600x1312", "checkpoint": 8700},
 ]
 
 # Per-class thresholds for the F1/precision/recall/specificity of the ENSEMBLE come

@@ -1,7 +1,8 @@
 ==============================================================================
 Mean AUROC per run  —  set=valid200
-generated: 2026-07-04T17:12:23
+generated: 2026-07-06T01:27:13
 ==============================================================================
+  0.8964   convnext_base_22k_1600x1312
   0.8854   convnext_base_22k_768x640
   0.8808   convnext_base_22k_final_stage1
   0.8799   convnext_base_22k_u_selftrain_consol_only
