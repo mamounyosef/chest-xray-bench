@@ -1,6 +1,6 @@
 # =============================================================================
-# config.yaml  —  experiment: convnext_base_22k_768x640
-#   (HIGH-RESOLUTION run: ConvNeXt-B, BCE + label smoothing 0.05, U-Ones except
+# config.yaml  —  experiment: convnext_large_22k_768x640
+#   (HIGH-RESOLUTION run: ConvNeXt-L, BCE + label smoothing 0.05, U-Ones except
 #    Consolidation = U-SelfTrained; trained at NATIVE 768x640 instead of 384x320)
 # -----------------------------------------------------------------------------
 # EXACT copy of convnext_base_22k_final_stage1 (same model, seed 42, 90/10 split
@@ -38,15 +38,15 @@
 # =============================================================================
 
 experiment:
-  name: "convnext_base_22k_768x640"
+  name: "convnext_large_22k_768x640"
 
 model:
-  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-B
+  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-L
   # pretrained on ImageNet-22k (@224) then fine-tuned on ImageNet-1k (@384).
-  # (Same weight scheme as convnext_tiny_22k, just the Base size. Distinct from
+  # (Same weight scheme as convnext_tiny_22k, just the Large size. Distinct from
   #  torchvision's IN-1k-only weights, and from timm's "in12k_*" tags which are an
   #  11,821-class subset, NOT IN-22k.)
-  name: "convnext_base.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
+  name: "convnext_large.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
   pretrained: true                             # IN-22k->IN-1k weights (timm, see train.py)
 
 # ----------------------------------------------------------------------------
@@ -58,7 +58,7 @@ model:
 #   <path>   : explicit checkpoint file path
 # Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
 # ----------------------------------------------------------------------------
-resume: 7500
+resume: null
 
 # ----------------------------------------------------------------------------
 # Label policy  —  MIXED per-task uncertainty handling (this arm's whole point).
@@ -112,7 +112,7 @@ image:
 
 # ----------------------------------------------------------------------------
 # CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
-# only difference is the architecture (ConvNeXt-B vs ResNet-50).
+# only difference is the architecture (ConvNeXt-L vs ResNet-50).
 # ----------------------------------------------------------------------------
 clahe:
   use_clahe: false
@@ -130,16 +130,16 @@ dataloader:
   # batches = num_workers * prefetch_factor, and at this size 16*2 already pins
   # ~12 GB of host RAM. batch_size stays 64 (fits A100-80GB, see modal.gpu).
   batch_size:         64
-  num_workers:        22        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  num_workers:        24        # 8 physical cores x2 vCPU on Modal -> 16 workers
   pin_memory:         true
-  prefetch_factor:    2
+  prefetch_factor:    3
   persistent_workers: true
   drop_last:          false
   # --- validation loader (no_grad, but 4x pixels): 512 -> 128 to stay within VRAM ---
-  val_batch_size:         256
-  val_num_workers:        22
+  val_batch_size:         512
+  val_num_workers:        24
   val_pin_memory:         true
-  val_prefetch_factor:    2
+  val_prefetch_factor:    3
   val_persistent_workers: true
 
 # ----------------------------------------------------------------------------
@@ -239,11 +239,11 @@ paths:
 #       override paths.data_root / paths.data_dir when running on Modal.
 # ----------------------------------------------------------------------------
 modal:
-  gpu: "A100-80GB"          # 80GB needed: ConvNeXt-B @768x640 batch 64 is ~4x the
+  gpu: "H200"          # 80GB needed: ConvNeXt-L @768x640 batch 64 is ~4x the
                             # activation memory of the 384x320 runs (would OOM on 40GB).
-  cpu_cores: 12             # native full-res JPEGs are far heavier to decode+resize
+  cpu_cores: 16             # native full-res JPEGs are far heavier to decode+resize
                             # than the small set -> match the 16 dataloader workers.
-  memory_gb: 96             # 4x-larger pinned prefetch batches + native decode buffers.
+  memory_gb: 64             # 4x-larger pinned prefetch batches + native decode buffers.
   timeout_seconds: 43200      # 12 hours (768x640 is ~4x the compute/step of 384x320)
   data_volume: "chexpert-native-data"   # NATIVE full-res tree (own volume)
   runs_volume: "chexpert-runs"
