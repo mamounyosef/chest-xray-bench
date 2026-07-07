@@ -32,12 +32,22 @@ from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
-SET    = "valid200"      # scored split — "valid200" or "test500"
+SET    = "test500"      # scored split — "valid200" or "test500"
 GPU    = "B200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each run's
                         # own dataloader.val_batch_size). valid200 is 200 imgs, so
                         # any value >=200 is one batch; lower it only to cap VRAM.
+
+# Modal container compute for the ensemble run (None -> inherit the reference run's
+# modal.cpu_cores / modal.memory_gb). These size what `modal` allocates.
+CPU_CORES = None        # requested CPU cores for the Modal container
+MEMORY_GB = None        # requested RAM in GB for the Modal container
+
+# DataLoader knobs applied to EVERY member's inference pass (None -> that run's own
+# dataloader.val_* value). Raise NUM_WORKERS toward CPU_CORES to speed up decoding.
+NUM_WORKERS     = None   # DataLoader workers per member
+PREFETCH_FACTOR = None   # batches prefetched per worker (only used when workers > 0)
 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
@@ -184,9 +194,16 @@ def _predict(cfg: dict, ckpt_path: Path, df, device) -> np.ndarray:
     sc._unwrap(model).load_state_dict(ck["model"])
     bs = int(BATCH_SIZE or cfg["dataloader"].get("val_batch_size",
                                                   cfg["dataloader"]["batch_size"]))
+    nw = int(NUM_WORKERS) if NUM_WORKERS is not None \
+        else int(cfg["dataloader"].get("val_num_workers", 4))
+    eff_cfg = cfg
+    if PREFETCH_FACTOR is not None:                   # _predict_dataframe reads it off cfg
+        eff_cfg = dict(cfg)
+        eff_cfg["dataloader"] = dict(cfg["dataloader"])
+        eff_cfg["dataloader"]["val_prefetch_factor"] = int(PREFETCH_FACTOR)
     _, y_prob, _, _ = sc._predict_dataframe(
-        cfg, model, df, device, _dummy_loss, amp=False, channels_last=False,
-        batch_size=bs, num_workers=int(cfg["dataloader"].get("val_num_workers", 4)))
+        eff_cfg, model, df, device, _dummy_loss, amp=False, channels_last=False,
+        batch_size=bs, num_workers=nw)
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -368,7 +385,11 @@ if _MODAL_OK and modal.is_local():
 
     _resources = sc.modal_resources(_ref_cfg)
     if GPU:
-        _resources["gpu"] = GPU          # explicit GPU override (see CONFIG at top)
+        _resources["gpu"] = GPU               # explicit GPU override (see CONFIG at top)
+    if CPU_CORES is not None:
+        _resources["cpu"] = CPU_CORES         # requested CPU cores override
+    if MEMORY_GB is not None:
+        _resources["memory"] = int(MEMORY_GB) * 1024   # GB -> MB (modal_resources' unit)
 
     @app.function(
         image=_image,
