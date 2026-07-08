@@ -58,7 +58,7 @@ model:
 #   <path>   : explicit checkpoint file path
 # Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
 # ----------------------------------------------------------------------------
-resume: null
+resume: 2400
 
 # ----------------------------------------------------------------------------
 # Label policy  —  MIXED per-task uncertainty handling (this arm's whole point).
@@ -136,7 +136,7 @@ dataloader:
   persistent_workers: true
   drop_last:          false
   # --- validation loader (no_grad, but 4x pixels): 512 -> 128 to stay within VRAM ---
-  val_batch_size:         512
+  val_batch_size:         256
   val_num_workers:        24
   val_pin_memory:         true
   val_prefetch_factor:    3
@@ -241,7 +241,7 @@ paths:
 modal:
   gpu: "H200"          # 80GB needed: ConvNeXt-L @768x640 batch 64 is ~4x the
                             # activation memory of the 384x320 runs (would OOM on 40GB).
-  cpu_cores: 16             # native full-res JPEGs are far heavier to decode+resize
+  cpu_cores: 20             # native full-res JPEGs are far heavier to decode+resize
                             # than the small set -> match the 16 dataloader workers.
   memory_gb: 64             # 4x-larger pinned prefetch batches + native decode buffers.
   timeout_seconds: 43200      # 12 hours (768x640 is ~4x the compute/step of 384x320)
