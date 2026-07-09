@@ -1,0 +1,17 @@
+======================================================================================
+OFFICIAL EVAL — test500   (01_test500.csv)
+======================================================================================
+  experiment : convnext_base_22k_pleural_effusion_only
+  checkpoint : /runs/convnext_base_22k_pleural_effusion_only/results/checkpoints/best.pt
+  images     : 668    device: cuda    amp: False
+  use_clahe  : False    u_policy: mixed    val_loss: 0.43520
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.9240        mean AUPRC : 0.7931
+    mean F1    : 0.4958    mean precision: 0.3324    mean recall: 0.9750    mean spec: 0.5712
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Pleural Effusion    0.240  0.9240  0.7931  0.4958  0.3324  0.9750  0.5712     120
+======================================================================================

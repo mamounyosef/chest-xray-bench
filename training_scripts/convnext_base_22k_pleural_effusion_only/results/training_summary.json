@@ -1,0 +1,23 @@
+{
+  "experiment": "convnext_base_22k_pleural_effusion_only",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8782402194780083,
+  "best_step": 6600,
+  "best_epoch": 3,
+  "best_metrics": {
+    "mean_auroc": 0.8782402194780083,
+    "mean_auprc": 0.8443462497100158,
+    "mean_f1": 0.7633272616879174,
+    "mean_precision": 0.7951929158760278,
+    "mean_recall": 0.733917104495038,
+    "mean_specificity": 0.8463217845277646,
+    "val_loss": 0.4766119676422698
+  },
+  "last_step": 9000,
+  "total_steps": 26870,
+  "elapsed_sec": 2599.07,
+  "elapsed_human": "43m 19s",
+  "updated": "2026-07-09T16:56:38"
+}

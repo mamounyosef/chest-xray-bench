@@ -1,0 +1,17 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : convnext_base_22k_cardiomegaly_only
+  checkpoint : /runs/convnext_base_22k_cardiomegaly_only/results/checkpoints/best.pt
+  images     : 234    device: cuda    amp: False
+  use_clahe  : False    u_policy: mixed    val_loss: 0.67358
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8055        mean AUPRC : 0.7261
+    mean F1    : 0.5253    mean precision: 0.8387    mean recall: 0.3824    mean spec: 0.9699
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Cardiomegaly        0.198  0.8055  0.7261  0.5253  0.8387  0.3824  0.9699      68
+======================================================================================

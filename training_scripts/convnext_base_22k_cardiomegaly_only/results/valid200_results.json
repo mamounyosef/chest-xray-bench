@@ -1,0 +1,41 @@
+{
+  "experiment": "convnext_base_22k_cardiomegaly_only",
+  "set": "valid200",
+  "csv": "01_valid200.csv",
+  "checkpoint": "/runs/convnext_base_22k_cardiomegaly_only/results/checkpoints/best.pt",
+  "checkpoint_step": 5400,
+  "checkpoint_epoch": 2,
+  "n_images": 234,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "01_val.csv",
+  "thresholds": {
+    "Cardiomegaly": 0.197892427444458
+  },
+  "use_clahe": false,
+  "u_policy": "mixed",
+  "val_loss": 0.6735777854919434,
+  "macro": {
+    "mean_auroc": 0.8055457122608078,
+    "mean_auprc": 0.726085870784836,
+    "mean_f1": 0.5252525252525252,
+    "mean_precision": 0.8387096774193549,
+    "mean_recall": 0.38235294117647056,
+    "mean_specificity": 0.9698795180722891
+  },
+  "per_task": {
+    "Cardiomegaly": {
+      "auroc": 0.8055457122608078,
+      "auprc": 0.726085870784836,
+      "f1": 0.5252525252525252,
+      "precision": 0.8387096774193549,
+      "recall": 0.38235294117647056,
+      "specificity": 0.9698795180722891,
+      "n_pos": 68,
+      "n_excluded": 0,
+      "threshold": 0.197892427444458
+    }
+  },
+  "evaluated_at": "2026-07-09T18:14:41"
+}

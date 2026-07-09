@@ -1,0 +1,37 @@
+{
+  "experiment": "convnext_base_22k_atelectasis_only",
+  "objective": "f1",
+  "scope": "per_task",
+  "calibration_set": "01_val.csv",
+  "checkpoint": "/runs/convnext_base_22k_atelectasis_only/results/checkpoints/best.pt",
+  "checkpoint_step": 6600,
+  "checkpoint_epoch": 2,
+  "n_val_images": 19100,
+  "thresholds": {
+    "Atelectasis": 0.29594969749450684
+  },
+  "val_metrics_at_threshold": {
+    "macro": {
+      "mean_auroc": 0.7243134471559007,
+      "mean_auprc": 0.5115773517453159,
+      "mean_f1": 0.5636296569531538,
+      "mean_precision": 0.44405696018599244,
+      "mean_recall": 0.7713276123170116,
+      "mean_specificity": 0.5638063388310405
+    },
+    "per_task": {
+      "Atelectasis": {
+        "auroc": 0.7243134471559007,
+        "auprc": 0.5115773517453159,
+        "f1": 0.5636296569531538,
+        "precision": 0.44405696018599244,
+        "recall": 0.7713276123170116,
+        "specificity": 0.5638063388310405,
+        "n_pos": 5943,
+        "n_excluded": 0,
+        "threshold": 0.29594969749450684
+      }
+    }
+  },
+  "calibrated_at": "2026-07-09T18:01:04"
+}

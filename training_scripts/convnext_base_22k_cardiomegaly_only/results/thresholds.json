@@ -1,0 +1,37 @@
+{
+  "experiment": "convnext_base_22k_cardiomegaly_only",
+  "objective": "f1",
+  "scope": "per_task",
+  "calibration_set": "01_val.csv",
+  "checkpoint": "/runs/convnext_base_22k_cardiomegaly_only/results/checkpoints/best.pt",
+  "checkpoint_step": 5400,
+  "checkpoint_epoch": 2,
+  "n_val_images": 19100,
+  "thresholds": {
+    "Cardiomegaly": 0.197892427444458
+  },
+  "val_metrics_at_threshold": {
+    "macro": {
+      "mean_auroc": 0.8716331438028445,
+      "mean_auprc": 0.6157090842649996,
+      "mean_f1": 0.5858442296759522,
+      "mean_precision": 0.5157657657657657,
+      "mean_recall": 0.6779605263157895,
+      "mean_specificity": 0.8795143212951432
+    },
+    "per_task": {
+      "Cardiomegaly": {
+        "auroc": 0.8716331438028445,
+        "auprc": 0.6157090842649996,
+        "f1": 0.5858442296759522,
+        "precision": 0.5157657657657657,
+        "recall": 0.6779605263157895,
+        "specificity": 0.8795143212951432,
+        "n_pos": 3040,
+        "n_excluded": 0,
+        "threshold": 0.197892427444458
+      }
+    }
+  },
+  "calibrated_at": "2026-07-09T18:07:24"
+}
