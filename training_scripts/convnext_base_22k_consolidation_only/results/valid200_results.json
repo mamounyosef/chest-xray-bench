@@ -1,0 +1,41 @@
+{
+  "experiment": "convnext_base_22k_consolidation_only",
+  "set": "valid200",
+  "csv": "01_valid200.csv",
+  "checkpoint": "/runs/convnext_base_22k_consolidation_only/results/checkpoints/best.pt",
+  "checkpoint_step": 7200,
+  "checkpoint_epoch": 2,
+  "n_images": 234,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "01_val.csv",
+  "thresholds": {
+    "Consolidation": 0.08098085969686508
+  },
+  "use_clahe": false,
+  "u_policy": "mixed",
+  "val_loss": 0.3806336224079132,
+  "macro": {
+    "mean_auroc": 0.8876827981305593,
+    "mean_auprc": 0.602855539187307,
+    "mean_f1": 0.4769230769230769,
+    "mean_precision": 0.31958762886597936,
+    "mean_recall": 0.9393939393939394,
+    "mean_specificity": 0.6716417910447762
+  },
+  "per_task": {
+    "Consolidation": {
+      "auroc": 0.8876827981305593,
+      "auprc": 0.602855539187307,
+      "f1": 0.4769230769230769,
+      "precision": 0.31958762886597936,
+      "recall": 0.9393939393939394,
+      "specificity": 0.6716417910447762,
+      "n_pos": 33,
+      "n_excluded": 0,
+      "threshold": 0.08098085969686508
+    }
+  },
+  "evaluated_at": "2026-07-09T15:09:48"
+}

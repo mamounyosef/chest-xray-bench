@@ -1,0 +1,37 @@
+{
+  "experiment": "convnext_base_22k_consolidation_only",
+  "objective": "f1",
+  "scope": "per_task",
+  "calibration_set": "01_val.csv",
+  "checkpoint": "/runs/convnext_base_22k_consolidation_only/results/checkpoints/best.pt",
+  "checkpoint_step": 7200,
+  "checkpoint_epoch": 2,
+  "n_val_images": 19100,
+  "thresholds": {
+    "Consolidation": 0.08098085969686508
+  },
+  "val_metrics_at_threshold": {
+    "macro": {
+      "mean_auroc": 0.6800125042999655,
+      "mean_auprc": 0.3088858653716441,
+      "mean_f1": 0.40988882387361036,
+      "mean_precision": 0.2838330632090762,
+      "mean_recall": 0.7373684210526316,
+      "mean_specificity": 0.5379084967320261
+    },
+    "per_task": {
+      "Consolidation": {
+        "auroc": 0.6800125042999655,
+        "auprc": 0.3088858653716441,
+        "f1": 0.40988882387361036,
+        "precision": 0.2838330632090762,
+        "recall": 0.7373684210526316,
+        "specificity": 0.5379084967320261,
+        "n_pos": 3800,
+        "n_excluded": 0,
+        "threshold": 0.08098085969686508
+      }
+    }
+  },
+  "calibrated_at": "2026-07-09T15:08:25"
+}
