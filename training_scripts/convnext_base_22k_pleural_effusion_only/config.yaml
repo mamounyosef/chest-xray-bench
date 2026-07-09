@@ -1,0 +1,206 @@
+# =============================================================================
+# config.yaml  —  experiment: convnext_base_22k_pleural_effusion_only
+#   (SINGLE-TASK arm: a Pleural Effusion-ONLY model — ONE output logit — trained on the
+#    FULL 01_train data at seed 42, as a SINGLE continuous stage. Pleural Effusion's
+#    uncertainty stays U-Ones, identical to the seed arms, for consistency.)
+# -----------------------------------------------------------------------------
+# This is convnext_base_22k_consolidation_only with two changes: the single task is
+# Pleural Effusion instead of Consolidation, and its uncertainty policy is U-Ones (per_task
+# "ones": uncertain -1 -> 1) rather than selftrained — Pleural Effusion has no soft labels, and
+# U-Ones is exactly how it was handled in the multi-task / seed arms.
+# EVERYTHING else (model, DATA SOURCE = the full 01_train/01_val split, loss + label
+# smoothing 0.05, schedule, eval cadence, 384x320, 10 ep, lr 1e-4, cosine, AMP on) is
+# held identical to the other single-task arms.
+# -----------------------------------------------------------------------------
+# Uncertainty for the single task:
+#   Pleural Effusion -> U-Ones (binary, sigmoid + BCE; uncertain -1 -> 1).
+# The one task is binary -> 1 output logit (sigmoid + BCE; no multiclass/softmax head).
+# Blank/NaN -> NEGATIVE (0). No selftrained_csv here (that is Consolidation-specific).
+# Holds only what VARIES per experiment; common settings come from ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "convnext_base_22k_pleural_effusion_only"
+
+model:
+  # timm model id WITH explicit pretrained tag. "fb_in22k_ft_in1k_384" = ConvNeXt-B
+  # pretrained on ImageNet-22k (@224) then fine-tuned on ImageNet-1k (@384).
+  # (Same weight scheme as convnext_tiny_22k, just the Base size. Distinct from
+  #  torchvision's IN-1k-only weights, and from timm's "in12k_*" tags which are an
+  #  11,821-class subset, NOT IN-22k.)
+  name: "convnext_base.fb_in22k_ft_in1k_384"   # timm id (NOT torchvision)
+  pretrained: true                             # IN-22k->IN-1k weights (timm, see train.py)
+
+# ----------------------------------------------------------------------------
+# Reproducibility  —  seed 42, the canonical seed (matching final_stage1 / the
+# 768 / 1600 arms). shared_config.yaml is also 42; set here explicitly for clarity.
+# deterministic stays inherited (true). Seeds model FC-head init + data shuffling +
+# augmentation.
+# ----------------------------------------------------------------------------
+reproducibility:
+  seed: 42
+
+# ----------------------------------------------------------------------------
+# Resume  —  continue training from a checkpoint (config-driven, no CLI flag).
+#   null     : fresh run
+#   "best"   : results/checkpoints/best.pt
+#   "last"   : newest rolling checkpoint
+#   <int>    : a specific step, e.g. 1200  ->  ckpt_step1200.pt
+#   <path>   : explicit checkpoint file path
+# Restores model + optimizer + scheduler + AMP scaler + RNG + step/epoch/elapsed.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Tasks  —  SINGLE-TASK override. shared_config.yaml lists all 5 pathologies; here
+# we train (and score) Pleural Effusion ONLY, so the head is one logit. This list
+# REPLACES the shared 5-task list wholesale (deep-merge: the experiment's list wins),
+# and fixes the (length-1) column order of every label tensor & metric vector.
+# ----------------------------------------------------------------------------
+tasks:
+  - Pleural Effusion
+
+# ----------------------------------------------------------------------------
+# Label policy  —  per-task uncertainty handling. u_policy "mixed" is the engine's
+#   per-task entry point; the single task Pleural Effusion uses "ones":
+#     "ones"  : BINARY head (sigmoid + BCE); uncertain(-1) -> 1.
+#   Blank/NaN -> NEGATIVE (0). There is NO selftrained_csv here — Pleural Effusion has no soft
+#   labels (those are Consolidation-specific); uncertain cells simply map to 1.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "mixed"
+  per_task:
+    Pleural Effusion: "ones"   # binary, uncertain -> 1
+
+  # val_ignore_uncertain : how the VALIDATION metric (and threshold calibration /
+  #   final eval) treats uncertain (-1) rows. Does NOT affect training.
+  #     false (DEFAULT) : KEEP uncertain rows, scored as POSITIVE (U-Ones for the
+  #                       metric), regardless of the per-task training policy. So
+  #                       'ones'/'zeros' keep their own 1/0, while 'multiclass'
+  #                       and 'selftrained' uncertain cells -> 1 on val.
+  #     true            : DROP uncertain rows from each task's metric (multiclass
+  #                       class-2 cells and selftrained/mask NaN cells excluded).
+  val_ignore_uncertain: false
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF for this arm. Held identical to the resnet50 baseline so the
+# only difference is the architecture (ConvNeXt-B vs ResNet-50).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  fully separate train vs validation settings. Each val_* key
+# falls back to its train counterpart if omitted. (drop_last is train-only;
+# validation never drops samples.)
+# ----------------------------------------------------------------------------
+dataloader:
+  # --- train loader ---
+  batch_size:         64
+  num_workers:        24        # 8 physical cores x2 vCPU on Modal -> 16 workers
+  pin_memory:         true
+  prefetch_factor:    3
+  persistent_workers: true
+  drop_last:          false
+  # --- validation loader (val runs under no_grad -> can be bigger/faster) ---
+  val_batch_size:         512
+  val_num_workers:        24
+  val_pin_memory:         true
+  val_prefetch_factor:    3
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  CUDA-only speedups (ignored on CPU). Keep these identical
+# across experiments so the comparison stays fair.
+#   channels_last   : NHWC memory format (better tensor-core conv throughput)
+#   fused_optimizer : fused AdamW kernel (one-kernel optimizer step)
+#   compile         : torch.compile the model (1.2-2x; first-step warmup cost)
+#   compile_mode    : default | reduce-overhead | max-autotune
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training
+# ----------------------------------------------------------------------------
+training:
+  epochs:        10
+  amp:           true        # mixed precision (A100)
+  grad_clip:     null        # max-norm, or null to disable
+
+  optimizer:                 # AdamW always
+    lr:           1.0e-4
+    weight_decay: 1.0e-5
+
+  scheduler:
+    name:        "cosine"    # cosine | plateau | none
+    warmup_epochs: 1
+    min_lr:      1.0e-6
+    plateau_patience: 2      # used by plateau only
+
+  loss:
+    name: "bce_with_logits"  # multi-label binary cross-entropy on logits
+    pos_weight: null         # null = unweighted; or per-task list
+    label_smoothing: 0.05    # eps: pull EVERY non-NaN target toward 0.5 (t(1-eps)+0.5eps),
+                             # applied to hard 0/1 AND the soft Consolidation cells.
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 4               # counted in VALIDATIONS, not epochs
+
+# ----------------------------------------------------------------------------
+# Evaluation
+#   eval_every_epochs : validate + checkpoint every N epochs (or null)
+#   eval_every_steps  : also validate every N optimizer steps (or null)
+#   eval_schedule     : OPTIONAL phased step cadence — validate rarely early
+#       (model clearly still improving) and often later, to save compute.
+#       threshold_epoch is 1-indexed + INCLUSIVE: epochs before it validate every
+#       before_steps; epoch threshold_epoch and onward validate every after_steps.
+#       Omit the block for a flat eval_every_steps (unchanged behavior).
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+  eval_schedule:
+    threshold_epoch: 3       # epochs 1-2 coarse, epochs 3+ fine (inclusive)
+    before_steps: 1200       # epochs 1-2: validate every 1200 steps
+    after_steps:  600        # epochs 3+:  validate every 600 steps
+
+# ----------------------------------------------------------------------------
+# Output  —  no per-experiment overrides. SINGLE-STAGE run: unlike
+# convnext_base_22k_final_stage1 there is no Stage-2 AUC-M run to seed, so the
+# persistent epoch_2.pt (output.save_epoch_checkpoints: [2]) is intentionally
+# DROPPED. All output keys come from ../shared_config.yaml.
+# ----------------------------------------------------------------------------
+# Modal  —  cloud run resources + volume layout for THIS experiment.
+#   gpu             : Modal GPU type string (T4 | L4 | A10G | A100 | A100-80GB | H100 | H200)
+#   cpu_cores       : requested CPU cores (match dataloader num_workers)
+#   memory_gb       : requested RAM in GB
+#   timeout_seconds : hard wall-clock limit for one run
+#   data_volume     : volume holding the dataset + split CSVs (read)
+#   runs_volume     : volume holding per-experiment outputs (written)
+#   *_mount         : where each volume is mounted in the container
+#   remote_data_root / remote_data_dir : paths INSIDE the data volume; these
+#       override paths.data_root / paths.data_dir when running on Modal.
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "A100"               # A100-40GB: comfortable for ConvNeXt-B (~88M) @384x320, batch 64
+  cpu_cores: 16
+  memory_gb: 40
+  timeout_seconds: 28800      # 8 hours
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"   # Modal secret holding WANDB_API_KEY
