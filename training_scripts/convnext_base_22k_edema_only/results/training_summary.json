@@ -1,0 +1,23 @@
+{
+  "experiment": "convnext_base_22k_edema_only",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8516580373529553,
+  "best_step": 7200,
+  "best_epoch": 3,
+  "best_metrics": {
+    "mean_auroc": 0.8516580373529553,
+    "mean_auprc": 0.7199525241031033,
+    "mean_f1": 0.6577361018084394,
+    "mean_precision": 0.6666666666666666,
+    "mean_recall": 0.6490416391275612,
+    "mean_specificity": 0.8494788473329246,
+    "val_loss": 0.470115603364575
+  },
+  "last_step": 9600,
+  "total_steps": 26870,
+  "elapsed_sec": 3547.1,
+  "elapsed_human": "59m 07s",
+  "updated": "2026-07-09T19:05:46"
+}

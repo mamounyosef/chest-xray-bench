@@ -1,0 +1,41 @@
+{
+  "experiment": "convnext_base_22k_edema_only",
+  "set": "test500",
+  "csv": "01_test500.csv",
+  "checkpoint": "/runs/convnext_base_22k_edema_only/results/checkpoints/best.pt",
+  "checkpoint_step": 7200,
+  "checkpoint_epoch": 2,
+  "n_images": 668,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "01_val.csv",
+  "thresholds": {
+    "Edema": 0.4049846827983856
+  },
+  "use_clahe": false,
+  "u_policy": "mixed",
+  "val_loss": 0.313714175345655,
+  "macro": {
+    "mean_auroc": 0.9180708303904752,
+    "mean_auprc": 0.6518808638070638,
+    "mean_f1": 0.6226415094339623,
+    "mean_precision": 0.5196850393700787,
+    "mean_recall": 0.7764705882352941,
+    "mean_specificity": 0.8953687821612349
+  },
+  "per_task": {
+    "Edema": {
+      "auroc": 0.9180708303904752,
+      "auprc": 0.6518808638070638,
+      "f1": 0.6226415094339623,
+      "precision": 0.5196850393700787,
+      "recall": 0.7764705882352941,
+      "specificity": 0.8953687821612349,
+      "n_pos": 85,
+      "n_excluded": 0,
+      "threshold": 0.4049846827983856
+    }
+  },
+  "evaluated_at": "2026-07-09T19:16:44"
+}

@@ -1,0 +1,37 @@
+{
+  "experiment": "convnext_base_22k_edema_only",
+  "objective": "f1",
+  "scope": "per_task",
+  "calibration_set": "01_val.csv",
+  "checkpoint": "/runs/convnext_base_22k_edema_only/results/checkpoints/best.pt",
+  "checkpoint_step": 7200,
+  "checkpoint_epoch": 2,
+  "n_val_images": 19100,
+  "thresholds": {
+    "Edema": 0.4049846827983856
+  },
+  "val_metrics_at_threshold": {
+    "macro": {
+      "mean_auroc": 0.8516546435085584,
+      "mean_auprc": 0.7199869741151586,
+      "mean_f1": 0.679807336050389,
+      "mean_precision": 0.6162837565497783,
+      "mean_recall": 0.7579312623925974,
+      "mean_specificity": 0.7811158798283262
+    },
+    "per_task": {
+      "Edema": {
+        "auroc": 0.8516546435085584,
+        "auprc": 0.7199869741151586,
+        "f1": 0.679807336050389,
+        "precision": 0.6162837565497783,
+        "recall": 0.7579312623925974,
+        "specificity": 0.7811158798283262,
+        "n_pos": 6052,
+        "n_excluded": 0,
+        "threshold": 0.4049846827983856
+      }
+    }
+  },
+  "calibrated_at": "2026-07-09T19:13:27"
+}
