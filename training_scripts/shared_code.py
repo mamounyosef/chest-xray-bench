@@ -244,6 +244,91 @@ def num_output_logits(cfg: dict) -> int:
     return task_layout(cfg)["n_logits"]
 
 
+def build_medmae_vit(cfg: dict, load_pretrained: bool = False) -> nn.Module:
+    """Build a Medical-MAE ViT-B/16 for the 3-way starting-checkpoint comparison
+    (lambert-x/medical_mae). Architecture is timm's VisionTransformer with GLOBAL
+    AVERAGE POOLING (global_pool='avg' -> a trained fc_norm, no cls-token norm),
+    exactly Medical-MAE's fine-tune recipe, at the project's native input. The head
+    is one logit per task (num_output_logits).
+
+    The input is (1,H,W) with H=image.height, W=image.width (320x384 here), so
+    img_size=(H,W) -> a 20x24 patch grid (480 patches) and pos_embed [1,481,768].
+
+    load_pretrained=False -> ARCHITECTURE ONLY (used by evaluate/calibrate/tta,
+    which then load the run's OWN best.pt). load_pretrained=True (train.py) also
+    seeds the backbone from the Medical-MAE checkpoint named in
+    cfg['model']['checkpoint_path'], with:
+      * MAE decoder / mask_token keys dropped (self-supervised pretrain ckpt),
+      * a self-supervised ckpt's encoder 'norm.*' dropped (this model uses fc_norm),
+      * the absolute pos_embed bicubically RESAMPLED from the ckpt's 14x14 grid to
+        this model's 20x24 grid (Medical-MAE's own helper only handles square grids,
+        so timm.layers.resample_abs_pos_embed is used instead),
+      * the classifier head KEPT only when cfg['model']['keep_head'] is true AND its
+        shape matches (Run 3, the CheXpert-fine-tuned 5-class start); otherwise a
+        FRESH small-std head (Runs 1 & 2). A kept head assumes the checkpoint's class
+        order equals cfg['tasks'] (the CheXpert competition 5, same order).
+    """
+    import timm
+    from timm.layers import resample_abs_pos_embed
+
+    m = cfg["model"]
+    n_out = num_output_logits(cfg)
+    img_cfg = cfg["image"]
+    model = timm.create_model(
+        m["name"], pretrained=False, num_classes=n_out,
+        img_size=(img_cfg["height"], img_cfg["width"]),
+        global_pool=m.get("global_pool", "avg"),
+    )
+    keep_head = bool(m.get("keep_head", False))
+    if not keep_head:                       # fresh head, Medical-MAE finetune init
+        nn.init.trunc_normal_(model.head.weight, std=2e-5)
+        nn.init.zeros_(model.head.bias)
+    if not load_pretrained:
+        return model
+
+    ckpt_path = m.get("checkpoint_path")
+    if not ckpt_path or not Path(ckpt_path).exists():
+        raise FileNotFoundError(
+            f"Medical-MAE checkpoint not found: {ckpt_path!r}. Download it to the "
+            f"data volume first (modal_scripts/modal_download_medmae.py).")
+    print("=" * 70)
+    print(f"[medmae] loading Medical-MAE ViT-B/16 start from {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    # Drop keys this fine-tune architecture does not have.
+    for k in list(sd.keys()):
+        if k.startswith("decoder") or k == "mask_token" or k.startswith("norm."):
+            del sd[k]                       # MAE decoder / cls-token norm (fc_norm used)
+    if not keep_head:
+        sd.pop("head.weight", None)
+        sd.pop("head.bias", None)
+    elif sd.get("head.weight") is not None and \
+            sd["head.weight"].shape != model.head.weight.shape:
+        print(f"   [warn] ckpt head {tuple(sd['head.weight'].shape)} != "
+              f"{tuple(model.head.weight.shape)} - dropping, using a FRESH head")
+        sd.pop("head.weight", None)
+        sd.pop("head.bias", None)
+
+    # Resample absolute position embedding to this model's patch grid.
+    if "pos_embed" in sd and sd["pos_embed"].shape != model.pos_embed.shape:
+        gh, gw = model.patch_embed.grid_size
+        sd["pos_embed"] = resample_abs_pos_embed(
+            sd["pos_embed"], new_size=(gh, gw), num_prefix_tokens=1, verbose=True)
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    # A backbone-block key going missing would mean an architecture mismatch, not the
+    # expected fresh head/fc_norm — surface it loudly.
+    bad = [k for k in missing if k.startswith("blocks.") or k.startswith("patch_embed")]
+    if bad:
+        raise RuntimeError(f"[medmae] backbone keys missing after load: {bad[:6]}")
+    print(f"   [ok] loaded (missing={sorted(set(k.split('.')[0] for k in missing))}, "
+          f"unexpected={sorted(set(k.split('.')[0] for k in unexpected))})")
+    print("=" * 70)
+    del ckpt, sd
+    return model
+
+
 def finetune_ckpt_subdir(cfg: dict) -> str:
     """Subfolder under results/checkpoints that holds the CheXpert model's
     checkpoints. For a two-stage run (pretrain.enable) that's the fine-tune stage's
@@ -817,6 +902,69 @@ def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5, exclude_mask=Non
     return {"macro": macro, "per_task": per_task}
 
 
+def _vit_layer_id(name: str, num_layers: int) -> int:
+    """Depth index of a ViT parameter for layer-wise LR decay: input/embedding
+    params (patch_embed, cls_token, pos_embed) -> 0 (earliest); transformer block i
+    -> i+1; everything after the blocks (final norm / fc_norm / head) -> num_layers."""
+    if name in ("cls_token", "pos_embed") or name.startswith("patch_embed"):
+        return 0
+    if name.startswith("blocks."):
+        return int(name.split(".")[1]) + 1
+    return num_layers
+
+
+def _param_groups_llrd(model: nn.Module, base_lr: float, weight_decay: float,
+                       layer_decay: float):
+    """Layer-wise LR decay (LLRD) param groups for a ViT. Each depth d gets
+    lr = base_lr * layer_decay**(num_layers - d), so EARLY blocks train slower than
+    late blocks + head (a soft freeze that still adapts — the standard MAE/BEiT
+    fine-tune trick). 1-D params (biases, LayerNorm) and pos_embed/cls_token get NO
+    weight decay. The params are the SAME tensors the scheduler later anneals, from
+    each group's own initial lr. Prints one line summarizing the LR spread."""
+    num_layers = len(model.blocks) + 1
+    scales = [layer_decay ** (num_layers - i) for i in range(num_layers + 1)]
+    no_decay = set(model.no_weight_decay()) if hasattr(model, "no_weight_decay") else set()
+    groups = {}
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_no_decay = p.ndim == 1 or n in no_decay
+        lid = _vit_layer_id(n, num_layers)
+        key = f"layer{lid}_{'no_decay' if is_no_decay else 'decay'}"
+        if key not in groups:
+            groups[key] = {"params": [], "lr": base_lr * scales[lid],
+                           "weight_decay": 0.0 if is_no_decay else weight_decay,
+                           "lr_scale": scales[lid], "layer_id": lid}
+        groups[key]["params"].append(p)
+    return list(groups.values())
+
+
+def _print_llrd(groups, base_lr: float, layer_decay: float, num_layers: int):
+    """Print the actual per-DEPTH learning rate at training start so it can be
+    eyeballed. One lr per depth (the decay/no-decay groups at a depth share the same
+    lr). If there are more than 6 depths, show the first 2 and last 2 with an
+    ellipsis between."""
+    depth_lr = {g["layer_id"]: g["lr"] for g in groups}
+    depths = sorted(depth_lr)
+
+    def label(d):
+        if d == 0:
+            return "embed (patch/pos/cls)"
+        if d == num_layers:
+            return "head / final-norm"
+        return f"block {d - 1}"
+
+    print(f"[optim] LLRD layer_decay={layer_decay}  base_lr={base_lr:.2e}  "
+          f"({len(depths)} depths, {len(groups)} param groups):")
+    show = depths if len(depths) <= 6 else depths[:2] + depths[-2:]
+    prev = None
+    for d in show:
+        if prev is not None and d != prev + 1:
+            print("           ...")
+        print(f"           depth {d:>2d}  {label(d):<22s} lr={depth_lr[d]:.3e}")
+        prev = d
+
+
 def build_optimizer(model: nn.Module, cfg: dict, loss_fn=None) -> optim.Optimizer:
     """Optimizer from cfg['training']['optimizer']. Defaults to AdamW (when 'name'
     is absent or 'adamw' — every existing run); 'pesg' builds LibAUC's PESG, which
@@ -835,6 +983,19 @@ def build_optimizer(model: nn.Module, cfg: dict, loss_fn=None) -> optim.Optimize
     if name == "adamw":
         fused = bool(cfg.get("performance", {}).get("fused_optimizer", False)) \
             and next(model.parameters()).is_cuda
+        # Layer-wise LR decay (opt-in via optimizer.layer_decay). Only meaningful for
+        # a transformer with .blocks; every non-ViT run omits the key -> uniform LR
+        # (unchanged). Names come from the UNWRAPPED module so torch.compile's
+        # '_orig_mod.' prefix doesn't break the blocks.<i> depth parsing.
+        ld = o.get("layer_decay")
+        base = _unwrap(model)
+        if ld is not None and hasattr(base, "blocks"):
+            groups = _param_groups_llrd(base, o["lr"], o["weight_decay"], float(ld))
+            _print_llrd(groups, o["lr"], float(ld), len(base.blocks) + 1)
+            return optim.AdamW(groups, lr=o["lr"],
+                               weight_decay=o["weight_decay"], fused=fused)
+        if ld is not None:
+            print("[optim] layer_decay set but model has no .blocks -> uniform LR")
         return optim.AdamW(model.parameters(), lr=o["lr"],
                            weight_decay=o["weight_decay"], fused=fused)
     if name == "pesg":
