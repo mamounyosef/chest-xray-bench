@@ -1,0 +1,169 @@
+# =============================================================================
+# config.yaml  —  experiment: medmae_vitb_chexpert
+#   (RUN 3 of a controlled 3-way starting-checkpoint comparison. Same architecture
+#    — Medical-MAE ViT-Base/16, ~86M — and IDENTICAL training settings across all
+#    three runs; the ONLY variable is the starting checkpoint.)
+# -----------------------------------------------------------------------------
+# START = the Medical-MAE ViT-B/16 already fine-tuned on CheXpert (reported mAUC
+#   89.3 at 224px, a 5-class head). Its EXISTING 5-class head is KEPT and training
+#   CONTINUES on our CheXpert split at a LOWER LR (it has already converged on
+#   CheXpert — a full-strength restart can damage it; watch for overfitting).
+#   Checkpoint: /data/pretrained/vit-b_CXR_0.5M_mae_chexpert.pth (medical_mae).
+# -----------------------------------------------------------------------------
+# Held identical across Runs 1/2/3: architecture (ViT-B/16, global-avg-pool
+# fine-tune arch, 384x320), seed 42, 6 epochs, batch 64, cosine + 1-epoch warmup,
+# AMP, the SAME 01_train/01_val split, U-SelfTrained for Consolidation + U-Ones for
+# the other four, label smoothing 0.05. The ONLY differences vs Runs 2/3 are the
+# starting checkpoint and (for Run 3) a lower LR. Runs 1 & 2 use lr 5e-5 (a warm
+# MAE/NIH backbone tolerates less than the 1e-4 used for ImageNet ConvNeXt).
+# Holds only what VARIES per experiment; common settings come from ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "medmae_vitb_chexpert"
+
+# ----------------------------------------------------------------------------
+# Model  —  Medical-MAE ViT-Base/16, built by shared_code.build_medmae_vit (NOT a
+# plain timm.create_model): timm's VisionTransformer with global_pool='avg'
+# (a trained fc_norm — Medical-MAE's fine-tune recipe) at our 320x384 input
+# (20x24 patch grid). pretrained:false — timm downloads NOTHING; the weights come
+# from checkpoint_path below. checkpoint_kind 'chexpert' = a CheXpert-fine-tuned
+# 5-class model whose head is KEPT (keep_head:true). Download the file first with
+# modal_scripts/modal_download_medmae.py.
+# ----------------------------------------------------------------------------
+model:
+  name: "vit_base_patch16_224"     # timm ViT-B/16 arch id (img_size overridden to 320x384)
+  arch: "medmae_vitb"
+  global_pool: "avg"               # fc_norm classifier — matches Medical-MAE fine-tune
+  pretrained: false                # weights come from checkpoint_path, not the timm hub
+  checkpoint_path: "/data/pretrained/vit-b_CXR_0.5M_mae_chexpert.pth"
+  checkpoint_kind: "chexpert"      # CheXpert-fine-tuned 5-class model (head KEPT)
+  keep_head: true                  # KEEP the 5-class head (warm start; assumes cfg.tasks order)
+
+# ----------------------------------------------------------------------------
+# Reproducibility  —  seed 42 (the canonical seed), held identical across all
+# three runs. deterministic stays inherited (true). Seeds head init + shuffling +
+# augmentation.
+# ----------------------------------------------------------------------------
+reproducibility:
+  seed: 42
+
+# ----------------------------------------------------------------------------
+# Resume  —  config-driven (null/'best'/'last'/<step>/<path>). null = fresh run.
+# ----------------------------------------------------------------------------
+resume: null
+
+# ----------------------------------------------------------------------------
+# Label policy  —  MIXED per-task uncertainty handling (identical to the seed arms).
+#   Atelectasis / Cardiomegaly / Edema / Pleural Effusion -> U-Ones (uncertain -> 1).
+#   Consolidation -> U-SelfTrained (uncertain TRAIN cells take a SOFT prob from
+#     selftrained_csv; val uncertain -> handled per val_ignore_uncertain).
+#   u_policy "mixed" is the engine's per-task entry point; with no multiclass task
+#   the head is 5 plain logits. selftrained_csv must sit next to the splits
+#   (/data/splits/01_train_softlabels.csv) before training.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"         # binary, uncertain -> 1
+    Cardiomegaly:     "ones"         # binary, uncertain -> 1
+    Consolidation:    "selftrained"  # binary, uncertain -> soft prob (train only)
+    Edema:            "ones"         # binary, uncertain -> 1
+    Pleural Effusion: "ones"         # binary, uncertain -> 1
+  selftrained_csv: "01_train_softlabels.csv"   # soft targets for the selftrained task (Consolidation)
+  val_ignore_uncertain: false
+
+# ----------------------------------------------------------------------------
+# CLAHE  —  OFF (held identical across every arm).
+# ----------------------------------------------------------------------------
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# DataLoader
+# ----------------------------------------------------------------------------
+dataloader:
+  batch_size:         64
+  num_workers:        22
+  pin_memory:         true
+  prefetch_factor:    3
+  persistent_workers: true
+  drop_last:          false
+  val_batch_size:         512
+  val_num_workers:        22
+  val_pin_memory:         true
+  val_prefetch_factor:    3
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  identical across arms.
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training  —  6 epochs; lr 1e-5 (10x lower — this backbone has already converged on
+# CheXpert, so this is a gentle polish, not a restart; watch for overfitting).
+# ----------------------------------------------------------------------------
+training:
+  epochs:        6
+  amp:           true
+  grad_clip:     1.0         # ViT fine-tunes are steadier with gradient clipping
+
+  optimizer:
+    lr:           1.0e-5
+    weight_decay: 1.0e-5
+    layer_decay:  0.75    # LLRD: per-block lr = lr * 0.75^(depth-from-top); null/omit -> uniform LR
+
+  scheduler:
+    name:        "cosine"
+    warmup_epochs: 1
+    min_lr:      1.0e-7
+    plateau_patience: 2
+
+  loss:
+    name: "bce_with_logits"
+    pos_weight: null
+    label_smoothing: 0.05
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 5
+
+# ----------------------------------------------------------------------------
+# Evaluation
+# ----------------------------------------------------------------------------
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 600
+  eval_schedule:
+    threshold_epoch: 2
+    before_steps: 1200
+    after_steps:  600
+
+# ----------------------------------------------------------------------------
+# Modal  —  A100-80GB so ViT-B/16 @320x384 (480 tokens) at batch 64 has headroom
+# (drop to "A100" + batch 32 to save cost). checkpoint lives on the data volume at
+# /data/pretrained (see modal_download_medmae.py).
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "A100-80GB"
+  cpu_cores: 16
+  memory_gb: 50
+  timeout_seconds: 28800
+  data_volume: "chexpert-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data"
+  runs_mount:  "/runs"
+  remote_data_root: "/data/CheXpert-v1.0-small"
+  remote_data_dir:  "/data/splits"
+  wandb_secret: "wandb-secret"
