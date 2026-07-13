@@ -50,7 +50,7 @@ reproducibility:
 # ----------------------------------------------------------------------------
 # Resume  —  config-driven (null/'best'/'last'/<step>/<path>). null = fresh run.
 # ----------------------------------------------------------------------------
-resume: null
+resume: 8100
 
 # ----------------------------------------------------------------------------
 # Label policy  —  MIXED per-task uncertainty handling (identical to the seed arms).
@@ -90,7 +90,7 @@ dataloader:
   prefetch_factor:    3
   persistent_workers: true
   drop_last:          false
-  val_batch_size:         512
+  val_batch_size:         1024
   val_num_workers:        22
   val_pin_memory:         true
   val_prefetch_factor:    3
@@ -150,12 +150,12 @@ evaluation:
     after_steps:  600
 
 # ----------------------------------------------------------------------------
-# Modal  —  A100-80GB so ViT-B/16 @320x384 (480 tokens) at batch 64 has headroom
-# (drop to "A100" + batch 32 to save cost). checkpoint lives on the data volume at
-# /data/pretrained (see modal_download_medmae.py).
+# Modal  —  A100-40GB ("A100"): ViT-B/16 @320x384 (480 tokens) batch 64 peaks ~12GB,
+# so 40GB is plenty. checkpoint lives on the data volume at /data/pretrained
+# (see modal_download_medmae.py).
 # ----------------------------------------------------------------------------
 modal:
-  gpu: "A100-80GB"
+  gpu: "A100"
   cpu_cores: 16
   memory_gb: 50
   timeout_seconds: 28800

@@ -86,6 +86,31 @@ reproducibility:
   deterministic: true
 
 # ----------------------------------------------------------------------------
+# Validation  —  extra subsets scored at EACH in-training validation, IN ADDITION
+# to the primary val_csv. REPORT-ONLY: they NEVER drive best.pt or early stopping
+# (those stay on val_csv, so the controlled comparison is unchanged). Each subset's
+# metrics are written to val_log.csv as "<name>_<metric>" columns and to W&B under
+# "<name>/...". Per subset:
+#   name   : short label used in the logs / prints
+#   csv    : split CSV under paths.data_dir (resolved like train_csv / val_csv)
+#   enable : turn a subset on/off without deleting the entry
+# Leave extra_subsets empty (or all enable:false) to restore the old single-val
+# behavior (schema then byte-identical to before).
+# ----------------------------------------------------------------------------
+validation:
+  # Which subset the BEST checkpoint + EARLY STOPPING track (training.early_stopping
+  # still picks the metric, e.g. val_mean_auroc — this picks the DATA it's read from):
+  #   "val"        : the primary 10% val_csv (default / previous behavior)
+  #   "<name>"     : one of the extra_subsets below (e.g. "valid200")
+  # A named subset must be enabled; if it's missing/disabled at runtime, best/early-
+  # stop fall back to "val" with a warning.
+  monitor_subset: "valid200"
+  extra_subsets:
+    - name: "valid200"
+      csv: "01_valid200.csv"       # official 200-study radiologist set
+      enable: true
+
+# ----------------------------------------------------------------------------
 # Weights & Biases  —  live metric visualization (same scores as the CSV logs;
 # NO system/GPU stats). Run name = experiment name. Needs WANDB_API_KEY as a
 # Modal secret (see modal.wandb_secret). enabled=false -> no tracking.

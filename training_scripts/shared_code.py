@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import csv
 import functools
+from collections import deque
 import json
 import math
 import random
@@ -735,6 +736,46 @@ def make_loaders(cfg: dict):
     return train_loader, val_loader
 
 
+def make_eval_loader(cfg: dict, csv_name: str) -> "DataLoader":
+    """Build a REPORT-ONLY eval DataLoader for an EXTRA validation subset (e.g. the
+    official valid200 set) scored alongside the primary val loader. Same val-split
+    preprocessing + labels as make_loaders' val loader, so scores are comparable.
+    Uses modest, NON-persistent workers (these subsets are small and only run at
+    validation, so we don't want a second pool of persistent workers competing with
+    the train loader for CPUs)."""
+    data_dir = Path(cfg["paths"]["data_dir"])
+    df = pd.read_csv(data_dir / csv_name)
+    ds = CheXpertDataset(df, cfg, split="val")
+    dl = cfg["dataloader"]
+    bs = int(dl.get("val_batch_size") or int(dl["batch_size"]))
+    nw = min(int(dl.get("val_num_workers", int(dl["num_workers"]))), 8)
+    kw = dict(num_workers=nw, pin_memory=bool(dl.get("val_pin_memory", dl["pin_memory"])),
+              worker_init_fn=seed_worker)
+    if nw > 0:
+        kw.update(prefetch_factor=dl.get("val_prefetch_factor", dl["prefetch_factor"]),
+                  persistent_workers=False)
+    return DataLoader(ds, batch_size=bs, shuffle=False, drop_last=False, **kw)
+
+
+def build_extra_val_loaders(cfg: dict) -> list:
+    """(name, loader) for every ENABLED validation.extra_subsets entry. Report-only
+    subsets scored at each in-training validation. A subset that fails to build (e.g.
+    a missing CSV) is skipped with a warning rather than crashing the run."""
+    out = []
+    for sub in (cfg.get("validation", {}) or {}).get("extra_subsets", []) or []:
+        if not sub.get("enable", True):
+            continue
+        name, csv_name = sub["name"], sub["csv"]
+        try:
+            ldr = make_eval_loader(cfg, csv_name)
+            out.append((name, ldr))
+            print(f"[extra-val] '{name}' <- {csv_name}: {len(ldr.dataset)} imgs, "
+                  f"{len(ldr)} batches (report-only)")
+        except Exception as e:
+            print(f"[extra-val] ⚠️  skipping '{name}' ({csv_name}): {type(e).__name__}: {e}")
+    return out
+
+
 def _build_train_loader(cfg: dict, train_df: pd.DataFrame):
     """Build a TRAIN dataset + DataLoader for `train_df`. Shared by the curriculum
     loaders so each phase honors the same train-only u_policy override,
@@ -1315,12 +1356,16 @@ def fmt_duration(seconds: float) -> str:
 
 def _flatten_val_row(epoch: int, gstep: int, val_loss: float, metrics: dict,
                      tasks: list, elapsed_sec: float, eta_sec: float,
-                     stage_tag: str = None) -> dict:
+                     stage_tag: str = None, extra: dict = None) -> dict:
     """Flatten validation metrics into one wide CSV row (macro + per-task). When a
     stage_tag is given (two-stage runs), a 'stage' column is added so the two
     stages' rows — stacked in the SAME val_log.csv — stay distinguishable. When it
     is None (every single-stage run) the column is omitted, so the schema is
-    byte-identical to before."""
+    byte-identical to before.
+
+    `extra` (report-only subsets, e.g. {"valid200": metrics}) appends prefixed
+    columns "<name>_<macrokey>" and "<name>_<key>/<task>" AFTER the primary columns.
+    Omitted/empty -> no extra columns, so the primary schema stays byte-identical."""
     row = {"step": gstep, "epoch": epoch}
     if stage_tag is not None:
         row["stage"] = stage_tag
@@ -1335,6 +1380,15 @@ def _flatten_val_row(epoch: int, gstep: int, val_loss: float, metrics: dict,
                     "n_pos", "n_excluded"):
             val = m[key]
             row[f"{key}/{t}"] = round(val, 6) if isinstance(val, float) else val
+    for name, em in (extra or {}).items():
+        for k, v in em["macro"].items():
+            row[f"{name}_{k}"] = round(v, 6)
+        for t in tasks:
+            m = em["per_task"][t]
+            for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity",
+                        "n_pos", "n_excluded"):
+                val = m[key]
+                row[f"{name}_{key}/{t}"] = round(val, 6) if isinstance(val, float) else val
     return row
 
 
@@ -1678,13 +1732,34 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
               f"({skip_batches // accum}/{opt_steps_per_epoch} optimizer steps) — "
               f"training continues at micro-batch {skip_batches + 1}.")
 
-    win_imgs, win_t0 = 0, time.time()    # images + wall-clock of the current window
-    for i, (imgs, labels) in enumerate(loader, start=1):
+    win_imgs, win_t0 = 0, time.time()    # images + COMPUTE wall-clock of the current window
+    # Throughput bookkeeping — TWO numbers so a data-loading (Modal volume) stall
+    # can't hide behind the compute number:
+    #   compute img/s : win_imgs / GPU-side time only (the existing figure).
+    #   real img/s    : images / FULL wall INCLUDING the time blocked in next()
+    #                   waiting for the DataLoader, averaged over the last 20 steps.
+    #   data-wait %   : share of that wall spent waiting for data. High => data-bound.
+    # next() is timed explicitly (not via `for`) so eval/checkpoint time BETWEEN
+    # steps is never miscounted as data wait.
+    roll = deque(maxlen=20)              # (imgs, wall_incl_data, data_wait) per opt step
+    win_data, win_first_data = 0.0, 0.0  # fetch-wait: window total, and the first micro's
+    _loader_it = iter(loader)
+    i = 0
+    while True:
+        _t_fetch = time.time()
+        try:
+            imgs, labels = next(_loader_it)
+        except StopIteration:
+            break
+        data_dt = time.time() - _t_fetch    # PURE time blocked waiting for THIS batch
+        i += 1
         ep_micro = i + skip_batches      # 1-indexed MICRO-batch number within the epoch
         # Start of a new accumulation window -> clear grads + start the window timer.
         if (ep_micro - 1) % accum == 0:
             optimizer.zero_grad(set_to_none=True)
             win_imgs, win_t0 = 0, time.time()
+            win_data, win_first_data = 0.0, data_dt
+        win_data += data_dt
         imgs = prepare_batch(imgs, cfg, device, channels_last)   # to GPU + (uint8) normalize
         labels = labels.to(device, non_blocking=True)
 
@@ -1721,8 +1796,22 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         global_step += 1
         ep_step = math.ceil(ep_micro / accum)    # 1-indexed OPTIMIZER step within epoch
         is_first = (ep_step == 1)
-        dt = time.time() - win_t0                # wall-clock for the whole effective batch
+        dt = time.time() - win_t0                # COMPUTE wall-clock of the effective batch
+        wall = win_first_data + dt               # + time blocked waiting for data
+        roll.append((win_imgs, wall, win_data))
+        r_imgs = sum(x[0] for x in roll)
+        r_wall = sum(x[1] for x in roll)
+        r_data = sum(x[2] for x in roll)
+        true_imgs_per_s = r_imgs / r_wall if r_wall > 0 else 0.0   # incl. data wait, 20-step
+        data_wait_pct = 100.0 * r_data / r_wall if r_wall > 0 else 0.0
         lr = optimizer.param_groups[0]["lr"]
+        # With LLRD the param groups span a RANGE of LRs; show BOTH ends — head
+        # (highest = base lr) and embed (lowest = base*decay^depth). Collapses to a
+        # single number when every group shares one LR (no LLRD).
+        _lrs = [g["lr"] for g in optimizer.param_groups]
+        lr_min, lr_max = min(_lrs), max(_lrs)
+        lr_str = (f"lr={lr_max:.4e}" if lr_min == lr_max
+                  else f"lr[head={lr_max:.3e} embed={lr_min:.3e}]")
         imgs_per_s = win_imgs / dt if dt > 0 else 0.0
         el = elapsed_fn()
         eta = eta_fn(global_step)
@@ -1735,6 +1824,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             "train_loss": round(loss.item(), 6),
             "lr": lr, "grad_norm": round(float(grad_norm), 6),
             "imgs_per_s": round(imgs_per_s, 1), "sec_per_step": round(dt, 4),
+            "true_imgs_per_s": round(true_imgs_per_s, 1),
+            "data_wait_pct": round(data_wait_pct, 1),
         })
         _safe("train_log", train_logger.log, train_row)
         if global_step % console_log_every == 0 or is_first:
@@ -1750,15 +1841,18 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
             print("─" * 70)                         # thin continuous separator
             print(f"  Epoch {epoch + 1}/{n_epochs}{phase_tag}  epoch_step: {ep_step}/{opt_steps_per_epoch}  "
                   f"global_step: {global_step}/{total_steps}")
-            print(f"     loss={cur_loss:.4f}{d_loss}  lr={lr:.4e}  gnorm={float(grad_norm):.2f}  "
-                  f"{imgs_per_s:.0f} img/s  elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}"
-                  f"{_gpu_mem_report(device)}")
+            print(f"     loss={cur_loss:.4f}{d_loss}  {lr_str}  gnorm={float(grad_norm):.2f}  "
+                  f"elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}{_gpu_mem_report(device)}")
+            print(f"     throughput: {imgs_per_s:.0f} img/s compute | {true_imgs_per_s:.0f} img/s real "
+                  f"(20-step) | data-wait {data_wait_pct:.0f}%")
 
         if log_fn is not None and (global_step % wandb_log_every == 0 or is_first):
             _safe("wandb", log_fn, {
                 f"{wandb_prefix}train/loss": loss.item(), f"{wandb_prefix}train/lr": lr,
                 f"{wandb_prefix}train/grad_norm": float(grad_norm),
                 f"{wandb_prefix}train/imgs_per_s": imgs_per_s,
+                f"{wandb_prefix}train/true_imgs_per_s": true_imgs_per_s,
+                f"{wandb_prefix}train/data_wait_pct": data_wait_pct,
             }, global_step + wandb_step_offset)
 
         if debug_dir is not None and debug_every > 0 and global_step % debug_every == 0:
@@ -1895,6 +1989,10 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
               f"(early-stop). combined step budget = {curr_total_steps}")
     else:
         train_loader, val_loader = make_loaders(cfg)
+    # Extra report-only validation subsets (e.g. valid200), scored at each in-training
+    # validation but never affecting best.pt / early stopping. Empty for runs whose
+    # config has no (enabled) validation.extra_subsets.
+    extra_val_loaders = build_extra_val_loaders(cfg)
     model = model.to(device)
     print_model_summary(model, cfg)
 
@@ -1972,6 +2070,9 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     es = cfg["training"]["early_stopping"]
     es_enable, es_patience = es["enable"], int(es["patience"])
     monitor = es.get("monitor", "val_mean_auroc")     # which metric drives best + early-stop
+    # which SUBSET that metric is read from: "val" (primary 10% val_csv) or an extra
+    # subset name (e.g. "valid200"). Report-only extras stay report-only unless named.
+    monitor_subset = (cfg.get("validation", {}) or {}).get("monitor_subset", "val")
     mode = es.get("mode", "max")                       # "max" | "min"
     better = (lambda a, b: a > b) if mode == "max" else (lambda a, b: a < b)
     summary_path = results_dir / out.get("summary_json", "training_summary.json")
@@ -2100,13 +2201,47 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         print(f"🔎 {_stg}VALIDATION START — epoch {epoch + 1}/{epochs}  step {gstep}  "
               f"({len(val_loader)} batches, {len(val_loader.dataset)} images) ...")
         val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device, amp, channels_last)
+        # Extra report-only subsets (e.g. valid200): score each, keep metrics for the
+        # log row / print / W&B. These NEVER touch `current` / best / early stopping.
+        extra, extra_loss, _failed = {}, {}, []
+        for _entry in extra_val_loaders:
+            _name, _ldr = _entry
+            try:
+                extra_loss[_name], extra[_name] = validate(
+                    model, _ldr, loss_fn, cfg, device, amp, channels_last)
+            except Exception as e:
+                # e.g. that subset's images aren't on the volume — disable it for the
+                # rest of the run (don't crash training over a report-only extra).
+                print(f"     ⚠️  [extra-val '{_name}'] disabled after error: "
+                      f"{type(e).__name__}: {e}")
+                _failed.append(_entry)
+        for _entry in _failed:
+            extra_val_loaders.remove(_entry)
         macro = metrics["macro"]
-        current = _monitor_value(macro, val_loss, monitor)
+        # Which subset drives best.pt + early stopping: "val" (primary 10% val_csv) or
+        # an extra subset's name (e.g. "valid200"). A named-but-unavailable subset
+        # (disabled/missing) falls back to the primary val with a warning.
+        if monitor_subset != "val" and monitor_subset in extra:
+            current = _monitor_value(extra[monitor_subset]["macro"],
+                                     extra_loss[monitor_subset], monitor)
+            mon_src = monitor_subset
+        else:
+            if monitor_subset != "val" and monitor_subset not in extra:
+                print(f"     ⚠️  monitor_subset '{monitor_subset}' unavailable — best/"
+                      f"early-stop falling back to primary val")
+            current = _monitor_value(macro, val_loss, monitor)
+            mon_src = "val"
+        # Seed the monitored source's remembered best from track["best"] BEFORE it is
+        # updated below, so on a RESUME its ⭐/⚠️ label stays in lock-step with best.pt
+        # (fresh run: track["best"] is +/-inf -> not seeded -> first val is a NEW BEST).
+        bbs = track.setdefault("best_by_src", {})
+        if mon_src not in bbs and math.isfinite(track["best"]):
+            bbs[mon_src] = track["best"]
         track["last_monitor"] = current
         track["last_step"] = gstep
         _safe("val_log", val_logger.log,
               _flatten_val_row(epoch + 1, gstep, val_loss, metrics,
-                               cfg["tasks"], elapsed(), eta(gstep), stage_tag))
+                               cfg["tasks"], elapsed(), eta(gstep), stage_tag, extra=extra))
 
         d_val_loss = _fmt_delta(val_loss, track["prev_val_loss"])   # vs last validation
         print("-" * 70)
@@ -2132,6 +2267,12 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             excl_str = f"  excl={n_excl}" if n_excl else ""   # uncertain rows dropped (multiclass)
             print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
                   f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']}{excl_str})")
+        for _name, _em in extra.items():             # report-only subsets (e.g. valid200)
+            _emac = _em["macro"]
+            print(f"     📈 [{_name}] mean AUROC={_emac['mean_auroc']:.4f}  "
+                  f"mean AUPRC={_emac['mean_auprc']:.4f}  F1={_emac['mean_f1']:.4f}  "
+                  f"P={_emac['mean_precision']:.4f}  R={_emac['mean_recall']:.4f}  "
+                  f"(report-only, {len(_em['per_task'])} tasks)")
         track["prev_macro"] = dict(macro)            # baseline for next validation
         track["prev_per_task"] = {t: dict(metrics["per_task"][t]) for t in cfg["tasks"]}
         track["prev_val_loss"] = val_loss
@@ -2155,16 +2296,36 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                 pm = metrics["per_task"][t]
                 for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity"):
                     wb[f"{wandb_prefix}val/{key}/{t}"] = pm[key]
+            for _name, _em in extra.items():          # report-only subsets under "<name>/..."
+                wb.update({f"{wandb_prefix}{_name}/{k}": v for k, v in _em["macro"].items()})
+                for t in cfg["tasks"]:
+                    pmt = _em["per_task"][t]
+                    for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity"):
+                        wb[f"{wandb_prefix}{_name}/{key}/{t}"] = pmt[key]
             _safe("wandb", log_fn, wb, gstep + wandb_offset)
         if persist_fn is not None:        # e.g. Modal volume.commit() -> live updates
             _safe("persist", persist_fn)
-        if is_best:
-            gain = current - prev_best if math.isfinite(prev_best) else current
-            sign = "+" if mode == "max" else ""
-            print(f"     ⭐ NEW BEST {monitor}={current:.4f} ({sign}{gain:.4f})  💾 saved best.pt")
-        else:
-            print(f"     ⚠️  no improvement ({track['no_improve']}/{es_patience})  "
-                  f"best {monitor}={track['best']:.4f}")
+        # Per-source ⭐/⚠️ status: the primary val AND every extra subset (e.g.
+        # valid200), each vs its OWN running best (bbs, seeded above). Only mon_src
+        # drives best.pt + early stopping.
+        mon_vals = {"val": _monitor_value(macro, val_loss, monitor)}
+        for _n in extra:
+            mon_vals[_n] = _monitor_value(extra[_n]["macro"], extra_loss[_n], monitor)
+        sign = "+" if mode == "max" else ""
+        for src in ["val"] + list(extra.keys()):
+            v = mon_vals[src]
+            prev = bbs.get(src)
+            improved = prev is None or better(v, prev)
+            if improved:
+                bbs[src] = v
+            drives = "  (drives best.pt + early-stop)" if src == mon_src else ""
+            if improved:
+                g = (v - prev) if (prev is not None and math.isfinite(prev)) else v
+                saved = "  💾 saved best.pt" if (src == mon_src and is_best) else ""
+                print(f"     ⭐ [{src}] NEW BEST {monitor}={v:.4f} ({sign}{g:.4f}){drives}{saved}")
+            else:
+                cnt = f" ({track['no_improve']}/{es_patience})" if src == mon_src else ""
+                print(f"     ⚠️  [{src}] no improvement{cnt}  best {monitor}={bbs[src]:.4f}{drives}")
         print("-" * 70)
 
         # track["allow_stop"] is set False during curriculum Phase A so those
