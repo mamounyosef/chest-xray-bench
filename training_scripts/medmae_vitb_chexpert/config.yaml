@@ -91,7 +91,7 @@ dataloader:
   prefetch_factor:    3
   persistent_workers: true
   drop_last:          false
-  val_batch_size:         1024
+  val_batch_size:         512
   val_num_workers:        22
   val_pin_memory:         true
   val_prefetch_factor:    3
@@ -135,7 +135,7 @@ training:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 5
+    patience: 9
 
 # ----------------------------------------------------------------------------
 # Evaluation
@@ -144,11 +144,11 @@ evaluation:
   metric: "mean_auroc"
   eval_level: "image"
   eval_every_epochs: null
-  eval_every_steps: 600
+  eval_every_steps: 500
   eval_schedule:
     threshold_epoch: 2
-    before_steps: 1200
-    after_steps:  600
+    before_steps: 500
+    after_steps:  500
 
 # ----------------------------------------------------------------------------
 # Modal  —  A100-40GB ("A100"): ViT-B/16 @320x384 (480 tokens) batch 64 peaks ~12GB,
@@ -158,7 +158,7 @@ evaluation:
 modal:
   gpu: "A100"
   cpu_cores: 16
-  memory_gb: 50
+  memory_gb: 40
   timeout_seconds: 28800
   data_volume: "chexpert-data"
   runs_volume: "chexpert-runs"

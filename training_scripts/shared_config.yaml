@@ -137,6 +137,6 @@ output:
   summary_json:    "training_summary.json"   # best-so-far metrics snapshot (live)
   console_capture_dir: "train_config"
   console_log_every: 20
-  checkpoint_every_steps: 300
-  keep_last_n: 35
+  checkpoint_every_steps: 200
+  keep_last_n: 40
   # keep_last_n lives in each experiment's config.yaml (output: keep_last_n)

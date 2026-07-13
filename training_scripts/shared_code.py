@@ -1589,6 +1589,57 @@ def validate(model, val_loader, loss_fn, cfg, device, amp: bool,
     return val_loss, metrics
 
 
+def _print_eval_block(name: str, n_imgs: int, vloss: float, metrics: dict, tasks: list):
+    """Print one subset's validation result (macro + per-task), same layout/metrics
+    as the in-training validation print."""
+    macro = metrics["macro"]
+    print("=" * 70)
+    print(f"📊 [{name}]  {n_imgs} images  val_loss={vloss:.4f}")
+    print(f"   mean AUROC={macro['mean_auroc']:.4f}  mean AUPRC={macro['mean_auprc']:.4f}  "
+          f"F1={macro['mean_f1']:.4f}  P={macro['mean_precision']:.4f}  "
+          f"R={macro['mean_recall']:.4f}  Spec={macro['mean_specificity']:.4f}")
+    for t in tasks:
+        m = metrics["per_task"][t]
+        n_excl = m.get("n_excluded", 0)
+        excl = f"  excl={n_excl}" if n_excl else ""
+        print(f"      {t:<18} AUROC={m['auroc']:.4f}  AUPRC={m['auprc']:.4f}  "
+              f"(pos={m['n_pos']}{excl})")
+    print("=" * 70)
+
+
+def evaluate_baseline(cfg: dict, model: nn.Module, out_dir=None, device=None,
+                      amp: bool = False, persist_fn=None) -> dict:
+    """Score an ALREADY-BUILT model (no training, no checkpoint load of a run's own
+    weights) on the primary val (paths.val_csv) AND every enabled
+    validation.extra_subsets (e.g. valid200), using the exact same data layer +
+    metrics as in-training validation. Prints macro + per-task per subset and, if
+    out_dir is given, writes pretrained_baseline.json there. AUROC/AUPRC are
+    threshold-free (the meaningful numbers here); F1/precision/recall/specificity are
+    at the default 0.5 threshold (no calibration)."""
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device).eval()
+    loss_fn = build_loss(cfg, device)
+    subsets = [("val", make_eval_loader(cfg, cfg["paths"]["val_csv"]))]
+    subsets += build_extra_val_loaders(cfg)          # valid200 etc.
+    results = {}
+    for name, loader in subsets:
+        vloss, metrics = validate(model, loader, loss_fn, cfg, device, amp,
+                                  channels_last=False)
+        results[name] = {"n_images": len(loader.dataset), "val_loss": vloss,
+                         "macro": dict(metrics["macro"]),
+                         "per_task": {t: dict(metrics["per_task"][t]) for t in cfg["tasks"]}}
+        _print_eval_block(name, len(loader.dataset), vloss, metrics, cfg["tasks"])
+    if out_dir is not None:
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        fp = out / "pretrained_baseline.json"
+        fp.write_text(json.dumps(results, indent=2, default=float), encoding="utf-8")
+        print(f"[saved] {fp}")
+        if persist_fn is not None:
+            persist_fn()
+    return results
+
+
 def _unwrap(model):
     """The underlying module behind a torch.compile wrapper (or the model itself),
     so checkpoints always use plain (un-prefixed) state-dict keys."""
@@ -2267,15 +2318,38 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             excl_str = f"  excl={n_excl}" if n_excl else ""   # uncertain rows dropped (multiclass)
             print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
                   f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']}{excl_str})")
-        for _name, _em in extra.items():             # report-only subsets (e.g. valid200)
+        # Extra subsets (e.g. valid200): SAME macro + per-task print as the primary
+        # val above, each with deltas vs that subset's OWN previous validation.
+        prev_extra = track.get("prev_extra") or {}
+        for _name, _em in extra.items():
             _emac = _em["macro"]
-            print(f"     📈 [{_name}] mean AUROC={_emac['mean_auroc']:.4f}  "
-                  f"mean AUPRC={_emac['mean_auprc']:.4f}  F1={_emac['mean_f1']:.4f}  "
-                  f"P={_emac['mean_precision']:.4f}  R={_emac['mean_recall']:.4f}  "
-                  f"(report-only, {len(_em['per_task'])} tasks)")
+            _pe = prev_extra.get(_name)
+            _pem = _pe["macro"] if _pe else None
+            def _de(k, _emac=_emac, _pem=_pem):      # delta vs this subset's last validation
+                return _fmt_delta(_emac[k], _pem[k] if _pem else None)
+            print("     " + "· · · · · · · · · ·  extra validation subset(s)  · · · · · · · · · ·")
+            print(f"     📈 [{_name}] mean AUROC={_emac['mean_auroc']:.4f}{_de('mean_auroc')}  "
+                  f"mean AUPRC={_emac['mean_auprc']:.4f}{_de('mean_auprc')}  "
+                  f"F1={_emac['mean_f1']:.4f}{_de('mean_f1')}  "
+                  f"P={_emac['mean_precision']:.4f}{_de('mean_precision')}  "
+                  f"R={_emac['mean_recall']:.4f}{_de('mean_recall')}  "
+                  f"Spec={_emac['mean_specificity']:.4f}{_de('mean_specificity')}")
+            _ppt = _pe["per_task"] if _pe else None
+            for t in cfg["tasks"]:
+                m = _em["per_task"][t]
+                pt = _ppt.get(t) if _ppt else None
+                d_auroc = _fmt_delta(m['auroc'], pt['auroc'] if pt is not None else None)
+                d_auprc = _fmt_delta(m['auprc'], pt['auprc'] if pt is not None else None)
+                n_excl = m.get('n_excluded', 0)
+                excl_str = f"  excl={n_excl}" if n_excl else ""
+                print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
+                      f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']}{excl_str})")
         track["prev_macro"] = dict(macro)            # baseline for next validation
         track["prev_per_task"] = {t: dict(metrics["per_task"][t]) for t in cfg["tasks"]}
         track["prev_val_loss"] = val_loss
+        track["prev_extra"] = {n: {"macro": dict(e["macro"]),
+                                   "per_task": {t: dict(e["per_task"][t]) for t in cfg["tasks"]}}
+                               for n, e in extra.items()}
 
         prev_best = track["best"]
         is_best = better(current, track["best"])
@@ -2306,26 +2380,30 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         if persist_fn is not None:        # e.g. Modal volume.commit() -> live updates
             _safe("persist", persist_fn)
         # Per-source ⭐/⚠️ status: the primary val AND every extra subset (e.g.
-        # valid200), each vs its OWN running best (bbs, seeded above). Only mon_src
-        # drives best.pt + early stopping.
+        # valid200), each vs its OWN running best (bbs, seeded above), so each gets its
+        # OWN ⭐/⚠️ independently. Only mon_src drives best.pt + early stopping — it is
+        # the ONLY line that shows the patience counter and the 💾 save marker.
         mon_vals = {"val": _monitor_value(macro, val_loss, monitor)}
         for _n in extra:
             mon_vals[_n] = _monitor_value(extra[_n]["macro"], extra_loss[_n], monitor)
         sign = "+" if mode == "max" else ""
+        _w = max(len(s) for s in (["val"] + list(extra.keys())))   # align the [src] labels
+        print("     " + "· · · · · · · · · ·  best / early-stop  · · · · · · · · · ·")
         for src in ["val"] + list(extra.keys()):
             v = mon_vals[src]
             prev = bbs.get(src)
             improved = prev is None or better(v, prev)
             if improved:
                 bbs[src] = v
-            drives = "  (drives best.pt + early-stop)" if src == mon_src else ""
+            drives = "   ← drives best.pt + early-stop" if src == mon_src else ""
+            label = f"[{src:<{_w}}]"
             if improved:
                 g = (v - prev) if (prev is not None and math.isfinite(prev)) else v
-                saved = "  💾 saved best.pt" if (src == mon_src and is_best) else ""
-                print(f"     ⭐ [{src}] NEW BEST {monitor}={v:.4f} ({sign}{g:.4f}){drives}{saved}")
+                saved = "   💾 saved best.pt" if (src == mon_src and is_best) else ""
+                print(f"     ⭐ {label} NEW BEST  {monitor}={v:.4f} ({sign}{g:.4f}){saved}{drives}")
             else:
-                cnt = f" ({track['no_improve']}/{es_patience})" if src == mon_src else ""
-                print(f"     ⚠️  [{src}] no improvement{cnt}  best {monitor}={bbs[src]:.4f}{drives}")
+                cnt = f"  ({track['no_improve']}/{es_patience})" if src == mon_src else ""
+                print(f"     ⚠️  {label} no improvement  best {monitor}={bbs[src]:.4f}{cnt}{drives}")
         print("-" * 70)
 
         # track["allow_stop"] is set False during curriculum Phase A so those
