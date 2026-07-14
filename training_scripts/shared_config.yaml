@@ -137,6 +137,15 @@ output:
   summary_json:    "training_summary.json"   # best-so-far metrics snapshot (live)
   console_capture_dir: "train_config"
   console_log_every: 20
-  checkpoint_every_steps: 200
-  keep_last_n: 40
+  checkpoint_every_steps: 200          # flat fallback / used when checkpoint_schedule is absent
+  # Phased periodic-checkpoint cadence (same shape as evaluation.eval_schedule): checkpoint
+  # COARSELY early (model still clearly improving) and FINELY later. threshold_epoch is
+  # 1-indexed & INCLUSIVE — epochs before it use before_steps, that epoch onward use
+  # after_steps. Comment this block out (or delete it) to fall back to the flat
+  # checkpoint_every_steps above.
+  checkpoint_schedule:
+    threshold_epoch: 2
+    before_steps: 400                  # epoch 1: rolling checkpoint every 400 steps
+    after_steps:  200                  # epoch 2 onward: every 200 steps
+  keep_last_n: 55
   # keep_last_n lives in each experiment's config.yaml (output: keep_last_n)

@@ -1053,6 +1053,18 @@ def build_optimizer(model: nn.Module, cfg: dict, loss_fn=None) -> optim.Optimize
     raise ValueError(f"unknown optimizer: {name!r}")
 
 
+def _warmup_steps_for(cfg: dict, steps_per_epoch: int, total_steps: int) -> int:
+    """Resolve the cosine scheduler's warmup length in OPTIMIZER steps.
+    `warmup_steps` (absolute) wins if set; else `warmup_epochs`*steps_per_epoch.
+    Clamped to [0, total_steps-1] so the cosine phase always has >=1 step."""
+    s = cfg["training"]["scheduler"]
+    if s.get("warmup_steps") is not None:
+        w = int(s["warmup_steps"])
+    else:
+        w = int(round(float(s.get("warmup_epochs", 0)) * steps_per_epoch))
+    return max(0, min(w, max(1, int(total_steps)) - 1))
+
+
 def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int,
                     total_steps_override: int = None):
     """Build the LR scheduler. Returns (scheduler_or_None, mode):
@@ -1060,10 +1072,13 @@ def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int,
         mode == "plateau" -> step once per validation with the monitored metric
         mode is None      -> no scheduler
 
-    cosine: linear warmup over `warmup_epochs` (expressed in STEPS) from
-    `warmup_start_factor`*lr up to lr, then cosine-anneal down to `min_lr` across
-    the remaining steps. Stepping per step gives a smooth ramp + decay (not the
-    once-per-epoch staircase that left the LR pinned during warmup)."""
+    cosine: linear warmup from `warmup_start_factor`*lr up to lr, then cosine-anneal
+    down to `min_lr` across the remaining steps. The warmup length is `warmup_steps`
+    if set (an ABSOLUTE step count, e.g. 200 — the right knob for a resolution-stage
+    jump, independent of that stage's epoch length), else `warmup_epochs`*steps_per_
+    epoch. Stepping per step gives a smooth ramp + decay (not the once-per-epoch
+    staircase that left the LR pinned during warmup). With LLRD the LinearLR ramp
+    scales every param group's own lr, so each layer warms up proportionally."""
     s = cfg["training"]["scheduler"]
     name = s["name"].lower()
     epochs = cfg["training"]["epochs"]
@@ -1076,7 +1091,7 @@ def build_scheduler(optimizer: optim.Optimizer, cfg: dict, steps_per_epoch: int,
     if name == "none":
         return None, None
     if name == "cosine":
-        warmup_steps = int(round(float(s.get("warmup_epochs", 0)) * steps_per_epoch))
+        warmup_steps = _warmup_steps_for(cfg, steps_per_epoch, total_steps)
         min_lr = s.get("min_lr", 0.0)
         start_factor = float(s.get("warmup_start_factor", 0.01))   # ~0 -> base lr
         cosine = optim.lr_scheduler.CosineAnnealingLR(
@@ -1475,8 +1490,9 @@ def print_config(cfg: dict):
     print("  --- training -----------------------------------------------------")
     print(f"  epochs            : {tr['epochs']}")
     print(f"  optimizer         : AdamW  lr={opt['lr']:.4e}  weight_decay={opt['weight_decay']}")
-    print(f"  scheduler         : {sch['name']}  warmup_epochs={sch.get('warmup_epochs')}  "
-          f"min_lr={sch.get('min_lr')}")
+    _warm = (f"warmup_steps={sch.get('warmup_steps')}" if sch.get("warmup_steps") is not None
+             else f"warmup_epochs={sch.get('warmup_epochs')}")
+    print(f"  scheduler         : {sch['name']}  {_warm}  min_lr={sch.get('min_lr')}")
     _loss_desc = "mixed per-task (BCE + 3-class CE, summed)" if _lay["mixed"] else loss["name"]
     print(f"  loss              : {_loss_desc}  pos_weight={loss.get('pos_weight')}")
     print(f"  amp               : {tr['amp']}  grad_clip={tr['grad_clip']}")
@@ -1500,6 +1516,13 @@ def print_config(cfg: dict):
     print(f"  seed              : {rep['seed']}  deterministic={rep['deterministic']}")
     print(f"  checkpointing     : periodic every {out.get('checkpoint_every_steps', 0)} steps "
           f"(0=off) + best.pt at validation")
+    _csched = out.get("checkpoint_schedule")
+    if _csched:
+        _cthr = int(_csched["threshold_epoch"])
+        _cbef = _csched.get("before_steps", out.get("checkpoint_every_steps", 0))
+        _caft = _csched.get("after_steps", out.get("checkpoint_every_steps", 0))
+        print(f"  ckpt schedule     : every {_cbef} steps before epoch {_cthr}, "
+              f"every {_caft} steps from epoch {_cthr} on (inclusive)")
     print(f"  keep_last_n ckpts : {out['keep_last_n']}  best_name={out['best_name']}")
     print(f"  run_dir           : {out['run_dir']}  "
           f"(logs: {out['train_log_csv']}, {out['val_log_csv']})")
@@ -1749,7 +1772,8 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                     checkpoint_fn=None, checkpoint_every: int = 0,
                     scheduler=None, n_epochs: int = 0, skip_batches: int = 0,
                     stage_tag: str = None, wandb_prefix: str = "",
-                    phase: str = None, wandb_step_offset: int = 0) -> tuple:
+                    phase: str = None, wandb_step_offset: int = 0,
+                    warmup_steps: int = 0) -> tuple:
     """One epoch of training. Logs every step (loss/lr/grad_norm/throughput/elapsed/eta)
     and fires `on_eval(epoch, step)` every eval_every_steps. Returns (global_step, stop).
 
@@ -1863,6 +1887,15 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
         lr_min, lr_max = min(_lrs), max(_lrs)
         lr_str = (f"lr={lr_max:.4e}" if lr_min == lr_max
                   else f"lr[head={lr_max:.3e} embed={lr_min:.3e}]")
+        # Warmup boundary markers (only meaningful on a fresh schedule: global_step
+        # counts up from 0, so step 1 is warmup start and warmup_steps its last step).
+        if warmup_steps > 0:
+            if global_step == 1:
+                print(f"🔥 [warmup] STARTED — linear LR ramp over {warmup_steps} "
+                      f"steps to base; {lr_str}")
+            elif global_step == warmup_steps:
+                print(f"✅ [warmup] COMPLETE at step {warmup_steps} — base LR reached "
+                      f"({lr_str}); cosine decay begins next step")
         imgs_per_s = win_imgs / dt if dt > 0 else 0.0
         el = elapsed_fn()
         eta = eta_fn(global_step)
@@ -1940,6 +1973,28 @@ def _resolve_eval_every_steps(cfg: dict, epoch: int):
     thr = int(sched["threshold_epoch"])               # 1-indexed, inclusive
     before = sched.get("before_steps", base)
     after = sched.get("after_steps", base)
+    return after if (epoch + 1) >= thr else before
+
+
+def _resolve_checkpoint_every_steps(cfg: dict, epoch: int) -> int:
+    """Effective periodic-checkpoint cadence (steps) for a 0-indexed `epoch`. Default
+    is the flat output.checkpoint_every_steps. If output.checkpoint_schedule is
+    present, the cadence is PHASED by epoch exactly like eval_schedule — coarse early
+    (the model is clearly still improving, few checkpoints worth keeping) and finer
+    later:
+        epochs BEFORE threshold_epoch     -> checkpoint every `before_steps`
+        epoch threshold_epoch and onward  -> checkpoint every `after_steps`
+    threshold_epoch is 1-indexed and INCLUSIVE (threshold_epoch=2 => epochs 2+ use
+    after_steps; epoch 1 uses before_steps). Missing before_/after_steps fall back to
+    the flat checkpoint_every_steps. No schedule -> unchanged behavior."""
+    out = cfg["output"]
+    base = int(out.get("checkpoint_every_steps", 0) or 0)
+    sched = out.get("checkpoint_schedule")
+    if not sched:
+        return base
+    thr = int(sched["threshold_epoch"])               # 1-indexed, inclusive
+    before = int(sched.get("before_steps", base) or 0)
+    after = int(sched.get("after_steps", base) or 0)
     return after if (epoch + 1) >= thr else before
 
 
@@ -2098,12 +2153,14 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     if use_curriculum:
         scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=warmup_ref_spe,
                                                 total_steps_override=curr_total_steps)
+        warmup_steps = _warmup_steps_for(cfg, warmup_ref_spe, curr_total_steps)
     else:
         # steps_per_epoch is in OPTIMIZER steps so the cosine/warmup span matches the
         # effective-batch step budget when gradient accumulation is on.
         _accum = max(1, int(cfg["training"].get("grad_accum_steps", 1)))
-        scheduler, sched_mode = build_scheduler(
-            optimizer, cfg, steps_per_epoch=math.ceil(len(train_loader) / _accum))
+        _spe = math.ceil(len(train_loader) / _accum)
+        scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=_spe)
+        warmup_steps = _warmup_steps_for(cfg, _spe, epochs * _spe)
     amp = bool(cfg["training"]["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=amp)
     _opt_name = str(cfg["training"]["optimizer"].get("name", "adamw")).upper()
@@ -2112,6 +2169,27 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
           f"{' (mode=' + perf.get('compile_mode', 'default') + ')' if do_compile else ''}"
           f"  fused_adamw={bool(perf.get('fused_optimizer')) and device.type == 'cuda'}"
           f"  tf32={tf32}")
+
+    # Resolution-stage + LR-warmup banner. For a staged resolution run (each stage is
+    # its OWN run at a different image size, warm-started from the prior stage), this
+    # makes the console self-describing: what resolution this stage trains at and how
+    # the LR ramps in before the cosine decay.
+    _img = cfg["image"]
+    _sch = cfg["training"]["scheduler"]
+    _base_lr = float(cfg["training"]["optimizer"]["lr"])
+    _min_lr = float(_sch.get("min_lr", 0.0))
+    _sf = float(_sch.get("warmup_start_factor", 0.01))
+    print("=" * 70)
+    print(f"🎬 RESOLUTION STAGE — input {_img['width']}x{_img['height']} (WxH)"
+          f"   [arch={cfg['model'].get('arch', cfg['model'].get('name'))}]")
+    if sched_mode == "step" and _sch["name"].lower() == "cosine" and warmup_steps > 0:
+        print(f"🔥 LR warmup: LINEAR over {warmup_steps} optimizer steps "
+              f"({_sf * 100:.1f}% → base), then cosine → min_lr")
+        print(f"   base_lr={_base_lr:.3e}   min_lr={_min_lr:.3e}"
+              f"   (LLRD: head=base, deeper layers lower)")
+    elif _sch["name"].lower() == "cosine":
+        print(f"   no warmup — cosine {_base_lr:.3e} → {_min_lr:.3e}")
+    print("=" * 70)
 
     # --- training params ---
     epochs = cfg["training"]["epochs"]
@@ -2170,10 +2248,19 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     run_start = time.time()
     console_log_every = int(out["console_log_every"])
     wandb_log_every = int(cfg.get("wandb", {}).get("log_every", 50))   # train-metric cadence
-    ckpt_every = int(out.get("checkpoint_every_steps", 0) or 0)         # periodic rolling ckpt
+    ckpt_every = int(out.get("checkpoint_every_steps", 0) or 0)         # periodic rolling ckpt (flat default)
     total_steps = curr_total_steps if use_curriculum else epochs * steps_per_epoch  # ETA denom (optimizer steps)
-    print(f"[checkpoint] periodic rolling checkpoint every "
-          f"{ckpt_every if ckpt_every > 0 else 'OFF'} steps; best.pt at validation")
+    _ckpt_sched = out.get("checkpoint_schedule")
+    if _ckpt_sched:
+        _cthr = int(_ckpt_sched["threshold_epoch"])
+        _cbef = int(_ckpt_sched.get("before_steps", ckpt_every) or 0)
+        _caft = int(_ckpt_sched.get("after_steps", ckpt_every) or 0)
+        print(f"[checkpoint] periodic rolling checkpoint: every "
+              f"{_cbef if _cbef > 0 else 'OFF'} steps before epoch {_cthr}, every "
+              f"{_caft if _caft > 0 else 'OFF'} steps from epoch {_cthr} on; best.pt at validation")
+    else:
+        print(f"[checkpoint] periodic rolling checkpoint every "
+              f"{ckpt_every if ckpt_every > 0 else 'OFF'} steps; best.pt at validation")
 
     # debug-image saving (assurance that preprocessing/augmentation look right)
     _dbg = cfg.get("debug", {})
@@ -2454,17 +2541,20 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         # (evaluation.eval_schedule splits coarse early vs fine later; absent ->
         # the flat ev_steps, so existing runs are unchanged).
         ev_steps_epoch = _resolve_eval_every_steps(cfg, epoch)
+        # phased periodic-checkpoint cadence, same idea (output.checkpoint_schedule;
+        # absent -> the flat ckpt_every, so existing runs are unchanged).
+        ckpt_every_epoch = _resolve_checkpoint_every_steps(cfg, epoch)
         global_step, stop = train_one_epoch(
             model, cur_loader, optimizer, loss_fn, scaler, device,
             epoch, global_step, train_logger, amp, grad_clip, ev_steps_epoch, on_eval,
             console_log_every, elapsed, eta, total_steps, log_fn, wandb_log_every,
             cfg=cfg, debug_dir=debug_dir, debug_every=debug_every,
             channels_last=channels_last,
-            checkpoint_fn=save_periodic, checkpoint_every=ckpt_every,
+            checkpoint_fn=save_periodic, checkpoint_every=ckpt_every_epoch,
             scheduler=(scheduler if sched_mode == "step" else None),
             n_epochs=epochs, skip_batches=skip,
             stage_tag=stage_tag, wandb_prefix=wandb_prefix, phase=phase,
-            wandb_step_offset=wandb_offset)
+            wandb_step_offset=wandb_offset, warmup_steps=warmup_steps)
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
             stop = on_eval(epoch, global_step)
