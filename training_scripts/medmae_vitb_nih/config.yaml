@@ -135,7 +135,7 @@ training:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 11
+    patience: 10
 
 # ----------------------------------------------------------------------------
 # Evaluation

@@ -33,6 +33,19 @@ STAGE2_RUNS = {
     "convnext_base_22k_final_stage2_pleural_effusion",
 }
 
+# the five per-class "_only" runs each train a SINGLE task, so each one's
+# valid200_results.json macro mean_auroc IS just that one class's AUROC. Listing
+# them individually isn't comparable to the full 5-task runs, so they are collapsed
+# into ONE combined row = the mean over the five single-class AUROCs (computed here,
+# directly from each run's results — no separate aggregate file needed).
+PER_CLASS_ONLY_RUNS = {
+    "convnext_base_22k_atelectasis_only",
+    "convnext_base_22k_cardiomegaly_only",
+    "convnext_base_22k_consolidation_only",
+    "convnext_base_22k_edema_only",
+    "convnext_base_22k_pleural_effusion_only",
+}
+
 
 def _run_auroc(run_dir: Path):
     """mean AUROC for one run from its <SET>_results.json (or None if missing)."""
@@ -56,10 +69,24 @@ def _stage2_combined():
         return None
 
 
+def _per_class_only_combined():
+    """combined mean AUROC over the 5 per-class '_only' runs, averaged straight from
+    each run's <SET>_results.json. Returns (mean, n_found) — averaging over whichever
+    of the five have results (None if none do)."""
+    vals = []
+    for name in PER_CLASS_ONLY_RUNS:
+        a = _run_auroc(RUNS_DIR / name)
+        if a is not None:
+            vals.append(a)
+    if not vals:
+        return None, 0
+    return sum(vals) / len(vals), len(vals)
+
+
 def main():
     rows = []                                    # (name, auroc)
     for run_dir in sorted(p for p in RUNS_DIR.iterdir() if p.is_dir()):
-        if run_dir.name in STAGE2_RUNS:
+        if run_dir.name in STAGE2_RUNS or run_dir.name in PER_CLASS_ONLY_RUNS:
             continue                             # collapsed below, not listed here
         auroc = _run_auroc(run_dir)
         if auroc is not None:
@@ -68,6 +95,10 @@ def main():
     s2 = _stage2_combined()
     if s2 is not None:
         rows.append(("final_stage2 (mean of 5 per-disease models)", s2))
+
+    pc, n_pc = _per_class_only_combined()
+    if pc is not None:
+        rows.append((f"per_class_only (mean of {n_pc} single-class models)", pc))
 
     rows.sort(key=lambda r: r[1], reverse=True)  # best first
 

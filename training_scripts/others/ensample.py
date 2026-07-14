@@ -41,19 +41,21 @@ BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each ru
 
 # Modal container compute for the ensemble run (None -> inherit the reference run's
 # modal.cpu_cores / modal.memory_gb). These size what `modal` allocates.
-CPU_CORES = None        # requested CPU cores for the Modal container
+CPU_CORES = 10        # requested CPU cores for the Modal container
 MEMORY_GB = None        # requested RAM in GB for the Modal container
 
 # DataLoader knobs applied to EVERY member's inference pass (None -> that run's own
 # dataloader.val_* value). Raise NUM_WORKERS toward CPU_CORES to speed up decoding.
-NUM_WORKERS     = None   # DataLoader workers per member
-PREFETCH_FACTOR = None   # batches prefetched per worker (only used when workers > 0)
+NUM_WORKERS     = 14   # DataLoader workers per member
+PREFETCH_FACTOR = 3   # batches prefetched per worker (only used when workers > 0)
 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
     "convnext_base_22k_1600x1312",
     "convnext_base_22k_768x640",
     "convnext_base_22k_final_stage1",
+    "medmae_vitb_nih",
+    # "medmae_vitb_raw",
     # "convnext_base_22k_seed1337",
     # "convnext_base_22k_seed7",
 ]
@@ -133,6 +135,12 @@ def build_model_generic(cfg: dict):
     import torchvision
     name = cfg["model"]["name"]
     n = sc.num_output_logits(cfg)
+    # Medical-MAE ViT runs (model.arch == "medmae_vitb") are NOT plain timm ViTs:
+    # they use global_pool='avg' (fc_norm head) at this run's img_size (non-square
+    # pos-embed). Build them EXACTLY as train.py does so best.pt loads; pretrained=
+    # False -> best.pt supplies the weights (no Google-Drive checkpoint reload).
+    if cfg["model"].get("arch") == "medmae_vitb":
+        return sc.build_medmae_vit(cfg, load_pretrained=False)
     if "." in name:                                  # timm id (e.g. convnext_base.fb_in22k...)
         return timm.create_model(name, pretrained=False, num_classes=n)
     low = name.lower()

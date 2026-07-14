@@ -1,0 +1,134 @@
+# =============================================================================
+# config.yaml  —  experiment: medmae_vitb_nih_A_768_s2
+#   RUN A, STAGE 2 (FINAL) of the 2-stage high-res continue of medmae_vitb_nih.
+#       Stage 1 : 512x432   (medmae_vitb_nih_A_512_s1)
+#       Stage 2 (THIS run): 768x640   <- final resolution
+# -----------------------------------------------------------------------------
+# WARM-START from Stage 1's best.pt (KEEP the 5-class head). build_medmae_vit
+# resamples the absolute pos_embed from Stage 1's 32x27 grid to this stage's 48x40
+# grid (768/16 x 640/16 = 48x40 = 1920 tokens). resume stays null -> fresh 200-step
+# linear warmup then cosine at the jump. RUN THIS ONLY AFTER Stage 1 has produced
+# /runs/medmae_vitb_nih_A_512_s1/results/checkpoints/best.pt.
+# -----------------------------------------------------------------------------
+# DATA = NATIVE full-res tree (chexpert-native-data). Holds only what VARIES per
+# experiment; common settings come from ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "medmae_vitb_nih_A_768_s2"
+
+model:
+  name: "vit_base_patch16_224"
+  arch: "medmae_vitb"
+  global_pool: "avg"
+  pretrained: false
+  checkpoint_path: "/runs/medmae_vitb_nih_A_512_s1/results/checkpoints/best.pt"
+  checkpoint_kind: "chexpert_run"  # Stage-1 (512x432) best.pt
+  keep_head: true                  # KEEP the head trained through Stage 1
+
+reproducibility:
+  seed: 42
+
+resume: null
+
+labels:
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"
+    Cardiomegaly:     "ones"
+    Consolidation:    "selftrained"
+    Edema:            "ones"
+    Pleural Effusion: "ones"
+  selftrained_csv: "01_train_softlabels.csv"
+  val_ignore_uncertain: false
+
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# Image geometry  —  FINAL resolution 768x640 (48x40 patch grid, 1920 tokens).
+# ----------------------------------------------------------------------------
+image:
+  width:  768
+  height: 640
+
+# ----------------------------------------------------------------------------
+# DataLoader  —  1920 tokens/image is ~16x the attention cost of 384x320; batch 64
+# on H200 (141GB) with no grad accumulation. prefetch trimmed to 2.
+# ----------------------------------------------------------------------------
+dataloader:
+  batch_size:         64
+  num_workers:        22
+  pin_memory:         true
+  prefetch_factor:    2
+  persistent_workers: true
+  drop_last:          false
+  val_batch_size:         256
+  val_num_workers:        22
+  val_pin_memory:         true
+  val_prefetch_factor:    2
+  val_persistent_workers: true
+
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training  —  RUN A LR: 3.0e-5 -> 3.0e-7 (1%), LLRD 0.75, 200-step warmup at the
+# jump, then cosine. Stage 2 = 3 epochs (Run A total 4 = 1 @512 + 3 @768).
+# ----------------------------------------------------------------------------
+training:
+  epochs:        3
+  amp:           true
+  grad_clip:     1.0
+
+  optimizer:
+    lr:           1.0e-5
+    weight_decay: 1.0e-5
+    layer_decay:  0.75
+
+  scheduler:
+    name:        "cosine"
+    warmup_steps: 400
+    warmup_start_factor: 0.1   # begin warmup at 10% of base 
+    min_lr:      1.0e-7        # 1% of lr (multi-epoch stage)
+    plateau_patience: 2
+
+  loss:
+    name: "bce_with_logits"
+    pos_weight: null
+    label_smoothing: 0.05
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 11
+
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 500
+
+paths:
+  path_remap:
+    from: "CheXpert-v1.0-small"
+    to:   "CheXpert-v1.0"
+
+modal:
+  gpu: "H200"
+  cpu_cores: 12
+  memory_gb: 96
+  timeout_seconds: 43200
+  data_volume: "chexpert-native-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data_native"
+  runs_mount:  "/runs"
+  remote_data_root: "/data_native/CheXpert-v1.0"
+  remote_data_dir:  "/data_native/splits"
+  wandb_secret: "wandb-secret"

@@ -1,0 +1,133 @@
+# =============================================================================
+# config.yaml  —  experiment: medmae_vitb_nih_B_448_s1
+#   RUN B, STAGE 1 of a 2-stage "from-scratch ramp" to 768x640. Run B does NOT
+#   reuse Run A's converged head — it starts from the NIH-finetuned BACKBONE with a
+#   FRESH 5-class head and ramps resolution in two stages:
+#       Stage 1 (THIS run): 448x384   (fresh head stabilizes here first)
+#       Stage 2           : 768x640   (medmae_vitb_nih_B_768_s2)
+# -----------------------------------------------------------------------------
+# WARM-START from the Medical-MAE NIH-ChestX-ray14 backbone (same checkpoint
+# medmae_vitb_nih started from), 14-class NIH head DROPPED for a FRESH 5-class head
+# (keep_head:false). build_medmae_vit resamples the absolute pos_embed from the
+# ckpt's 14x14 grid to this stage's 28x24 grid (448/16 x 384/16 = 28x24 = 672
+# tokens). resume null -> fresh 200-step warmup then cosine. The nih14 checkpoint
+# must be on the NATIVE volume at /data_native/pretrained/ (modal_download_medmae.py).
+# -----------------------------------------------------------------------------
+# DATA = NATIVE full-res tree. Holds only what VARIES; common settings from
+# ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "medmae_vitb_nih_B_448_s1"
+
+model:
+  name: "vit_base_patch16_224"
+  arch: "medmae_vitb"
+  global_pool: "avg"
+  pretrained: false
+  checkpoint_path: "/data_native/pretrained/vit-b_CXR_0.5M_mae_nih14.pth"
+  checkpoint_kind: "nih14"         # NIH ChestX-ray14 backbone (14-class head dropped)
+  keep_head: false                 # FRESH 5-class head (from-scratch ramp)
+
+reproducibility:
+  seed: 42
+
+resume: null
+
+labels:
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"
+    Cardiomegaly:     "ones"
+    Consolidation:    "selftrained"
+    Edema:            "ones"
+    Pleural Effusion: "ones"
+  selftrained_csv: "01_train_softlabels.csv"
+  val_ignore_uncertain: false
+
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# Image geometry  —  STAGE-1 resolution 448x384 (28x24 patch grid, 672 tokens).
+# ----------------------------------------------------------------------------
+image:
+  width:  448
+  height: 384
+
+dataloader:
+  batch_size:         64
+  num_workers:        22
+  pin_memory:         true
+  prefetch_factor:    2
+  persistent_workers: true
+  drop_last:          false
+  val_batch_size:         256
+  val_num_workers:        22
+  val_pin_memory:         true
+  val_prefetch_factor:    2
+  val_persistent_workers: true
+
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training  —  RUN B LR: 5.0e-5 -> 5.0e-7 (1%), LLRD 0.75 (identical base LR to
+# medmae_vitb_nih). 200-step warmup then cosine. Stage 1 = 1 epoch (Run B split
+# 1 @448 + 5 @768).
+# ----------------------------------------------------------------------------
+training:
+  epochs:        1
+  amp:           true
+  grad_clip:     1.0
+
+  optimizer:
+    lr:           5.0e-5
+    weight_decay: 1.0e-5
+    layer_decay:  0.75
+
+  scheduler:
+    name:        "cosine"
+    warmup_steps: 400        # absolute-step linear warmup (from ~0 -> base) at the jump
+    min_lr:      1.0e-5      # 20% of lr — short 1-epoch stage, don't decay to near-zero
+    plateau_patience: 2
+
+  loss:
+    name: "bce_with_logits"
+    pos_weight: null
+    label_smoothing: 0.05
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 11
+
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 500
+
+paths:
+  path_remap:
+    from: "CheXpert-v1.0-small"
+    to:   "CheXpert-v1.0"
+
+modal:
+  gpu: "A100-80GB"
+  cpu_cores: 12
+  memory_gb: 96
+  timeout_seconds: 43200
+  data_volume: "chexpert-native-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data_native"
+  runs_mount:  "/runs"
+  remote_data_root: "/data_native/CheXpert-v1.0"
+  remote_data_dir:  "/data_native/splits"
+  wandb_secret: "wandb-secret"
