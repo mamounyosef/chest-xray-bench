@@ -1,0 +1,23 @@
+{
+  "experiment": "medmae_vitb_nih",
+  "status": "running",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8891737270171326,
+  "best_step": 7800,
+  "best_epoch": 3,
+  "best_metrics": {
+    "mean_auroc": 0.8085187504490803,
+    "mean_auprc": 0.6131574089045975,
+    "mean_f1": 0.4592039175789672,
+    "mean_precision": 0.6628987530580512,
+    "mean_recall": 0.4261892519994676,
+    "mean_specificity": 0.910760776892662,
+    "val_loss": 0.4298929996016138
+  },
+  "last_step": 13500,
+  "total_steps": 16122,
+  "elapsed_sec": 4266.42,
+  "elapsed_human": "1h 11m",
+  "updated": "2026-07-13T19:44:41"
+}

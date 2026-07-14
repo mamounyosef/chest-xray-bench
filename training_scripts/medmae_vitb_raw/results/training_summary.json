@@ -1,0 +1,23 @@
+{
+  "experiment": "medmae_vitb_raw",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8805184647903038,
+  "best_step": 7800,
+  "best_epoch": 3,
+  "best_metrics": {
+    "mean_auroc": 0.8065319786808697,
+    "mean_auprc": 0.6112911969449929,
+    "mean_f1": 0.45117583058530536,
+    "mean_precision": 0.7457663163205526,
+    "mean_recall": 0.41466355126482457,
+    "mean_specificity": 0.9159134587202328,
+    "val_loss": 0.4316031191611165
+  },
+  "last_step": 13000,
+  "total_steps": 16122,
+  "elapsed_sec": 3807.75,
+  "elapsed_human": "1h 03m",
+  "updated": "2026-07-13T19:32:49"
+}

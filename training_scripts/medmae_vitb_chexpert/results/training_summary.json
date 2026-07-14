@@ -1,0 +1,23 @@
+{
+  "experiment": "medmae_vitb_chexpert",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8789585093740309,
+  "best_step": 9000,
+  "best_epoch": 4,
+  "best_metrics": {
+    "mean_auroc": 0.8160682582383358,
+    "mean_auprc": 0.6275800352692409,
+    "mean_f1": 0.48167210077673667,
+    "mean_precision": 0.6844026179701782,
+    "mean_recall": 0.42882442503208684,
+    "mean_specificity": 0.9179688187250408,
+    "val_loss": 0.4205477932173544
+  },
+  "last_step": 13500,
+  "total_steps": 16122,
+  "elapsed_sec": 3856.26,
+  "elapsed_human": "1h 04m",
+  "updated": "2026-07-13T20:43:26"
+}
