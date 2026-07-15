@@ -41,13 +41,13 @@ BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each ru
 
 # Modal container compute for the ensemble run (None -> inherit the reference run's
 # modal.cpu_cores / modal.memory_gb). These size what `modal` allocates.
-CPU_CORES = 10        # requested CPU cores for the Modal container
+CPU_CORES = 14        # requested CPU cores for the Modal container
 MEMORY_GB = None        # requested RAM in GB for the Modal container
 
 # DataLoader knobs applied to EVERY member's inference pass (None -> that run's own
 # dataloader.val_* value). Raise NUM_WORKERS toward CPU_CORES to speed up decoding.
-NUM_WORKERS     = 14   # DataLoader workers per member
-PREFETCH_FACTOR = 3   # batches prefetched per worker (only used when workers > 0)
+NUM_WORKERS     = 24   # DataLoader workers per member
+PREFETCH_FACTOR = 4   # batches prefetched per worker (only used when workers > 0)
 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
@@ -55,6 +55,7 @@ FULL_MODELS = [
     "convnext_base_22k_768x640",
     "convnext_base_22k_final_stage1",
     "medmae_vitb_nih",
+    "medmae_vitb_nih_B_768_s2",
     # "medmae_vitb_raw",
     # "convnext_base_22k_seed1337",
     # "convnext_base_22k_seed7",
@@ -77,6 +78,8 @@ CKPT_SUBPATH = {
 CHECKPOINT_MEMBERS = [
     {"run": "convnext_base_22k_1600x1312", "checkpoint": 7500},
     {"run": "convnext_base_22k_1600x1312", "checkpoint": 8700},
+    {"run": "medmae_vitb_nih", "checkpoint": 7500},
+    {"run": "medmae_vitb_nih_B_768_s2", "checkpoint": 4400},
 ]
 
 # Per-class thresholds for the F1/precision/recall/specificity of the ENSEMBLE come
