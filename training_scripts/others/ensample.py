@@ -32,7 +32,7 @@ from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
-SET    = "valid200"      # scored split — "valid200" or "test500"
+SET    = "test500"      # scored split — "valid200" or "test500"
 GPU    = "B200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each run's
