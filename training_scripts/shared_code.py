@@ -3035,7 +3035,29 @@ def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
             _vlines(ax, bsteps)
             ax.set_xlabel("global step"); ax.set_ylabel(col)
             ax.set_title(f"{name} — {title}"); ax.grid(True, alpha=0.3)
+            # A tick at EVERY validation/checkpoint step so each point's global step is
+            # readable off the axis. Labels rotated + shrunk to stay legible; when there
+            # are very many points, thin the LABELS (keep all tick marks) so they don't
+            # overlap into an unreadable smear.
+            xs = val_df["step"].values
+            ax.set_xticks(xs)
+            stride = max(1, int(math.ceil(len(xs) / 40)))
+            labels = [str(int(s)) if i % stride == 0 else "" for i, s in enumerate(xs)]
+            ax.set_xticklabels(labels, rotation=90, fontsize=6)
             _save(fig, fname)
+
+        # 2b) extra report-only subsets (e.g. valid200): a SEPARATE mean-AUROC plot
+        # per subset, exactly like mean_auroc.png. Subset names are recovered from any
+        # "<name>_mean_auroc" column present in the CSV, so a subset is plotted ONLY
+        # when it was actually scored in this run — a run without valid200 draws nothing.
+        def _plot_extra_macro_auroc():
+            if val_df is None:
+                return
+            for col in val_df.columns:
+                if col.endswith("_mean_auroc") and col != "mean_auroc":
+                    sub = col[: -len("_mean_auroc")]
+                    _plot_macro_metric(col, f"validation mean AUROC [{sub}]",
+                                       f"{sub}_mean_auroc.png", "max")
 
         # 4/5) per-task curves (one line per pathology) for a given metric prefix.
         # Discover EVERY "{prefix}/<task>" column present, rather than only those whose
@@ -3110,6 +3132,7 @@ def make_plots(cfg: dict, results_dir, out_subdir: str = "plots",
               "mean_auroc", "validation mean AUROC", "mean_auroc.png", "max")
         _safe("plot:mean_auprc", _plot_macro_metric,
               "mean_auprc", "validation mean AUPRC", "mean_auprc.png", "max")
+        _safe("plot:extra_mean_auroc", _plot_extra_macro_auroc)
         _safe("plot:per_task_auroc", _plot_per_task, "auroc", "per-task AUROC", "per_task_auroc.png")
         _safe("plot:per_task_auprc", _plot_per_task, "auprc", "per-task AUPRC", "per_task_auprc.png")
         _safe("plot:macro_fpr", _plot_macro_fpr)
