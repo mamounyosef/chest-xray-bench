@@ -29,7 +29,7 @@ model:
 reproducibility:
   seed: 42
 
-resume: null
+resume: 6000
 
 labels:
   u_policy: "mixed"
@@ -56,15 +56,15 @@ image:
 
 dataloader:
   batch_size:         64
-  num_workers:        22
+  num_workers:        30
   pin_memory:         true
-  prefetch_factor:    2
+  prefetch_factor:    4
   persistent_workers: true
   drop_last:          false
-  val_batch_size:         256
-  val_num_workers:        22
+  val_batch_size:         512
+  val_num_workers:        24
   val_pin_memory:         true
-  val_prefetch_factor:    2
+  val_prefetch_factor:    4
   val_persistent_workers: true
 
 performance:
@@ -78,21 +78,21 @@ performance:
 # jump, then cosine. Stage 2 = 5 epochs (Run B split 1 @448 + 5 @768).
 # ----------------------------------------------------------------------------
 training:
-  epochs:        5
+  epochs:        8
   amp:           true
   grad_clip:     1.0
 
   optimizer:
-    lr:           3.0e-5
+    lr:           5.0e-5
     weight_decay: 1.0e-5
     layer_decay:  0.75
 
   scheduler:
     name:        "cosine"
-    warmup_steps: 400
-    warmup_start_factor: 0.1   # begin warmup at 10% of base 
-    
-    min_lr:      3.0e-7        # 1% of lr (multi-epoch stage)
+    warmup_steps: 600
+    warmup_start_factor: 0.01   # begin warmup at 1% of base 
+
+    min_lr:      5.0e-7        # 1% of lr (multi-epoch stage)
     plateau_patience: 2
 
   loss:
@@ -104,7 +104,7 @@ training:
     enable:   true
     monitor:  "val_mean_auroc"
     mode:     "max"
-    patience: 11
+    patience: 15
 
 evaluation:
   metric: "mean_auroc"
@@ -118,9 +118,9 @@ paths:
     to:   "CheXpert-v1.0"
 
 modal:
-  gpu: "H200"
-  cpu_cores: 12
-  memory_gb: 96
+  gpu: "A100-80GB"
+  cpu_cores: 24
+  memory_gb: 45
   timeout_seconds: 43200
   data_volume: "chexpert-native-data"
   runs_volume: "chexpert-runs"

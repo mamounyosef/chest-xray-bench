@@ -145,7 +145,7 @@ output:
   # checkpoint_every_steps above.
   checkpoint_schedule:
     threshold_epoch: 2
-    before_steps: 400                  # epoch 1: rolling checkpoint every 400 steps
+    before_steps: 200                  # epoch 1: rolling checkpoint every 400 steps
     after_steps:  200                  # epoch 2 onward: every 200 steps
-  keep_last_n: 55
+  keep_last_n: 60
   # keep_last_n lives in each experiment's config.yaml (output: keep_last_n)

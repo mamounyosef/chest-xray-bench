@@ -23,6 +23,7 @@ import json
 import math
 import random
 import sys
+import io
 import time
 from datetime import datetime
 from pathlib import Path
@@ -311,11 +312,25 @@ def build_medmae_vit(cfg: dict, load_pretrained: bool = False) -> nn.Module:
         sd.pop("head.weight", None)
         sd.pop("head.bias", None)
 
-    # Resample absolute position embedding to this model's patch grid.
+    # Resample absolute position embedding to this model's patch grid. The SOURCE
+    # grid may be NON-SQUARE (warm-starting from a prior stage/run trained at e.g.
+    # 384x320 -> 20x24, or 512x432 -> 27x32): timm's resample infers a SQUARE old grid
+    # from the token count when old_size is None, which fails for non-square sources
+    # (sqrt(480) is not an integer). Our run checkpoints save the full cfg, so recover
+    # the true source grid from cfg['image']; the original Medical-MAE .pth files
+    # (224x224, square, no saved cfg) fall back to timm's square inference (old_size=None).
     if "pos_embed" in sd and sd["pos_embed"].shape != model.pos_embed.shape:
         gh, gw = model.patch_embed.grid_size
+        old_size = None
+        src_img = (ckpt.get("cfg") or {}).get("image") if isinstance(ckpt, dict) else None
+        if src_img:
+            ph, pw = model.patch_embed.patch_size
+            old_size = (int(src_img["height"]) // ph, int(src_img["width"]) // pw)
+            print(f"   [pos_embed] source grid {old_size[0]}x{old_size[1]} "
+                  f"(from ckpt cfg) -> {gh}x{gw}")
         sd["pos_embed"] = resample_abs_pos_embed(
-            sd["pos_embed"], new_size=(gh, gw), num_prefix_tokens=1, verbose=True)
+            sd["pos_embed"], new_size=(gh, gw), old_size=old_size,
+            num_prefix_tokens=1, verbose=True)
 
     missing, unexpected = model.load_state_dict(sd, strict=False)
     # A backbone-block key going missing would mean an architecture mismatch, not the
@@ -465,6 +480,22 @@ def build_train_transforms(cfg: dict):
     return T.Compose(ops) if ops else None
 
 
+# Shared cross-worker counters isolating RAW IMAGE RETRIEVAL (the volume byte-read)
+# from decode/transform. Created at import (before DataLoader fork on Linux/Modal), so
+# every worker increments the SAME counters. The training loop snapshots them each
+# print to report retrieval img/s, MB/s, and avg per-file latency — telling us for
+# certain whether the bottleneck is fetching bytes off the volume vs. GPU/decode.
+import multiprocessing as _mp
+_RETR_NS    = _mp.Value("q", 0)   # summed read time across workers (nanoseconds)
+_RETR_BYTES = _mp.Value("q", 0)   # summed bytes read
+_RETR_IMGS  = _mp.Value("q", 0)   # images read
+
+
+def _retr_snapshot():
+    """(imgs, bytes, ns) current totals — cheap, lock-free read of the raw ints."""
+    return _RETR_IMGS.value, _RETR_BYTES.value, _RETR_NS.value
+
+
 def preprocess(rel: str, cfg: dict, use_clahe: bool = False,
                train_transforms=None, clahe=None) -> torch.Tensor:
     """One image: grayscale -> [CLAHE] -> resize_pad -> tensor -> [augment] ->
@@ -483,7 +514,16 @@ def preprocess(rel: str, cfg: dict, use_clahe: bool = False,
     if path is None:
         raise FileNotFoundError(f"image not found for relative path: {rel}")
 
-    img = np.asarray(Image.open(path).convert("L"))                 # grayscale uint8
+    # Time ONLY the raw byte retrieval (open+read off the volume) — the suspected
+    # bottleneck — separately from decode. Accumulate into the shared counters.
+    _t = time.perf_counter()
+    _raw = path.read_bytes()
+    _rd_ns = int((time.perf_counter() - _t) * 1e9)
+    with _RETR_NS.get_lock():
+        _RETR_NS.value += _rd_ns
+        _RETR_BYTES.value += len(_raw)
+        _RETR_IMGS.value += 1
+    img = np.asarray(Image.open(io.BytesIO(_raw)).convert("L"))      # grayscale uint8
     if use_clahe:
         if clahe is None:
             clahe = _get_clahe(cfg["clahe"]["clip_limit"], tuple(cfg["clahe"]["tile_grid"]))
@@ -1929,6 +1969,17 @@ def train_one_epoch(model, loader, optimizer, loss_fn, scaler, device,
                   f"elapsed={fmt_duration(el)}  ETA={fmt_duration(eta)}{_gpu_mem_report(device)}")
             print(f"     throughput: {imgs_per_s:.0f} img/s compute | {true_imgs_per_s:.0f} img/s real "
                   f"(20-step) | data-wait {data_wait_pct:.0f}%")
+            # Raw image-retrieval speed (volume byte-read only, all workers), over the
+            # window since the last print: img/s + MB/s are aggregate throughput; ms/img
+            # is the average PER-FILE read latency. If retrieval img/s ~= real img/s and
+            # data-wait is high, fetching bytes off the volume IS the bottleneck.
+            _ri, _rb, _rns = _retr_snapshot()
+            _pi, _pb, _pns, _pel = getattr(train_one_epoch, "_retr_prev", (0, 0, 0, el))
+            d_i, d_b, d_ns, d_el = _ri - _pi, _rb - _pb, _rns - _pns, max(1e-6, el - _pel)
+            train_one_epoch._retr_prev = (_ri, _rb, _rns, el)
+            if d_i > 0:
+                print(f"     retrieval:  {d_i / d_el:.0f} img/s | {d_b / 1e6 / d_el:.0f} MB/s "
+                      f"| {d_ns / 1e6 / d_i:.1f} ms/img avg read (volume)")
 
         if log_fn is not None and (global_step % wandb_log_every == 0 or is_first):
             _safe("wandb", log_fn, {
@@ -2160,7 +2211,7 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         _accum = max(1, int(cfg["training"].get("grad_accum_steps", 1)))
         _spe = math.ceil(len(train_loader) / _accum)
         scheduler, sched_mode = build_scheduler(optimizer, cfg, steps_per_epoch=_spe)
-        warmup_steps = _warmup_steps_for(cfg, _spe, epochs * _spe)
+        warmup_steps = _warmup_steps_for(cfg, _spe, int(cfg["training"]["epochs"]) * _spe)
     amp = bool(cfg["training"]["amp"]) and device.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=amp)
     _opt_name = str(cfg["training"]["optimizer"].get("name", "adamw")).upper()

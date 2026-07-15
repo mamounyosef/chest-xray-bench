@@ -83,15 +83,15 @@ image:
 # ----------------------------------------------------------------------------
 dataloader:
   batch_size:         64
-  num_workers:        22
+  num_workers:        30
   pin_memory:         true
-  prefetch_factor:    2
+  prefetch_factor:    4
   persistent_workers: true
   drop_last:          false
   val_batch_size:         256
-  val_num_workers:        22
+  val_num_workers:        24
   val_pin_memory:         true
-  val_prefetch_factor:    2
+  val_prefetch_factor:    4
   val_persistent_workers: true
 
 performance:
@@ -135,7 +135,7 @@ evaluation:
   metric: "mean_auroc"
   eval_level: "image"
   eval_every_epochs: null
-  eval_every_steps: 500
+  eval_every_steps: 400
 
 # ----------------------------------------------------------------------------
 # Paths  —  reroute image FILE lookup to the NATIVE tree WITHOUT editing the CSVs
@@ -152,9 +152,9 @@ paths:
 # read from and this stage's best.pt is written for Stage 2.
 # ----------------------------------------------------------------------------
 modal:
-  gpu: "A100-80GB"
-  cpu_cores: 12
-  memory_gb: 96
+  gpu: "A100"
+  cpu_cores: 24
+  memory_gb: 50
   timeout_seconds: 43200
   data_volume: "chexpert-native-data"
   runs_volume: "chexpert-runs"

@@ -22,14 +22,14 @@ model:
   arch: "medmae_vitb"
   global_pool: "avg"
   pretrained: false
-  checkpoint_path: "/runs/medmae_vitb_nih_A_512_s1/results/checkpoints/best.pt"
+  checkpoint_path: "/data_native/pretrained/vit-b_CXR_0.5M_mae_nih14.pth"
   checkpoint_kind: "chexpert_run"  # Stage-1 (512x432) best.pt
   keep_head: true                  # KEEP the head trained through Stage 1
 
 reproducibility:
   seed: 42
 
-resume: null
+resume: 'best'
 
 labels:
   u_policy: "mixed"
@@ -60,15 +60,15 @@ image:
 # ----------------------------------------------------------------------------
 dataloader:
   batch_size:         64
-  num_workers:        22
+  num_workers:        30
   pin_memory:         true
-  prefetch_factor:    2
+  prefetch_factor:    4
   persistent_workers: true
   drop_last:          false
   val_batch_size:         256
-  val_num_workers:        22
+  val_num_workers:        24
   val_pin_memory:         true
-  val_prefetch_factor:    2
+  val_prefetch_factor:    4
   val_persistent_workers: true
 
 performance:
@@ -82,7 +82,7 @@ performance:
 # jump, then cosine. Stage 2 = 3 epochs (Run A total 4 = 1 @512 + 3 @768).
 # ----------------------------------------------------------------------------
 training:
-  epochs:        3
+  epochs:        5
   amp:           true
   grad_clip:     1.0
 
@@ -93,8 +93,8 @@ training:
 
   scheduler:
     name:        "cosine"
-    warmup_steps: 400
-    warmup_start_factor: 0.1   # begin warmup at 10% of base 
+    warmup_steps: 800
+    warmup_start_factor: 0.01   # begin warmup at 10% of base 
     min_lr:      1.0e-7        # 1% of lr (multi-epoch stage)
     plateau_patience: 2
 
@@ -121,9 +121,9 @@ paths:
     to:   "CheXpert-v1.0"
 
 modal:
-  gpu: "H200"
-  cpu_cores: 12
-  memory_gb: 96
+  gpu: "A100-80GB"
+  cpu_cores: 22
+  memory_gb: 50
   timeout_seconds: 43200
   data_volume: "chexpert-native-data"
   runs_volume: "chexpert-runs"

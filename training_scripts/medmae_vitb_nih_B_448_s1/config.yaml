@@ -59,15 +59,15 @@ image:
 
 dataloader:
   batch_size:         64
-  num_workers:        22
+  num_workers:        30
   pin_memory:         true
-  prefetch_factor:    2
+  prefetch_factor:    4
   persistent_workers: true
   drop_last:          false
-  val_batch_size:         256
-  val_num_workers:        22
+  val_batch_size:         512
+  val_num_workers:        24
   val_pin_memory:         true
-  val_prefetch_factor:    2
+  val_prefetch_factor:    4
   val_persistent_workers: true
 
 performance:
@@ -120,9 +120,9 @@ paths:
     to:   "CheXpert-v1.0"
 
 modal:
-  gpu: "A100-80GB"
-  cpu_cores: 12
-  memory_gb: 96
+  gpu: "A100"
+  cpu_cores: 22
+  memory_gb: 50
   timeout_seconds: 43200
   data_volume: "chexpert-native-data"
   runs_volume: "chexpert-runs"
