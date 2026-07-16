@@ -32,7 +32,7 @@ from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
-SET    = "test500"      # scored split — "valid200" or "test500"
+SET    = "valid200"      # scored split — "valid200" or "test500"
 GPU    = "B200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each run's
@@ -52,10 +52,11 @@ PREFETCH_FACTOR = 4   # batches prefetched per worker (only used when workers > 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
     "convnext_base_22k_1600x1312",
+    "medmae_vitb_nih_B_768_s2",
+    "medmae_vitb_nih",
     "convnext_base_22k_768x640",
     "convnext_base_22k_final_stage1",
-    "medmae_vitb_nih",
-    "medmae_vitb_nih_B_768_s2",
+
     # "medmae_vitb_raw",
     # "convnext_base_22k_seed1337",
     # "convnext_base_22k_seed7",
@@ -198,6 +199,243 @@ def _fetch_results_from_modal(runs_volume: str, remote_sub: str, local_base: Pat
     print(f"[fetch] modal volume get {runs_volume} {remote_posix} -> {dest_parent}")
     subprocess.run(cmd, check=True)
     print(f"[fetch] downloaded ensemble results -> {final_dir}")
+    return final_dir
+
+
+def _sync_cache_up(runs_volume: str, local_base: Path):
+    """Push the LOCAL others/ensemble_cache/ up to the runs volume BEFORE a Modal run,
+    so remote members reuse probs already computed on this PC. Uploading the folder to
+    the volume ROOT lands it at /ensemble_cache (dir basename), matching where the
+    remote reads/writes (/runs/ensemble_cache). --force overwrites unchanged dupes;
+    check=False so a first run (nothing to push) never aborts the ensemble."""
+    import subprocess
+    L = Path(local_base) / "ensemble_cache"
+    if not L.exists() or not any(L.rglob("*.npy")):
+        print("[cache-sync] up: no local ensemble_cache yet (skip)")
+        return
+    cmd = [sys.executable, "-m", "modal", "volume", "put", "--force",
+           runs_volume, str(L), "/"]
+    print(f"[cache-sync] up: {L} -> {runs_volume}:/ensemble_cache")
+    subprocess.run(cmd, check=False)
+
+
+def _sync_cache_down(runs_volume: str, local_base: Path):
+    """Pull the runs volume's /ensemble_cache/ back down to others/ensemble_cache/ AFTER
+    a Modal run, so members freshly computed on the GPU are cached on this PC too.
+    local_base already exists as a dir, so `get` maps entries under it (-> its
+    ensemble_cache/ subtree). check=False: an empty/absent remote cache isn't fatal."""
+    import subprocess
+    dest = Path(local_base)
+    dest.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-m", "modal", "volume", "get", "--force",
+           runs_volume, "ensemble_cache", str(dest)]
+    print(f"[cache-sync] down: {runs_volume}:/ensemble_cache -> {dest}")
+    subprocess.run(cmd, check=False)
+
+
+def _member_ckpt_stem(run: str, checkpoint=None):
+    """The checkpoint-file stem used in a member's cache name (f'{run}_{stem}'),
+    WITHOUT touching any volume. Returns None when it can't be known offline (e.g.
+    'last', which needs a directory listing) -> caller must then assume 'not cached'.
+    Mirrors ckpt_path_of + _predict_member's naming."""
+    sub = CKPT_SUBPATH.get(run, "best.pt")
+    if checkpoint is None or checkpoint == "best":
+        return Path(sub).stem
+    if isinstance(checkpoint, int) or (isinstance(checkpoint, str) and checkpoint.isdigit()):
+        return f"ckpt_step{int(checkpoint)}"
+    if isinstance(checkpoint, str) and checkpoint.endswith(".pt"):
+        return Path(checkpoint).stem
+    return None                                   # e.g. "last" -> undecidable offline
+
+
+def _expected_cache_names():
+    """(names, undecidable): the cache basenames every member of the CURRENT config
+    will look up, and whether any member's name can't be resolved offline."""
+    names, undecidable = [], False
+
+    def add(run, checkpoint=None):
+        nonlocal undecidable
+        stem = _member_ckpt_stem(run, checkpoint)
+        if stem is None:
+            undecidable = True
+        else:
+            names.append(f"{run}_{stem}")
+
+    for run in FULL_MODELS:
+        add(run)
+    for spec in CHECKPOINT_MEMBERS:
+        add(spec["run"], spec["checkpoint"])
+    if USE_STAGE2:
+        for run in STAGE2_GROUP.values():
+            add(run)
+    return names, undecidable
+
+
+def _members_all_cached(local_base: Path, set_name: str) -> bool:
+    """True iff EVERY member's probs (and the labels) are already cached locally for
+    `set_name` — so the Modal VM can run CPU-only (no GPU). Existence check only: the
+    remote still validates each cache against its checkpoint (mtime/size) and would
+    recompute a stale one on CPU. Any undecidable member -> False (play it safe)."""
+    names, undecidable = _expected_cache_names()
+    if undecidable or not names:
+        return False
+    cdir = Path(local_base) / "ensemble_cache" / set_name
+    needed = [f"{n}.npy" for n in names] + ["_y_true.npy"]
+    missing = [f for f in needed if not (cdir / f).exists()]
+    if missing:
+        print(f"[gpu] not all cached for {set_name} — missing: {missing}")
+    return not missing
+
+
+# --------------------- local "best" tracker (per SET) ----------------------
+# After every run the freshly written results folder is on local disk. We keep, PER
+# scored SET, ONE winning folder tagged with a set-qualified suffix " (best <set>)"
+# (e.g. "2026-07-15_17-09-13 (best test500)"). If the new run's ensemble mean AUROC
+# beats the current winner for THAT set, the old winner is demoted (suffix stripped)
+# and the new folder is promoted. valid200 and test500 keep INDEPENDENT winners,
+# distinguished by the set named in the suffix.
+import re as _re                                          # noqa: E402
+# matches a trailing "(best)" or "(best <set>)" marker on a folder name
+_BEST_RE = _re.compile(r"\s*\(best(?:\s+(?P<set>valid200|test500))?\)\s*$")
+
+
+def _strip_best(name: str) -> str:
+    """Folder name without any trailing '(best)'/'(best <set>)' marker."""
+    return _BEST_RE.sub("", name).rstrip()
+
+
+def _folder_mean_auroc(folder: Path, set_name: str):
+    """ensemble_mean_auroc for `set_name`, read from folder's summary json (or None)."""
+    import json
+    j = Path(folder) / f"ensemble_{set_name}_summary.json"
+    if not j.exists():
+        return None
+    try:
+        return float(json.loads(j.read_text(encoding="utf-8"))["ensemble_mean_auroc"])
+    except Exception:
+        return None
+
+
+def _rename_dir(d: Path, new_name: str) -> Path:
+    """Rename folder d -> its parent/new_name (no-op if unchanged; refuse to clobber)."""
+    tgt = d.parent / new_name
+    if tgt.resolve() == d.resolve():
+        return d
+    if tgt.exists():
+        print(f"[best] WARNING: '{tgt.name}' already exists — leaving '{d.name}' as-is")
+        return d
+    d.rename(tgt)
+    return tgt
+
+
+def _migrate_legacy_best(root: Path):
+    """Normalize any legacy bare '<ts> (best)' folder to the set-qualified
+    '<ts> (best <set>)', inferring <set> from whichever summary json it contains."""
+    for d in list(root.iterdir()):
+        if not d.is_dir():
+            continue
+        m = _BEST_RE.search(d.name)
+        if not m or m.group("set") is not None:          # only bare "(best)" (no set)
+            continue
+        base = _strip_best(d.name)
+        for s in ("valid200", "test500"):
+            if (d / f"ensemble_{s}_summary.json").exists():
+                print(f"[best] migrating legacy marker: '{d.name}' -> '{base} (best {s})'")
+                _rename_dir(d, f"{base} (best {s})")
+                break
+
+
+def _update_best_tracker(set_name: str, new_dir: Path):
+    """Promote new_dir to the '(best <set_name>)' winner IFF its ensemble mean AUROC
+    beats the current winner for THIS set. Independent tracker per set; also heals
+    any legacy bare '(best)' folder into the set-qualified form first."""
+    new_dir = Path(new_dir)
+    root = new_dir.parent                                 # others/ensembling_results
+    if not root.exists():
+        return
+    _migrate_legacy_best(root)
+
+    new_auroc = _folder_mean_auroc(new_dir, set_name)
+    if new_auroc is None:
+        print(f"[best] {set_name}: no ensemble_{set_name}_summary.json in "
+              f"'{new_dir.name}' — best tracker skipped")
+        return
+
+    # current winner for THIS set = a folder whose name ends in "(best <set_name>)"
+    cur_best, cur_auroc = None, None
+    for d in root.iterdir():
+        if not d.is_dir() or d.resolve() == new_dir.resolve():
+            continue
+        m = _BEST_RE.search(d.name)
+        if m and m.group("set") == set_name:
+            a = _folder_mean_auroc(d, set_name)
+            if a is not None and (cur_auroc is None or a > cur_auroc):
+                cur_best, cur_auroc = d, a
+
+    if cur_best is None:
+        p = _rename_dir(new_dir, f"{_strip_best(new_dir.name)} (best {set_name})")
+        print(f"[best] {set_name}: no previous best -> promoted '{p.name}' "
+              f"(AUROC={new_auroc:.4f})")
+    elif new_auroc > cur_auroc:
+        _rename_dir(cur_best, _strip_best(cur_best.name))          # demote old winner
+        p = _rename_dir(new_dir, f"{_strip_best(new_dir.name)} (best {set_name})")
+        print(f"[best] {set_name}: NEW BEST {new_auroc:.4f} > {cur_auroc:.4f} "
+              f"-> '{p.name}'  (demoted '{cur_best.name}')")
+    else:
+        print(f"[best] {set_name}: kept '{cur_best.name}' "
+              f"(best AUROC={cur_auroc:.4f} >= new {new_auroc:.4f})")
+
+
+# ------------------------ per-member prediction cache ----------------------
+# A member's (N, 5) PROBABILITY matrix depends only on (run cfg, checkpoint, SET) —
+# the run's cfg (geometry/CLAHE/u-policy) is fixed, so the cache key is just
+# ensemble_cache/<set>/<run>_<ckpt>.npy. This lets a re-run reuse a member's probs
+# instead of recomputing on the GPU. A sidecar .meta.json stores the checkpoint's
+# (mtime, size) + N, so a RETRAINED best.pt (or a different-sized split) auto-misses.
+def _cache_paths(cache_dir: Path, set_name: str, cache_name: str):
+    d = Path(cache_dir) / set_name
+    return d / f"{cache_name}.npy", d / f"{cache_name}.meta.json"
+
+
+def _load_cached(npy: Path, meta: Path, ckpt_path: Path, n: int):
+    import json
+    if not (npy.exists() and meta.exists()):
+        return None
+    try:
+        m = json.loads(meta.read_text(encoding="utf-8"))
+        st = Path(ckpt_path).stat()
+        if m.get("mtime") == int(st.st_mtime) and m.get("size") == st.st_size \
+                and m.get("n") == n:
+            return np.load(npy)
+    except Exception:
+        pass
+    return None
+
+
+def _save_cache(npy: Path, meta: Path, ckpt_path: Path, arr: np.ndarray):
+    import json
+    npy.parent.mkdir(parents=True, exist_ok=True)
+    np.save(npy, arr)
+    st = Path(ckpt_path).stat()
+    meta.write_text(json.dumps({"mtime": int(st.st_mtime), "size": st.st_size,
+                                "n": int(arr.shape[0])}), encoding="utf-8")
+
+
+def _predict_member(cfg, ckpt_path, df, device, cache_dir, set_name, cache_name):
+    """_predict with an on-disk cache: reuse ensemble_cache/<set>/<name>.npy when the
+    checkpoint is unchanged; otherwise compute, save, and return."""
+    npy, meta = _cache_paths(cache_dir, set_name, cache_name)
+    hit = _load_cached(npy, meta, ckpt_path, len(df))
+    if hit is not None:
+        print(f"[cache] HIT  {set_name}/{cache_name}  {hit.shape}")
+        return hit
+    p = _predict(cfg, ckpt_path, df, device)
+    try:
+        _save_cache(npy, meta, ckpt_path, p)
+        print(f"[cache] save {set_name}/{cache_name}")
+    except Exception as e:
+        print(f"[cache] WARNING: could not save {set_name}/{cache_name}: {e}")
+    return p
 
 
 def _predict(cfg: dict, ckpt_path: Path, df, device) -> np.ndarray:
@@ -247,6 +485,9 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
     data_dir = Path(ref["paths"]["data_dir"])
     df = pd.read_csv(data_dir / ref["paths"][f"{SET}_csv"])
     print(f"[ensemble] {SET}: {len(df)} images  |  tasks={tasks}  device={device}")
+    # per-member prob cache, next to ensembling_results/ (out_dir = <base>/ensembling_results/<ts>)
+    cache_dir = Path(out_dir).parent.parent / "ensemble_cache"
+    print(f"[cache] dir: {cache_dir / SET}")
 
     # per-class thresholds for F1/P/R/Spec (AUROC/AUPRC ignore them).
     thr_map = {}
@@ -257,15 +498,20 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
         print(f"[ensemble] WARNING: {thr_json} not found -> F1/P/R/Spec at 0.5")
     thr_vec = [float(thr_map.get(t, 0.5)) for t in tasks]
 
-    # ground truth (from the reference model; valid200 has no uncertain labels).
-    y_true, _ = None, None
+    # ground truth labels are FIXED per SET -> cache them too, so an ALL-cached run
+    # needs NO model build at all (truly CPU-only). _y_true.npy sits beside members.
+    _yt_npy = Path(cache_dir) / SET / "_y_true.npy"
+    y_true = np.load(_yt_npy) if _yt_npy.exists() else None
+    if y_true is not None:
+        print(f"[cache] HIT  {SET}/_y_true  {y_true.shape} (labels)")
     members = {}          # label -> (N, 5) prob matrix
 
     # --- full 5-class models ---
     for run in FULL_MODELS:
         cfg = load_cfg(run)
         print(f"[member] {run} ...")
-        p = _predict(cfg, ckpt_path_of(run), df, device)
+        cp = ckpt_path_of(run)
+        p = _predict_member(cfg, cp, df, device, cache_dir, SET, f"{run}_{Path(cp).stem}")
         members[run] = p
         if y_true is None:
             yt, _, _, _ = sc._predict_dataframe(   # labels once (cheap, same df)
@@ -273,6 +519,10 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
                 df, device, _dummy_loss, amp=False, channels_last=False,
                 batch_size=8, num_workers=0)
             y_true = yt
+            arr = yt.detach().cpu().numpy() if hasattr(yt, "detach") else np.asarray(yt)
+            _yt_npy.parent.mkdir(parents=True, exist_ok=True)
+            np.save(_yt_npy, arr)                 # cache labels for future CPU-only runs
+            print(f"[cache] save {SET}/_y_true  {arr.shape} (labels)")
 
     # --- extra members from specific checkpoints (each its own 5-class voter) ---
     for spec in CHECKPOINT_MEMBERS:
@@ -280,7 +530,9 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
         cfg = load_cfg(run)
         label = _ckpt_member_label(run, ckpt)
         print(f"[member] {label} ...")
-        members[label] = _predict(cfg, ckpt_path_of(run, ckpt), df, device)
+        cp = ckpt_path_of(run, ckpt)
+        members[label] = _predict_member(cfg, cp, df, device, cache_dir, SET,
+                                         f"{run}_{Path(cp).stem}")
 
     # --- Stage-2 composite (one member, per-class dedicated model) ---
     if USE_STAGE2:
@@ -288,7 +540,9 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
         for disease, run in STAGE2_GROUP.items():
             cfg = load_cfg(run)
             print(f"[member] stage2/{disease}: {run} ...")
-            p = _predict(cfg, ckpt_path_of(run), df, device)   # (N,1)
+            cp = ckpt_path_of(run)
+            p = _predict_member(cfg, cp, df, device, cache_dir, SET,
+                                f"{run}_{Path(cp).stem}")   # (N,1)
             comp[:, tasks.index(disease)] = p[:, 0]
         members["final_stage2 (5 per-disease composite)"] = comp
 
@@ -364,6 +618,7 @@ def run_local():
     thr_json = PKG_ROOT / THRESHOLDS_FROM / "results" / "thresholds.json"
     out_dir = _out_subdir(Path(__file__).resolve().parent)   # others/ensembling_results/<stamp>
     run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_json)
+    return out_dir
 
 
 # ----------------------------- modal execution -----------------------------
@@ -396,9 +651,19 @@ if _MODAL_OK and modal.is_local():
         if _mount not in _volumes:
             _volumes[_mount] = modal.Volume.from_name(_vname, create_if_missing=True)
 
+    # If EVERY member (and the labels) is already cached locally, the remote run is
+    # pure CPU averaging -> reserve NO GPU (don't idle-book a B200). Otherwise use the
+    # configured GPU. Decided at VM-build time from the LOCAL cache (kept in sync by
+    # _sync_cache_down); the up-sync then mirrors it to the volume the remote reads.
+    _all_cached = _members_all_cached(Path(__file__).resolve().parent, SET)
     _resources = sc.modal_resources(_ref_cfg)
-    if GPU:
-        _resources["gpu"] = GPU               # explicit GPU override (see CONFIG at top)
+    if _all_cached:
+        _resources.pop("gpu", None)           # all members cached -> CPU-only VM
+        print(f"[gpu] all members cached for {SET} -> CPU-only VM (no GPU reserved)")
+    else:
+        if GPU:
+            _resources["gpu"] = GPU           # explicit GPU override (see CONFIG at top)
+        print(f"[gpu] some members need compute -> GPU={_resources.get('gpu')}")
     if CPU_CORES is not None:
         _resources["cpu"] = CPU_CORES         # requested CPU cores override
     if MEMORY_GB is not None:
@@ -448,14 +713,19 @@ if __name__ == "__main__":
     if RUN_ON == "modal":
         if not _MODAL_OK:
             raise SystemExit("RUN_ON='modal' but modal isn't installed; set RUN_ON='local'.")
+        _base_local = Path(__file__).resolve().parent
+        _runs_volume = _ref_cfg["modal"]["runs_volume"]
+        _sync_cache_up(_runs_volume, _base_local)    # push local cache so remote can reuse it
         with modal.enable_output():
             with app.run():
                 remote_sub = ensemble_remote.remote()   # volume-relative POSIX subpath
+        _sync_cache_down(_runs_volume, _base_local)  # pull GPU-computed cache back to this PC
         # remote run + volume commit are done; pull the results folder down locally.
         if remote_sub:
-            _fetch_results_from_modal(_ref_cfg["modal"]["runs_volume"], remote_sub,
-                                      Path(__file__).resolve().parent)
+            local_dir = _fetch_results_from_modal(_runs_volume, remote_sub, _base_local)
+            _update_best_tracker(SET, local_dir)     # promote if it beats the local best
     elif RUN_ON == "local":
-        run_local()
+        out_dir = run_local()
+        _update_best_tracker(SET, out_dir)           # promote if it beats the local best
     else:
         raise SystemExit(f"RUN_ON must be 'modal' or 'local', got {RUN_ON!r}")
