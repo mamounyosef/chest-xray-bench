@@ -3208,12 +3208,17 @@ def _json_safe(obj):
 
 @torch.no_grad()
 def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
-                       channels_last: bool, batch_size: int, num_workers: int):
+                       channels_last: bool, batch_size: int, num_workers: int,
+                       progress_desc: str = None):
     """Run the model over one dataframe (split='val' -> no augmentation) and
     return (y_true (N,T) binary, y_prob (N,T), exclude_mask (N,T), mean_loss).
     Predictions collapse to per-task binary probabilities via the cfg head layout
     (sigmoid / renormalized p_pos); exclude_mask flags uncertain rows on
-    multiclass tasks (all-False for a binary arm)."""
+    multiclass tasks (all-False for a binary arm).
+
+    progress_desc: when set, print a throttled progress line (every ~5s + at the
+    end) — image count, %, img/s, elapsed, ETA — labelled with this string. Left
+    None (the default, e.g. in-training validation) it stays silent."""
     layout = task_layout(cfg)
     ds = CheXpertDataset(df, cfg, split="val")
     # Match the config's validation loader settings (val_* keys). prefetch_factor /
@@ -3231,7 +3236,15 @@ def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
     model.eval()
     total_loss, n = 0.0, 0
     ys, ps = [], []
-    for imgs, labels in loader:
+    _prog = progress_desc is not None
+    _N, _B = len(ds), len(loader)
+    _t0 = _last = time.perf_counter()
+    if _prog:
+        _res = f"{cfg['image']['width']}x{cfg['image']['height']}"
+        print(f"     [infer] {progress_desc}: {_N} imgs @ {_res} | "
+              f"{_B} batches x{batch_size} | {num_workers} workers | amp={amp}",
+              flush=True)
+    for _bi, (imgs, labels) in enumerate(loader, 1):
         imgs = prepare_batch(imgs, cfg, device, channels_last)   # to GPU + (uint8) normalize
         labels = labels.to(device, non_blocking=True)
         with torch.autocast(device_type=device.type, enabled=amp):
@@ -3242,6 +3255,21 @@ def _predict_dataframe(cfg, model, df, device, loss_fn, amp: bool,
         n += bs
         ys.append(labels.detach().cpu().numpy())
         ps.append(logits_to_probs(logits, layout).float().detach().cpu().numpy())
+        if _prog:
+            _now = time.perf_counter()
+            if _now - _last >= 5.0 or _bi == _B:            # throttle to ~5s + final
+                _el = _now - _t0
+                _ips = n / max(1e-6, _el)
+                _eta = (_N - n) / max(1e-6, _ips)
+                print(f"     [infer] {progress_desc}: batch {_bi}/{_B} | "
+                      f"img {n}/{_N} ({100 * n / _N:.0f}%) | {_ips:.0f} img/s | "
+                      f"elapsed {fmt_duration(_el)} | ETA {fmt_duration(_eta)}",
+                      flush=True)
+                _last = _now
+    if _prog:
+        _el = time.perf_counter() - _t0
+        print(f"     [infer] {progress_desc}: DONE {_N} imgs in {fmt_duration(_el)} "
+              f"({_N / max(1e-6, _el):.0f} img/s)", flush=True)
     y_true, excl = binarize_targets(np.concatenate(ys), layout,
                                     _val_ignore_uncertain(cfg))
     return y_true, np.concatenate(ps), excl, total_loss / max(1, n)

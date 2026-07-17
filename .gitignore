@@ -3,6 +3,8 @@ debugged_images/
 checkpoints/
 train_config/
 ensembling_results/
+cache_runs/
+training_scripts/others/ci/results/
 
 modal_commants.txt
 # Byte-compiled / optimized / DLL files

@@ -31,8 +31,8 @@ import sys
 from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
-RUN_ON = "modal"        # "modal" -> Modal GPU (reads best.pt from /runs) | "local"
-SET    = "valid200"      # scored split — "valid200" or "test500"
+RUN_ON = "modal"        # "modal" | "local" 
+SET    = "val"      # scored split — "valid200" or "test500" or "val"
 GPU    = "B200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each run's
@@ -42,20 +42,29 @@ BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each ru
 # Modal container compute for the ensemble run (None -> inherit the reference run's
 # modal.cpu_cores / modal.memory_gb). These size what `modal` allocates.
 CPU_CORES = 14        # requested CPU cores for the Modal container
-MEMORY_GB = None        # requested RAM in GB for the Modal container
+MEMORY_GB = 50        # requested RAM in GB for the Modal container
 
 # DataLoader knobs applied to EVERY member's inference pass (None -> that run's own
-# dataloader.val_* value). Raise NUM_WORKERS toward CPU_CORES to speed up decoding.
-NUM_WORKERS     = 24   # DataLoader workers per member
+# dataloader.val_* value). Raise workers toward the available cores to speed decoding.
+# Separate worker counts per environment (Modal has many vCPUs; a local run is bound
+# by this PC's cores). The active one is picked from RUN_ON below.
+NUM_WORKERS_MODAL = 24   # DataLoader workers per member when RUN_ON == "modal"
+NUM_WORKERS_LOCAL = 2    # DataLoader workers per member when RUN_ON == "local"
+NUM_WORKERS = NUM_WORKERS_MODAL if RUN_ON == "modal" else NUM_WORKERS_LOCAL
 PREFETCH_FACTOR = 4   # batches prefetched per worker (only used when workers > 0)
+
+# Per-member prob cache (cache_runs/<set>/<run>_<ckpt>.npy). A present file is a
+# HIT and is reused as-is (no GPU, no checkpoint needed). Set True for ONE run to
+# ignore + overwrite existing cache entries — do this after RETRAINING a checkpoint.
+REFRESH_CACHE = False
 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
     "convnext_base_22k_1600x1312",
     "medmae_vitb_nih_B_768_s2",
-    "medmae_vitb_nih",
-    "convnext_base_22k_768x640",
-    "convnext_base_22k_final_stage1",
+    # "medmae_vitb_nih",
+    # "convnext_base_22k_768x640",
+    # "convnext_base_22k_final_stage1",
 
     # "medmae_vitb_raw",
     # "convnext_base_22k_seed1337",
@@ -65,8 +74,8 @@ FULL_MODELS = [
 # Per-run checkpoint file under results/checkpoints/ (default "best.pt"). Two-stage
 # runs keep their fine-tune best.pt in a stage subfolder.
 CKPT_SUBPATH = {
-    "convnext_large_22k_cxr14_pretrain": "finetune_chexpert/best.pt",
-    "convnext_base_22k_cxr14_pretrain_lowlr_all": "finetune_chexpert/best.pt",
+    # "convnext_large_22k_cxr14_pretrain": "finetune_chexpert/best.pt",
+    # "convnext_base_22k_cxr14_pretrain_lowlr_all": "finetune_chexpert/best.pt",
 }
 
 # Extra members from SPECIFIC checkpoints — each entry is its own separate 5-class
@@ -77,10 +86,10 @@ CKPT_SUBPATH = {
 #   two-stage subfolder from CKPT_SUBPATH honored). Labeled "<run> @ step<N>" so it
 #   never collides with the plain "<run>" best.pt member. Empty list = off.
 CHECKPOINT_MEMBERS = [
-    {"run": "convnext_base_22k_1600x1312", "checkpoint": 7500},
-    {"run": "convnext_base_22k_1600x1312", "checkpoint": 8700},
-    {"run": "medmae_vitb_nih", "checkpoint": 7500},
-    {"run": "medmae_vitb_nih_B_768_s2", "checkpoint": 4400},
+    # {"run": "convnext_base_22k_1600x1312", "checkpoint": 7500},
+    # {"run": "convnext_base_22k_1600x1312", "checkpoint": 8700},
+    # {"run": "medmae_vitb_nih", "checkpoint": 7500},
+    # {"run": "medmae_vitb_nih_B_768_s2", "checkpoint": 4400},
 ]
 
 # Per-class thresholds for the F1/precision/recall/specificity of the ENSEMBLE come
@@ -203,33 +212,33 @@ def _fetch_results_from_modal(runs_volume: str, remote_sub: str, local_base: Pat
 
 
 def _sync_cache_up(runs_volume: str, local_base: Path):
-    """Push the LOCAL others/ensemble_cache/ up to the runs volume BEFORE a Modal run,
+    """Push the LOCAL others/cache_runs/ up to the runs volume BEFORE a Modal run,
     so remote members reuse probs already computed on this PC. Uploading the folder to
-    the volume ROOT lands it at /ensemble_cache (dir basename), matching where the
-    remote reads/writes (/runs/ensemble_cache). --force overwrites unchanged dupes;
+    the volume ROOT lands it at /cache_runs (dir basename), matching where the
+    remote reads/writes (/runs/cache_runs). --force overwrites unchanged dupes;
     check=False so a first run (nothing to push) never aborts the ensemble."""
     import subprocess
-    L = Path(local_base) / "ensemble_cache"
+    L = Path(local_base) / "cache_runs"
     if not L.exists() or not any(L.rglob("*.npy")):
-        print("[cache-sync] up: no local ensemble_cache yet (skip)")
+        print("[cache-sync] up: no local cache_runs yet (skip)")
         return
     cmd = [sys.executable, "-m", "modal", "volume", "put", "--force",
            runs_volume, str(L), "/"]
-    print(f"[cache-sync] up: {L} -> {runs_volume}:/ensemble_cache")
+    print(f"[cache-sync] up: {L} -> {runs_volume}:/cache_runs")
     subprocess.run(cmd, check=False)
 
 
 def _sync_cache_down(runs_volume: str, local_base: Path):
-    """Pull the runs volume's /ensemble_cache/ back down to others/ensemble_cache/ AFTER
+    """Pull the runs volume's /cache_runs/ back down to others/cache_runs/ AFTER
     a Modal run, so members freshly computed on the GPU are cached on this PC too.
     local_base already exists as a dir, so `get` maps entries under it (-> its
-    ensemble_cache/ subtree). check=False: an empty/absent remote cache isn't fatal."""
+    cache_runs/ subtree). check=False: an empty/absent remote cache isn't fatal."""
     import subprocess
     dest = Path(local_base)
     dest.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, "-m", "modal", "volume", "get", "--force",
-           runs_volume, "ensemble_cache", str(dest)]
-    print(f"[cache-sync] down: {runs_volume}:/ensemble_cache -> {dest}")
+           runs_volume, "cache_runs", str(dest)]
+    print(f"[cache-sync] down: {runs_volume}:/cache_runs -> {dest}")
     subprocess.run(cmd, check=False)
 
 
@@ -273,13 +282,15 @@ def _expected_cache_names():
 
 def _members_all_cached(local_base: Path, set_name: str) -> bool:
     """True iff EVERY member's probs (and the labels) are already cached locally for
-    `set_name` — so the Modal VM can run CPU-only (no GPU). Existence check only: the
-    remote still validates each cache against its checkpoint (mtime/size) and would
-    recompute a stale one on CPU. Any undecidable member -> False (play it safe)."""
+    `set_name` — so the Modal VM can run CPU-only (no GPU). Name-based existence check
+    (a present .npy is reused as-is). Any undecidable member ("last") -> False, and
+    REFRESH_CACHE -> False (a refresh recomputes, so it needs the GPU)."""
+    if REFRESH_CACHE:
+        return False
     names, undecidable = _expected_cache_names()
     if undecidable or not names:
         return False
-    cdir = Path(local_base) / "ensemble_cache" / set_name
+    cdir = Path(local_base) / "cache_runs" / set_name
     needed = [f"{n}.npy" for n in names] + ["_y_true.npy"]
     missing = [f for f in needed if not (cdir / f).exists()]
     if missing:
@@ -295,8 +306,9 @@ def _members_all_cached(local_base: Path, set_name: str) -> bool:
 # and the new folder is promoted. valid200 and test500 keep INDEPENDENT winners,
 # distinguished by the set named in the suffix.
 import re as _re                                          # noqa: E402
-# matches a trailing "(best)" or "(best <set>)" marker on a folder name
-_BEST_RE = _re.compile(r"\s*\(best(?:\s+(?P<set>valid200|test500))?\)\s*$")
+# matches a trailing "(best)" or "(best <set>)" marker on a folder name. <set> is any
+# split token (valid200, test500, val, ...) so the tracker works for every SET.
+_BEST_RE = _re.compile(r"\s*\(best(?:\s+(?P<set>\w+))?\)\s*$")
 
 
 def _strip_best(name: str) -> str:
@@ -338,11 +350,11 @@ def _migrate_legacy_best(root: Path):
         if not m or m.group("set") is not None:          # only bare "(best)" (no set)
             continue
         base = _strip_best(d.name)
-        for s in ("valid200", "test500"):
-            if (d / f"ensemble_{s}_summary.json").exists():
-                print(f"[best] migrating legacy marker: '{d.name}' -> '{base} (best {s})'")
-                _rename_dir(d, f"{base} (best {s})")
-                break
+        for summ in sorted(d.glob("ensemble_*_summary.json")):   # infer set from the summary file
+            s = summ.name[len("ensemble_"):-len("_summary.json")]
+            print(f"[best] migrating legacy marker: '{d.name}' -> '{base} (best {s})'")
+            _rename_dir(d, f"{base} (best {s})")
+            break
 
 
 def _update_best_tracker(set_name: str, new_dir: Path):
@@ -389,57 +401,41 @@ def _update_best_tracker(set_name: str, new_dir: Path):
 # ------------------------ per-member prediction cache ----------------------
 # A member's (N, 5) PROBABILITY matrix depends only on (run cfg, checkpoint, SET) —
 # the run's cfg (geometry/CLAHE/u-policy) is fixed, so the cache key is just
-# ensemble_cache/<set>/<run>_<ckpt>.npy. This lets a re-run reuse a member's probs
-# instead of recomputing on the GPU. A sidecar .meta.json stores the checkpoint's
-# (mtime, size) + N, so a RETRAINED best.pt (or a different-sized split) auto-misses.
-def _cache_paths(cache_dir: Path, set_name: str, cache_name: str):
-    d = Path(cache_dir) / set_name
-    return d / f"{cache_name}.npy", d / f"{cache_name}.meta.json"
+# cache_runs/<set>/<run>_<ckpt>.npy. This lets a re-run reuse a member's probs
+# instead of recomputing on the GPU. The cache is NAME-based: a present .npy is a hit,
+# regardless of environment (a probe built on Modal is reused as-is when run locally,
+# and vice-versa). On a HIT the checkpoint is never resolved/loaded/stat'd at all — so
+# a fully-cached run needs neither the GPU nor even the .pt files present. If you
+# RETRAIN a checkpoint, set REFRESH_CACHE=True (below) for one run to overwrite.
+def _cache_npy(cache_dir: Path, set_name: str, cache_name: str) -> Path:
+    return Path(cache_dir) / set_name / f"{cache_name}.npy"
 
 
-def _load_cached(npy: Path, meta: Path, ckpt_path: Path, n: int):
-    import json
-    if not (npy.exists() and meta.exists()):
-        return None
+def _predict_member(cfg, ckpt_resolver, df, device, cache_dir, set_name, cache_name):
+    """_predict with a NAME-based on-disk cache. `ckpt_resolver` is a 0-arg callable
+    returning the checkpoint path — it is invoked ONLY on a cache miss, so a hit never
+    touches (or requires) the checkpoint file. Set REFRESH_CACHE to force recompute."""
+    npy = _cache_npy(cache_dir, set_name, cache_name)
+    if not REFRESH_CACHE and npy.exists():
+        arr = np.load(npy)
+        print(f"[cache] HIT  {set_name}/{cache_name}  {arr.shape}  (no compute)")
+        return arr
+    print(f"[cache] MISS {set_name}/{cache_name} -> computing on {device.type.upper()}", flush=True)
+    ckpt_path = ckpt_resolver()                       # resolve/require the .pt only now
+    p = _predict(cfg, ckpt_path, df, device, desc=cache_name)
     try:
-        m = json.loads(meta.read_text(encoding="utf-8"))
-        st = Path(ckpt_path).stat()
-        if m.get("mtime") == int(st.st_mtime) and m.get("size") == st.st_size \
-                and m.get("n") == n:
-            return np.load(npy)
-    except Exception:
-        pass
-    return None
-
-
-def _save_cache(npy: Path, meta: Path, ckpt_path: Path, arr: np.ndarray):
-    import json
-    npy.parent.mkdir(parents=True, exist_ok=True)
-    np.save(npy, arr)
-    st = Path(ckpt_path).stat()
-    meta.write_text(json.dumps({"mtime": int(st.st_mtime), "size": st.st_size,
-                                "n": int(arr.shape[0])}), encoding="utf-8")
-
-
-def _predict_member(cfg, ckpt_path, df, device, cache_dir, set_name, cache_name):
-    """_predict with an on-disk cache: reuse ensemble_cache/<set>/<name>.npy when the
-    checkpoint is unchanged; otherwise compute, save, and return."""
-    npy, meta = _cache_paths(cache_dir, set_name, cache_name)
-    hit = _load_cached(npy, meta, ckpt_path, len(df))
-    if hit is not None:
-        print(f"[cache] HIT  {set_name}/{cache_name}  {hit.shape}")
-        return hit
-    p = _predict(cfg, ckpt_path, df, device)
-    try:
-        _save_cache(npy, meta, ckpt_path, p)
-        print(f"[cache] save {set_name}/{cache_name}")
+        npy.parent.mkdir(parents=True, exist_ok=True)
+        np.save(npy, p)
+        print(f"[cache] {'REFRESH' if REFRESH_CACHE else 'save'} {set_name}/{cache_name}")
     except Exception as e:
         print(f"[cache] WARNING: could not save {set_name}/{cache_name}: {e}")
     return p
 
 
-def _predict(cfg: dict, ckpt_path: Path, df, device) -> np.ndarray:
-    """Probabilities (N, len(cfg tasks)) for one checkpoint (ckpt_path) over `df`."""
+def _predict(cfg: dict, ckpt_path: Path, df, device, desc: str = None) -> np.ndarray:
+    """Probabilities (N, len(cfg tasks)) for one checkpoint (ckpt_path) over `df`.
+    `desc` labels the throttled per-batch progress line printed during inference."""
+    print(f"     [load] building model + weights from {Path(ckpt_path).name} ...", flush=True)
     model = build_model_generic(cfg).to(device).eval()
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     sc._unwrap(model).load_state_dict(ck["model"])
@@ -454,7 +450,7 @@ def _predict(cfg: dict, ckpt_path: Path, df, device) -> np.ndarray:
         eff_cfg["dataloader"]["val_prefetch_factor"] = int(PREFETCH_FACTOR)
     _, y_prob, _, _ = sc._predict_dataframe(
         eff_cfg, model, df, device, _dummy_loss, amp=False, channels_last=False,
-        batch_size=bs, num_workers=nw)
+        batch_size=bs, num_workers=nw, progress_desc=(desc or "member"))
     del model
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -486,7 +482,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
     df = pd.read_csv(data_dir / ref["paths"][f"{SET}_csv"])
     print(f"[ensemble] {SET}: {len(df)} images  |  tasks={tasks}  device={device}")
     # per-member prob cache, next to ensembling_results/ (out_dir = <base>/ensembling_results/<ts>)
-    cache_dir = Path(out_dir).parent.parent / "ensemble_cache"
+    cache_dir = Path(out_dir).parent.parent / "cache_runs"
     print(f"[cache] dir: {cache_dir / SET}")
 
     # per-class thresholds for F1/P/R/Spec (AUROC/AUPRC ignore them).
@@ -506,12 +502,18 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
         print(f"[cache] HIT  {SET}/_y_true  {y_true.shape} (labels)")
     members = {}          # label -> (N, 5) prob matrix
 
+    # total members for the "i/M" progress counter in the headers below
+    _n_members = len(FULL_MODELS) + len(CHECKPOINT_MEMBERS) + (1 if USE_STAGE2 else 0)
+    _mi = 0
+
     # --- full 5-class models ---
     for run in FULL_MODELS:
         cfg = load_cfg(run)
-        print(f"[member] {run} ...")
-        cp = ckpt_path_of(run)
-        p = _predict_member(cfg, cp, df, device, cache_dir, SET, f"{run}_{Path(cp).stem}")
+        _mi += 1
+        print(f"[member {_mi}/{_n_members}] {run}", flush=True)
+        cname = f"{run}_{_member_ckpt_stem(run)}"          # name only — no file access
+        p = _predict_member(cfg, (lambda run=run: ckpt_path_of(run)),
+                            df, device, cache_dir, SET, cname)
         members[run] = p
         if y_true is None:
             yt, _, _, _ = sc._predict_dataframe(   # labels once (cheap, same df)
@@ -529,20 +531,23 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
         run, ckpt = spec["run"], spec["checkpoint"]
         cfg = load_cfg(run)
         label = _ckpt_member_label(run, ckpt)
-        print(f"[member] {label} ...")
-        cp = ckpt_path_of(run, ckpt)
-        members[label] = _predict_member(cfg, cp, df, device, cache_dir, SET,
-                                         f"{run}_{Path(cp).stem}")
+        _mi += 1
+        print(f"[member {_mi}/{_n_members}] {label}", flush=True)
+        resolver = (lambda run=run, ckpt=ckpt: ckpt_path_of(run, ckpt))
+        stem = _member_ckpt_stem(run, ckpt) or Path(resolver()).stem   # resolve only if "last"
+        members[label] = _predict_member(cfg, resolver, df, device, cache_dir, SET,
+                                         f"{run}_{stem}")
 
     # --- Stage-2 composite (one member, per-class dedicated model) ---
     if USE_STAGE2:
+        _mi += 1
         comp = np.zeros((len(df), len(tasks)), dtype=float)
         for disease, run in STAGE2_GROUP.items():
             cfg = load_cfg(run)
-            print(f"[member] stage2/{disease}: {run} ...")
-            cp = ckpt_path_of(run)
-            p = _predict_member(cfg, cp, df, device, cache_dir, SET,
-                                f"{run}_{Path(cp).stem}")   # (N,1)
+            print(f"[member {_mi}/{_n_members}] stage2/{disease}: {run}", flush=True)
+            cname = f"{run}_{_member_ckpt_stem(run)}"
+            p = _predict_member(cfg, (lambda run=run: ckpt_path_of(run)),
+                                df, device, cache_dir, SET, cname)   # (N,1)
             comp[:, tasks.index(disease)] = p[:, 0]
         members["final_stage2 (5 per-disease composite)"] = comp
 
