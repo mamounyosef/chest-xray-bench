@@ -345,6 +345,104 @@ def build_medmae_vit(cfg: dict, load_pretrained: bool = False) -> nn.Module:
     return model
 
 
+# RAD-DINO's HF hub id. RAD-DINO = DINOv2-base (ViT-B/14, 87M, no register tokens)
+# domain-pretrained on chest X-rays by Microsoft. Distributed ONLY as a HuggingFace
+# `Dinov2Model` (transformers), so — unlike the timm medmae ViT — it is loaded via
+# `AutoModel.from_pretrained`, wrapped here to expose the project's (B,H,W)->(B,5)
+# contract. Native pretraining is 518x518 -> a 37x37 absolute-pos-embed grid; we
+# fine-tune at 784x644 (56x46=2576 patch tokens) and let the HF backbone's own
+# `interpolate_pos_encoding=True` resample the grid (the officially-supported path,
+# so NO manual pos-embed surgery / weight conversion is involved).
+_RADDINO_HF_ID = "microsoft/rad-dino"
+
+
+class RadDinoClassifier(nn.Module):
+    """RAD-DINO backbone (HF Dinov2Model) + a fresh linear classification head.
+
+    Head input (cfg['model']['head_pool']):
+        "cls_patch" (default) : concat[ CLS token , mean over patch tokens ]  (2*768)
+        "cls"                 : CLS token only                                (768)
+    The backbone is run with interpolate_pos_encoding=True so the 37x37 pretrained
+    position grid is resampled to this run's non-square 56x46 grid; the first forward
+    ASSERTS the realized patch-token count matches (image.height/14)*(image.width/14).
+
+    load_pretrained=True  (train.py)        : download the RAD-DINO weights.
+    load_pretrained=False (eval/calibrate)  : build the SAME architecture from the HF
+                                              config only (no weight download); the
+                                              run's own best.pt supplies the weights.
+    """
+
+    def __init__(self, cfg: dict, load_pretrained: bool = False):
+        super().__init__()
+        from transformers import AutoConfig, AutoModel
+
+        m = cfg["model"]
+        rev = m.get("hf_revision")                 # optional pin for reproducibility
+        if load_pretrained:
+            print("=" * 70)
+            print(f"[raddino] loading RAD-DINO backbone from {_RADDINO_HF_ID}"
+                  + (f" @ {rev}" if rev else " @ main"))
+            self.backbone = AutoModel.from_pretrained(_RADDINO_HF_ID, revision=rev)
+        else:
+            conf = AutoConfig.from_pretrained(_RADDINO_HF_ID, revision=rev)
+            self.backbone = AutoModel.from_config(conf)   # arch only, random init
+
+        hidden = self.backbone.config.hidden_size          # 768
+        self.head_pool = str(m.get("head_pool", "cls_patch"))
+        if self.head_pool not in ("cls_patch", "cls"):
+            raise ValueError(f"head_pool must be 'cls_patch' or 'cls', got {self.head_pool!r}")
+        in_dim = hidden * (2 if self.head_pool == "cls_patch" else 1)
+        n_out = num_output_logits(cfg)
+        self.head = nn.Linear(in_dim, n_out)
+        nn.init.trunc_normal_(self.head.weight, std=2e-5)  # same tiny-std head as medmae
+        nn.init.zeros_(self.head.bias)
+
+        # expected patch-token count for the runtime grid assertion.
+        patch = int(self.backbone.config.patch_size)       # 14
+        self._expect_patches = (int(cfg["image"]["height"]) // patch) * \
+                               (int(cfg["image"]["width"]) // patch)
+        self._grid_checked = False
+        if load_pretrained:
+            print(f"[raddino] head_pool={self.head_pool} -> Linear({in_dim}, {n_out}) "
+                  f"(fresh); patch={patch}, expect {self._expect_patches} patch tokens "
+                  f"({int(cfg['image']['height']) // patch}x{int(cfg['image']['width']) // patch} grid)")
+            print("=" * 70)
+
+    def no_weight_decay(self):
+        """Parameter names that must NOT get weight decay (>1-D embedding tensors;
+        1-D biases / LayerNorm / layer-scale are excluded automatically by ndim)."""
+        return {"backbone.embeddings.cls_token",
+                "backbone.embeddings.position_embeddings",
+                "backbone.embeddings.mask_token"}
+
+    def forward(self, x):
+        # x: (B, 3, H, W) already normalized (prepare_batch); interpolate_pos_encoding
+        # lets the fixed 37x37 pretrained grid serve this run's 56x46 grid.
+        out = self.backbone(pixel_values=x, interpolate_pos_encoding=True)
+        seq = out.last_hidden_state                 # (B, 1+P, 768), final-layernormed
+        cls = seq[:, 0]                             # CLS token (== pooler_output)
+        if not self._grid_checked:
+            n_patches = seq.shape[1] - 1
+            assert n_patches == self._expect_patches, (
+                f"[raddino] realized {n_patches} patch tokens but expected "
+                f"{self._expect_patches}; check image.height/width vs patch size 14")
+            self._grid_checked = True
+        if self.head_pool == "cls_patch":
+            patch = seq[:, 1:].mean(dim=1)          # mean-pooled patch tokens
+            feat = torch.cat([cls, patch], dim=1)   # (B, 2*768)
+        else:
+            feat = cls                              # (B, 768)
+        return self.head(feat)
+
+
+def build_raddino_vit(cfg: dict, load_pretrained: bool = False) -> nn.Module:
+    """RAD-DINO (HF Dinov2 ViT-B/14) + fresh 5-logit head, at cfg['image'] resolution.
+    load_pretrained=True downloads the RAD-DINO backbone weights (train.py); False
+    builds the identical architecture from the HF config so evaluate/calibrate can
+    load the run's own best.pt. See RadDinoClassifier for pooling + pos-embed detail."""
+    return RadDinoClassifier(cfg, load_pretrained=load_pretrained)
+
+
 def finetune_ckpt_subdir(cfg: dict) -> str:
     """Subfolder under results/checkpoints that holds the CheXpert model's
     checkpoints. For a two-stage run (pretrain.enable) that's the fine-tune stage's
@@ -994,15 +1092,35 @@ def _vit_layer_id(name: str, num_layers: int) -> int:
     return num_layers
 
 
+def _raddino_layer_id(name: str, num_layers: int) -> int:
+    """Depth index for LLRD on the RAD-DINO wrapper (HF Dinov2 naming). Param names
+    come from RadDinoClassifier.named_parameters():
+      backbone.embeddings.*           (patch_embed / cls / pos / mask) -> 0
+      backbone.encoder.layer.<i>.*    transformer block i              -> i+1
+      backbone.layernorm.* / head.*   final norm + classifier          -> num_layers"""
+    if name.startswith("backbone.embeddings"):
+        return 0
+    if name.startswith("backbone.encoder.layer."):
+        return int(name.split(".")[3]) + 1
+    return num_layers
+
+
 def _param_groups_llrd(model: nn.Module, base_lr: float, weight_decay: float,
-                       layer_decay: float):
+                       layer_decay: float, layer_id_fn=None, num_layers: int = None):
     """Layer-wise LR decay (LLRD) param groups for a ViT. Each depth d gets
     lr = base_lr * layer_decay**(num_layers - d), so EARLY blocks train slower than
     late blocks + head (a soft freeze that still adapts — the standard MAE/BEiT
     fine-tune trick). 1-D params (biases, LayerNorm) and pos_embed/cls_token get NO
     weight decay. The params are the SAME tensors the scheduler later anneals, from
-    each group's own initial lr. Prints one line summarizing the LR spread."""
-    num_layers = len(model.blocks) + 1
+    each group's own initial lr. Prints one line summarizing the LR spread.
+
+    layer_id_fn / num_layers default to the timm-ViT layout (model.blocks + name
+    'blocks.<i>'); the RAD-DINO wrapper passes _raddino_layer_id + its own depth so
+    the same machinery drives HF Dinov2 naming (backbone.encoder.layer.<i>)."""
+    if layer_id_fn is None:
+        layer_id_fn = _vit_layer_id
+    if num_layers is None:
+        num_layers = len(model.blocks) + 1
     scales = [layer_decay ** (num_layers - i) for i in range(num_layers + 1)]
     no_decay = set(model.no_weight_decay()) if hasattr(model, "no_weight_decay") else set()
     groups = {}
@@ -1010,7 +1128,7 @@ def _param_groups_llrd(model: nn.Module, base_lr: float, weight_decay: float,
         if not p.requires_grad:
             continue
         is_no_decay = p.ndim == 1 or n in no_decay
-        lid = _vit_layer_id(n, num_layers)
+        lid = layer_id_fn(n, num_layers)
         key = f"layer{lid}_{'no_decay' if is_no_decay else 'decay'}"
         if key not in groups:
             groups[key] = {"params": [], "lr": base_lr * scales[lid],
@@ -1070,6 +1188,17 @@ def build_optimizer(model: nn.Module, cfg: dict, loss_fn=None) -> optim.Optimize
         # '_orig_mod.' prefix doesn't break the blocks.<i> depth parsing.
         ld = o.get("layer_decay")
         base = _unwrap(model)
+        arch = str(cfg.get("model", {}).get("arch", "")).lower()
+        if ld is not None and arch == "raddino":
+            # HF Dinov2 wrapper: blocks live at backbone.encoder.layer.<i>, so use the
+            # raddino name parser + its own depth (same LLRD math as the timm path).
+            n_blocks = len(base.backbone.encoder.layer)
+            n_layers = n_blocks + 1
+            groups = _param_groups_llrd(base, o["lr"], o["weight_decay"], float(ld),
+                                        layer_id_fn=_raddino_layer_id, num_layers=n_layers)
+            _print_llrd(groups, o["lr"], float(ld), n_layers)
+            return optim.AdamW(groups, lr=o["lr"],
+                               weight_decay=o["weight_decay"], fused=fused)
         if ld is not None and hasattr(base, "blocks"):
             groups = _param_groups_llrd(base, o["lr"], o["weight_decay"], float(ld))
             _print_llrd(groups, o["lr"], float(ld), len(base.blocks) + 1)

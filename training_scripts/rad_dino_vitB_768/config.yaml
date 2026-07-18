@@ -1,0 +1,196 @@
+# =============================================================================
+# config.yaml  —  experiment: rad_dino_vitB_768
+#   RAD-DINO (ViT-B/14) fine-tuned on CheXpert, to serve as a THIRD, architecturally
+#   DIVERSE ensemble member alongside convnext_base_22k_1600x1312 and
+#   medmae_vitb_nih_B_768_s2. Single continuous stage (no resolution ramp): trained
+#   directly at 784x644.
+# -----------------------------------------------------------------------------
+# BACKBONE  —  microsoft/rad-dino (HuggingFace Dinov2Model; ViT-B/14, ~87M, domain-
+#   pretrained on chest X-rays with DINOv2, native 518x518 -> 37x37 pos grid). Loaded
+#   ONLY as the backbone via AutoModel.from_pretrained; a FRESH classification head is
+#   attached. Head input = concat[ CLS token , mean-pooled patch tokens ] (2*768 -> 5),
+#   selected by model.head_pool below. Because RAD-DINO ships as a HF model (NOT timm),
+#   the whole thing is wrapped in shared_code.RadDinoClassifier; model.arch="raddino"
+#   routes the layer-wise-LR-decay grouping to the HF Dinov2 block naming.
+# -----------------------------------------------------------------------------
+# RESOLUTION  —  784x644 (width x height, keeping the project's width>=height ordering,
+#   consistent with every other run). Patch size is 14 (NOT the medmae ViT's 16): the
+#   image size must be divisible by the patch size, and 768x640 is NOT a multiple of 14,
+#   so 784x644 is the nearest valid grid (784/14=56, 644/14=46 -> 56x46 = 2576 patch
+#   tokens, +1 CLS). The absolute position embedding is resampled from the pretrained
+#   37x37 grid to this non-square 56x46 grid by the HF backbone's own
+#   interpolate_pos_encoding=True; RadDinoClassifier.forward ASSERTS the realized
+#   patch-token count == 2576 on the first batch. No progressive resolution ramp (native
+#   is 518, so 784x644 is only a ~1.9x token jump — unlike medmae's 224->768 ramp).
+# -----------------------------------------------------------------------------
+# NORMALIZATION  —  RAD-DINO's OWN image-processor stats (mean 0.5307, std 0.2583 per
+#   channel, replicated over 3), read from microsoft/rad-dino's preprocessor_config.json
+#   — deliberately NOT the ImageNet stats every CNN run uses (see image.norm_* below).
+# -----------------------------------------------------------------------------
+# DATA  —  NATIVE full-res CheXpert tree (like the medmae 768 runs; the small 320px
+#   tree would upscale). Full train split, frontal only, SAME patient-disjoint split
+#   and SAME preprocessing as all runs (aspect-preserving INTER_AREA resize, zero-pad
+#   to target, grayscale replicated to 3 channels; NO horizontal flips — CXR laterality).
+# -----------------------------------------------------------------------------
+# LABELS / LOSS  —  multi-label 5-class, per-class sigmoid + BCEWithLogits (no pos_weight).
+#   Uncertainty = U-Ones for every task EXCEPT Consolidation = U-SelfTrained (soft target
+#   from convnext_base_22k_certain_only), identical to the joint runs. PREREQUISITE:
+#   01_train_softlabels.csv present next to the splits on the native data volume.
+# -----------------------------------------------------------------------------
+# TRAINING  —  full fine-tune (not a frozen probe), LLRD 0.75 (same as the medmae runs).
+#   LR / schedule mirror medmae_vitb_nih_B_768_s2 (lr 5e-5 -> 5e-7, 600-step warmup,
+#   cosine, grad_clip 1.0, label_smoothing 0.05, AdamW wd 1e-5). Holds only what VARIES;
+#   common settings come from ../shared_config.yaml (which also sets monitor_subset:
+#   valid200, so best.pt + early stopping track the valid200 radiologist set).
+# =============================================================================
+
+experiment:
+  name: "rad_dino_vitB_768"
+
+# ----------------------------------------------------------------------------
+# Model  —  RAD-DINO via the HF wrapper (shared_code.build_raddino_vit).
+#   name        : descriptive id (RAD-DINO == DINOv2 ViT-B/14); used only in logs.
+#   arch        : "raddino" -> RadDinoClassifier + HF-Dinov2 LLRD name parser.
+#   pretrained  : true -> download microsoft/rad-dino backbone weights (train only).
+#   head_pool   : "cls_patch" -> head input = concat[CLS, mean(patch)] (2*768);
+#                 "cls" -> CLS only (768). Spec's default is the concat.
+#   hf_revision : optional HF commit/tag to pin the backbone for reproducibility
+#                 (null = main). Set a commit hash here to freeze the weights.
+# ----------------------------------------------------------------------------
+model:
+  name: "vit_base_patch14_dinov2 (microsoft/rad-dino)"
+  arch: "raddino"
+  pretrained: true
+  head_pool: "cls_patch"
+  hf_revision: null
+
+reproducibility:
+  seed: 42
+
+# Fresh run — no checkpoint to resume from.
+resume: null
+
+# ----------------------------------------------------------------------------
+# Labels  —  MIXED per-task uncertainty: U-Ones everywhere except Consolidation
+# (U-SelfTrained soft target), identical to the medmae / convnext joint runs.
+# ----------------------------------------------------------------------------
+labels:
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"
+    Cardiomegaly:     "ones"
+    Consolidation:    "selftrained"
+    Edema:            "ones"
+    Pleural Effusion: "ones"
+  selftrained_csv: "01_train_softlabels.csv"
+  val_ignore_uncertain: false
+
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# Image geometry & normalization  —  784x644 (56x46 patch grid, 2576 tokens).
+# RAD-DINO's OWN normalization (mean 0.5307 / std 0.2583, per its image processor),
+# NOT ImageNet. Grayscale replicated to 3 channels; aspect-preserving INTER_AREA fit
+# + zero-pad (inherited behavior). gpu_normalize keeps the shared uint8->GPU path.
+# ----------------------------------------------------------------------------
+image:
+  width:  784
+  height: 644
+  interpolation: "INTER_AREA"
+  channels: 3
+  norm_mean: [0.5307, 0.5307, 0.5307]
+  norm_std:  [0.2583, 0.2583, 0.2583]
+  gpu_normalize: true
+
+dataloader:
+  batch_size:         64
+  num_workers:        30
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  val_batch_size:         512
+  val_num_workers:        24
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+# ----------------------------------------------------------------------------
+# Performance  —  channels_last + fused AdamW on. torch.compile is OFF for this run:
+# the HF Dinov2 backbone with interpolate_pos_encoding is unproven under torch.compile
+# here, and compile only affects SPEED (scores are identical). Flip compile: true to
+# A/B it once training is confirmed — a compile failure surfaces at setup, not mid-run.
+# ----------------------------------------------------------------------------
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: false
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training  —  mirrors medmae_vitb_nih_B_768_s2: lr 5e-5 -> 5e-7 (1%), LLRD 0.75,
+# 600-step warmup then cosine, grad_clip 1.0, label_smoothing 0.05, AdamW wd 1e-5.
+# ----------------------------------------------------------------------------
+training:
+  epochs:        8
+  amp:           true
+  grad_clip:     1.0
+
+  optimizer:
+    lr:           5.0e-5
+    weight_decay: 1.0e-5
+    layer_decay:  0.75
+
+  scheduler:
+    name:        "cosine"
+    warmup_steps: 600
+    warmup_start_factor: 0.01
+    min_lr:      5.0e-7
+    plateau_patience: 2
+
+  loss:
+    name: "bce_with_logits"
+    pos_weight: null
+    label_smoothing: 0.05
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 15
+
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 500
+
+# ----------------------------------------------------------------------------
+# Paths  —  the native tree stores images under CheXpert-v1.0 (not the small
+# CheXpert-v1.0-small); remap the split CSVs' path column accordingly.
+# ----------------------------------------------------------------------------
+paths:
+  path_remap:
+    from: "CheXpert-v1.0-small"
+    to:   "CheXpert-v1.0"
+
+# ----------------------------------------------------------------------------
+# Modal  —  A100-80GB, native data volume. `transformers` is added to the image
+# per-run via train/evaluate's sc.modal_image(extra_pip=[...]) (RAD-DINO is a HF
+# model; timm alone can't load it).
+# ----------------------------------------------------------------------------
+modal:
+  gpu: "A100-80GB"
+  cpu_cores: 24
+  memory_gb: 45
+  timeout_seconds: 43200      # 12 hours
+  data_volume: "chexpert-native-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data_native"
+  runs_mount:  "/runs"
+  remote_data_root: "/data_native/CheXpert-v1.0"
+  remote_data_dir:  "/data_native/splits"
+  wandb_secret: "wandb-secret"
