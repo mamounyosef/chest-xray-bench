@@ -215,19 +215,22 @@ def main(source: str = "CheXpert-v1.0-small", archive: str = "chexpert.tar",
     keep_archive : leave the archive on the volume instead of deleting it after.
     """
     import subprocess
+    import sys
     import time
 
     # 1) build the archive server-side on the volume.
     name, size, n = make_archive.remote(source, archive, mount)
 
     # 2) download that single file locally via the modal CLI (runs on THIS machine).
+    #    Invoke as `python -m modal` (not bare "modal"): on Windows CreateProcess
+    #    doesn't resolve modal.exe/PATHEXT, so a bare "modal" raises WinError 2.
     volname = _VOLNAME_BY_MOUNT[mount]
     local_dest = dest or f"./{name}"
     print(f"\n[download] pulling {name} ({size / 1e9:.2f} GB, {n} files) "
           f"from volume {volname!r} -> {local_dest}", flush=True)
     t0 = time.time()
-    subprocess.run(["modal", "volume", "get", "--force", volname, name, local_dest],
-                   check=True)
+    subprocess.run([sys.executable, "-m", "modal", "volume", "get", "--force",
+                    volname, name, local_dest], check=True)
     print(f"[download] done in {time.time() - t0:.0f}s -> {local_dest}", flush=True)
 
     # 3) reclaim the space on the volume unless asked to keep it.
