@@ -48,6 +48,18 @@ for _s in (sys.stdout, sys.stderr):
 SET     = "val"                # scored split whose cache to read: "val" = the ~19k
                               # patient-grouped 10% val split (01_val.csv); also
                               # "valid200" / "test500" (radiologist sets)
+
+# U_IGNORE : uncertain-label handling for the METRIC only (predictions are reused
+#   from cache either way — nothing is recomputed).
+#     False (default) : U-Ones — uncertain (-1) cells scored as POSITIVE (1). Uses
+#                       the cached _y_true.npy directly (matches ensample.py scoring).
+#     True            : U-Ignore — for each task, DROP its uncertain (-1) rows from
+#                       that class's AUROC. Labels are rebuilt from VAL_CSV (blank->0,
+#                       1->1, 0->0, -1->NaN=excluded); verified row-aligned to cache.
+#                       Only valid for SET whose raw CSV is available (VAL_CSV below).
+U_IGNORE = True
+VAL_CSV  = "data/chexpert/01_val.csv"   # raw split (repo-relative); only read if U_IGNORE
+
 N_BOOT  = 2000                 # bootstrap iterations
 SEED    = 42                   # RNG seed (reproducible)
 CI_LOW, CI_HIGH = 2.5, 97.5    # percentiles for the 95% CI
@@ -77,14 +89,42 @@ def _load(name: str) -> np.ndarray:
 
 
 def per_class_auroc(y: np.ndarray, p: np.ndarray) -> np.ndarray:
-    """(C,) per-class AUROC; NaN for any class with <2 label values present."""
+    """(C,) per-class AUROC. Rows whose label is NaN for a class are dropped from
+    that class (this is how U-Ignore excludes uncertain cells; in U-Ones there are
+    no NaNs so nothing is dropped). NaN for any class with <2 label values left."""
     C = p.shape[1]
     out = np.full(C, np.nan)
     for c in range(C):
         yc = y[:, c]
-        if np.unique(yc).size >= 2:
-            out[c] = roc_auc_score(yc, p[:, c])
+        m = ~np.isnan(yc)               # keep only labelled rows for this class
+        ycm = yc[m]
+        if np.unique(ycm).size >= 2:
+            out[c] = roc_auc_score(ycm, p[m, c])
     return out
+
+
+def _load_uignore_labels(cached_y: np.ndarray) -> np.ndarray:
+    """Rebuild (N,5) labels from the raw split CSV with uncertain(-1)->NaN (U-Ignore).
+    Verifies row alignment by reconstructing the U-Ones labels and matching them to
+    the cached _y_true.npy (fails loudly if the CSV and cache ever drift)."""
+    import pandas as pd
+    csv = (CI_DIR.parent.parent.parent / VAL_CSV)      # repo root / VAL_CSV
+    if not csv.exists():
+        raise FileNotFoundError(f"U_IGNORE=True but VAL_CSV not found: {csv}")
+    raw = pd.read_csv(csv)[TASKS].values.astype(float)  # blank->NaN, plus 0/1/-1
+    if raw.shape != cached_y.shape:
+        raise ValueError(f"CSV rows {raw.shape} != cache {cached_y.shape}")
+    uones = np.where(np.isnan(raw), 0.0, np.where(raw == -1.0, 1.0, raw))
+    if not np.array_equal(uones, cached_y):
+        raise ValueError("CSV/cache row mismatch — U-Ones reconstruction != cached "
+                         "_y_true.npy; cannot trust the uncertain mask.")
+    y = np.where(np.isnan(raw), 0.0, raw)               # blank->0
+    y[raw == -1.0] = np.nan                             # uncertain -> excluded
+    n_unc = int((raw == -1.0).sum())
+    print(f"[U-Ignore] rebuilt labels from {csv.name}; excluded {n_unc} uncertain "
+          f"cells: " + ", ".join(f"{t}={int((raw[:, i] == -1.0).sum())}"
+                                  for i, t in enumerate(TASKS)))
+    return y
 
 
 def summarize(dist: np.ndarray):
@@ -103,6 +143,8 @@ def frac_positive(diff: np.ndarray) -> float:
 def main():
     # --- load probabilities + labels (all (N, 5)) -------------------------------
     y_true = _load("_y_true")
+    if U_IGNORE:
+        y_true = _load_uignore_labels(y_true)   # -1 cells -> NaN (excluded per class)
     single = _load(SINGLE_MEMBER)
     ens = np.mean([_load(m) for m in ENSEMBLE_MEMBERS], axis=0)   # prob-average
     N, C = y_true.shape
@@ -137,6 +179,7 @@ def main():
 
     w("=" * 92)
     w(f"BOOTSTRAP 95% CI  —  mean AUROC on {SET} ({N} images)")
+    w(f"uncertain : {'U-Ignore (uncertain rows dropped per class)' if U_IGNORE else 'U-Ones (uncertain scored as positive)'}")
     w(f"generated : {ts}   |   iterations : {N_BOOT}   |   seed : {SEED}")
     w(f"single    : {SINGLE_MEMBER}")
     w(f"ensemble  : prob-average of {ENSEMBLE_MEMBERS}")
@@ -184,7 +227,7 @@ def main():
     print(report)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = RESULTS_DIR / f"{ts}.txt"
+    out_path = RESULTS_DIR / f"{ts}_{SET}_{'uignore' if U_IGNORE else 'uones'}.txt"
     out_path.write_text(report, encoding="utf-8")
     print(f"wrote -> {out_path}")
 
