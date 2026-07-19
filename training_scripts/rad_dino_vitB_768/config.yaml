@@ -68,7 +68,7 @@ reproducibility:
   seed: 42
 
 # Fresh run — no checkpoint to resume from.
-resume: null
+resume: 'best'
 
 # ----------------------------------------------------------------------------
 # Labels  —  MIXED per-task uncertainty: U-Ones everywhere except Consolidation
@@ -135,20 +135,20 @@ performance:
 # 600-step warmup then cosine, grad_clip 1.0, label_smoothing 0.05, AdamW wd 1e-5.
 # ----------------------------------------------------------------------------
 training:
-  epochs:        8
+  epochs:        5
   amp:           true
   grad_clip:     1.0
 
   optimizer:
-    lr:           5.0e-5
+    lr:           3.0e-5
     weight_decay: 1.0e-5
     layer_decay:  0.75
 
   scheduler:
     name:        "cosine"
-    warmup_steps: 600
-    warmup_start_factor: 0.01
-    min_lr:      5.0e-7
+    warmup_epochs: 1
+    warmup_start_factor: 0.001
+    min_lr:      3.0e-7
     plateau_patience: 2
 
   loss:

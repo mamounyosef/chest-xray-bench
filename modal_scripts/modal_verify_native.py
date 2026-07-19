@@ -41,9 +41,10 @@ def _human(n: int) -> str:
         x /= 1024
 
 
-@app.function(image=image, volumes={MOUNT: vol}, timeout=2 * 3600)
+@app.function(image=image, volumes={MOUNT: vol}, cpu=8.0, timeout=2 * 3600)
 def verify(clean: bool):
     import os
+    from concurrent.futures import ThreadPoolExecutor
 
     vol.reload()
     # the files may sit directly under MOUNT or under the container subfolder
@@ -53,14 +54,28 @@ def verify(clean: bool):
         print(f"[verify] ⚠️ '{root}' not found. {MOUNT} contains: {sorted(os.listdir(MOUNT))}")
         return
 
+    def _leaf_size(p):
+        try:
+            return os.path.getsize(p)
+        except OSError:
+            return 0
+
+    # size of one top-level entry. For a directory we fan its subtree's per-file
+    # getsize() calls out over a thread pool — each stat() is a latency-bound
+    # volume round-trip, so ~400k serial stats become a few seconds.
+    def _entry_size(p, ex):
+        if os.path.isfile(p):
+            return _leaf_size(p)
+        files = [os.path.join(dp, f) for dp, _dn, fs in os.walk(p) for f in fs]
+        return sum(ex.map(_leaf_size, files, chunksize=256))
+
     entries = sorted(os.listdir(root))
     orphans, clean_files, total = [], {}, 0
-    print(f"[verify] {len(entries)} entries:")
+    print(f"[verify] {len(entries)} entries (sizing in parallel):", flush=True)
+    _ex = ThreadPoolExecutor(max_workers=256)
     for name in entries:
         p = f"{root}/{name}"
-        size = os.path.getsize(p) if os.path.isfile(p) else sum(
-            os.path.getsize(os.path.join(dp, f))
-            for dp, _dn, fs in os.walk(p) for f in fs)
+        size = _entry_size(p, _ex)
         total += size
         is_orphan = name.startswith(".azDownload-")
         if is_orphan:
@@ -70,6 +85,7 @@ def verify(clean: bool):
         tag = "  ⛔ ORPHAN PARTIAL" if is_orphan else ""
         print(f"    {_human(size):>12}   {name}{tag}")
 
+    _ex.shutdown()
     orphan_bytes = sum(s for _n, s in orphans)
     print(f"\n[verify] total on disk : {_human(total)}")
     print(f"[verify] orphan partials: {len(orphans)}  ({_human(orphan_bytes)} reclaimable)")

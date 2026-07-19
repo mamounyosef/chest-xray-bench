@@ -72,17 +72,91 @@ def list_zips():
     return zips
 
 
+def _extract_zip_parallel(zpath: str, dest: str, name: str, workers: int = 32):
+    """Extract one zip into `dest` with a thread pool. Each worker thread keeps its
+    OWN ZipFile handle (ZipFile isn't thread-safe to share), so decompression runs
+    on multiple cores — zlib releases the GIL — AND the many small volume writes
+    overlap instead of going one-at-a-time. Returns files written. Raises on any
+    failure so the caller can fall back to bsdtar.
+    """
+    import collections
+    import os
+    import threading
+    import time
+    import zipfile
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = os.path.realpath(dest)
+    tl = threading.local()
+
+    def _handle():
+        zf = getattr(tl, "zf", None)
+        if zf is None:
+            zf = tl.zf = zipfile.ZipFile(zpath)
+        return zf
+
+    def _one(info):
+        full = os.path.realpath(os.path.join(dest, info.filename))
+        if full != root and not full.startswith(root + os.sep):
+            raise ValueError(f"unsafe path escapes {dest!r}: {info.filename!r}")
+        if info.is_dir():
+            os.makedirs(full, exist_ok=True)
+            return 0
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with _handle().open(info) as fsrc, open(full, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(1 << 20)      # 1 MiB streaming; caps RAM per file
+                if not chunk:
+                    break
+                fdst.write(chunk)
+        return 1
+
+    with zipfile.ZipFile(zpath) as zf:
+        infos = zf.infolist()
+    total = sum(1 for i in infos if not i.is_dir())
+    tbytes = sum(i.file_size for i in infos if not i.is_dir())
+    print(f"[extract]   {name}: {total} files, {_human(tbytes)} uncompressed; "
+          f"{workers} parallel workers", flush=True)
+
+    n = 0
+    t0 = last = time.time()
+    it = iter(infos)
+    inflight = collections.deque()
+    WINDOW = workers * 8
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for _ in range(WINDOW):
+            i = next(it, None)
+            if i is None:
+                break
+            inflight.append(ex.submit(_one, i))
+        while inflight:
+            n += inflight.popleft().result()
+            i = next(it, None)
+            if i is not None:
+                inflight.append(ex.submit(_one, i))
+            now = time.time()
+            if now - last >= 5.0 or n == total:
+                el = now - t0
+                rate = n / max(1e-6, el)
+                eta = (total - n) / max(1e-6, rate)
+                print(f"[extract]   {name}: {n}/{total} ({100 * n / max(1, total):.1f}%) | "
+                      f"{rate:.0f} files/s | elapsed {el:.0f}s | ETA {eta:.0f}s", flush=True)
+                last = now
+    return n
+
+
 @app.function(
     image=image,
     volumes={MOUNT: vol},
     timeout=12 * 3600,
-    cpu=2,                        # bsdtar is single-threaded per archive; 2 is plenty
+    cpu=8,                        # parallel zip extractor uses several cores (zlib frees GIL)
     ephemeral_disk=512 * 1024,    # 512 GiB = Modal's per-container minimum (covers the 185 GiB zip)
 )
 def extract_one(name: str, delete_zips: bool):
     """Extract ONE zip straight into the volume and commit. Runs in its own container
     (one per zip via .map), so the 4 zips extract concurrently. Disjoint output paths
-    => no cross-container conflict on the shared volume."""
+    => no cross-container conflict on the shared volume. Within a zip, a thread pool
+    parallelizes decompression + writes; bsdtar/unar are the fallback."""
     import os
     import subprocess
     import time
@@ -92,19 +166,26 @@ def extract_one(name: str, delete_zips: bool):
     zsize = os.path.getsize(zpath)
     print(f"[extract] START {name}  ({_human(zsize)})  -> {MOUNT}/{EXPECTED_ROOT}")
     t0 = time.time()
-    # bsdtar first, then unar. subprocess list args -> spaces in names are safe.
-    attempts = [
-        ["bsdtar", "-x", "-f", zpath, "-C", MOUNT],
-        ["unar", "-quiet", "-force-overwrite", "-output-directory", MOUNT, zpath],
-    ]
     ok = None
-    for cmd in attempts:
-        print(f"[extract]   {name}: trying {cmd[0]} ...")
-        rc = subprocess.run(cmd).returncode
-        if rc == 0:
-            ok = cmd[0]
-            break
-        print(f"[extract]   {name}: {cmd[0]} failed (rc={rc}); trying next ...")
+    # 1) fast path: parallel Python zip extractor.
+    try:
+        n_files = _extract_zip_parallel(zpath, MOUNT, name)
+        ok = "zipfile(parallel)"
+        print(f"[extract]   {name}: wrote {n_files} files via {ok}")
+    except Exception as e:
+        print(f"[extract]   {name}: parallel zipfile failed ({e!r}); falling back to bsdtar/unar ...")
+        # 2) fallback: bsdtar, then unar. List args -> spaces in names are safe.
+        attempts = [
+            ["bsdtar", "-x", "-f", zpath, "-C", MOUNT],
+            ["unar", "-quiet", "-force-overwrite", "-output-directory", MOUNT, zpath],
+        ]
+        for cmd in attempts:
+            print(f"[extract]   {name}: trying {cmd[0]} ...")
+            rc = subprocess.run(cmd).returncode
+            if rc == 0:
+                ok = cmd[0]
+                break
+            print(f"[extract]   {name}: {cmd[0]} failed (rc={rc}); trying next ...")
     if ok is None:
         raise RuntimeError(f"extraction of {name!r} failed with all tools; aborting.")
     print(f"[extract]   {name}: done via {ok} in {time.time() - t0:.0f}s")

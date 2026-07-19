@@ -39,22 +39,58 @@ image = modal.Image.debian_slim(python_version="3.11")
 vol = modal.Volume.from_name(VOLUME)
 
 
-@app.function(image=image, volumes={MOUNT: vol}, timeout=6 * 3600)
+@app.function(image=image, volumes={MOUNT: vol}, cpu=8.0, timeout=6 * 3600)
 def consolidate(dry_run: bool):
+    import collections
     import os
+    import time
+    from concurrent.futures import ThreadPoolExecutor
 
     vol.reload()
     tag = "[dry-run] would" if dry_run else "[apply]"
 
-    def move(src, dst):
-        """os.rename src->dst (same volume => instant). Skips if dst exists."""
-        if os.path.exists(dst):
-            print(f"  ⚠️ target exists, SKIP: {dst}")
-            return 0
-        if not dry_run:
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.rename(src, dst)
-        return 1
+    def _do_moves(pairs, label):
+        """Run a list of (src, dst) renames CONCURRENTLY (each is a latency-bound
+        metadata round-trip on the volume, so a thread pool collapses ~thousands
+        of serial renames into a few seconds). Returns the count actually moved.
+        Prints progress every ~5s. In dry-run nothing is renamed."""
+        pairs = [(s, d) for (s, d) in pairs if not os.path.exists(d)]
+        total = len(pairs)
+        if dry_run or total == 0:
+            print(f"[{label}] {tag} move {total:,} dirs", flush=True)
+            return total
+
+        def _mv(pd):
+            s, d = pd
+            os.rename(s, d)     # same volume => metadata-only, but still 1 RTT
+
+        n = 0
+        t0 = last = time.time()
+        it = iter(pairs)
+        inflight = collections.deque()
+        WORKERS, WINDOW = 256, 1024
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            for _ in range(WINDOW):
+                pd = next(it, None)
+                if pd is None:
+                    break
+                inflight.append(ex.submit(_mv, pd))
+            while inflight:
+                inflight.popleft().result()
+                pd = next(it, None)
+                if pd is not None:
+                    inflight.append(ex.submit(_mv, pd))
+                n += 1
+                now = time.time()
+                if now - last >= 5.0 or n == total:
+                    el = now - t0
+                    rate = n / max(1e-6, el)
+                    eta = (total - n) / max(1e-6, rate)
+                    print(f"[{label}]   moved {n}/{total} ({100 * n / total:.1f}%) | "
+                          f"{rate:.0f} dirs/s | elapsed {el:.0f}s | ETA {eta:.0f}s",
+                          flush=True)
+                    last = now
+        return n
 
     train_dir = f"{MOUNT}/{TARGET}/train"
     valid_dir = f"{MOUNT}/{TARGET}/valid"
@@ -75,8 +111,7 @@ def consolidate(dry_run: bool):
         if other:
             print(f"[train] ⚠️ non-patient entries in {sub}: {other}")
         print(f"[train] {tag} move {len(pats):,} patient dirs from '{sub}' -> {TARGET}/train/")
-        for e in pats:
-            n_train += move(f"{src_root}/{e}", f"{train_dir}/{e}")
+        n_train += _do_moves([(f"{src_root}/{e}", f"{train_dir}/{e}") for e in pats], "train")
 
     # ---- valid: move patient dirs from batch 1's valid/ into TARGET/valid ----
     n_valid = 0
@@ -84,17 +119,21 @@ def consolidate(dry_run: bool):
     if os.path.isdir(vsrc):
         pats = sorted(e for e in os.listdir(vsrc) if e.startswith("patient"))
         print(f"[valid] {tag} move {len(pats):,} patient dirs -> {TARGET}/valid/")
-        for e in pats:
-            n_valid += move(f"{vsrc}/{e}", f"{valid_dir}/{e}")
+        n_valid += _do_moves([(f"{vsrc}/{e}", f"{valid_dir}/{e}") for e in pats], "valid")
     else:
         print(f"[valid] source not found (already moved?): {vsrc}")
 
     # ---- CSVs: move to TARGET/ (Path column already references CheXpert-v1.0/...) ----
     for c in CSVS:
         csrc = f"{MOUNT}/{VALID_SRC}/{c}"
+        cdst = f"{MOUNT}/{TARGET}/{c}"
         if os.path.isfile(csrc):
             print(f"[csv] {tag} move {c} -> {TARGET}/{c}")
-            move(csrc, f"{MOUNT}/{TARGET}/{c}")
+            if os.path.exists(cdst):
+                print(f"  ⚠️ target exists, SKIP: {cdst}")
+            elif not dry_run:
+                os.makedirs(os.path.dirname(cdst), exist_ok=True)
+                os.rename(csrc, cdst)
 
     # ---- clean up emptied source dirs + leftover azcopy container dir ----
     if not dry_run:
