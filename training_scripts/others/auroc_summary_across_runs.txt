@@ -1,0 +1,119 @@
+########################################################################################
+Cross-run mean AUROC leaderboard   (source: training_summary.json + results/*.json)
+generated: 2026-07-20T14:02:13
+splits: val19k, val200    runs listed: 44
+  - val19k: 41 run(s) have a value
+  - val200: 41 run(s) have a value
+########################################################################################
+
+========================================================================================
+Ranked by  val19k   (mean AUROC, best first)
+========================================================================================
+   1.  0.8220   convnext_base_22k_u_selftrain                   (val200=0.8723)
+   2.  0.8161   medmae_vitb_chexpert                            (val200=0.8789)
+   3.  0.8159   densenet121_u_mixed                             (val200=0.8411)
+   4.  0.8085   medmae_vitb_nih                                 (val200=0.8891)
+   5.  0.8085   densenet121_cons_zeros                          (val200=0.8451)
+   6.  0.8076   medmae_vitb_nih_B_768_s2                        (val200=0.8934)
+   7.  0.8070   convnext_base_22k_cxr14_pretrain_lowlr_all      (val200=0.8736)
+   8.  0.8069   convnext_base_22k_aucm                          (val200=0.8750)
+   9.  0.8067   convnext_large_22k_cxr14_pretrain               (val200=0.8695)
+  10.  0.8065   medmae_vitb_raw                                 (val200=0.8805)
+  11.  0.8065   convnext_base_22k_768x640                       (val200=0.8854)
+  12.  0.8064   convnext_large_22k                              (val200=0.8519)
+  13.  0.8062   convnext_base_22k_cxr14_pretrain_lowlr          (val200=0.8747)
+  14.  0.8062   convnext_base_22k                               (val200=0.8743)
+  15.  0.8062   convnext_large_22k_768x640                      (val200=0.8774)
+  16.  0.8061   convnext_base_22k_cxr14_pretrain                (val200=0.8628)
+  17.  0.8056   convnext_small                                  (val200=0.8535)
+  18.  0.8045   convnext_tiny_22k                               (val200=0.8625)
+  19.  0.8045   convnext_base_22k_5pct_val                      (val200=0.8603)
+  20.  0.8043   convnext_tiny                                   (val200=0.8671)
+  21.  0.8038   convnext_base_22k_final_stage1                  (val200=0.8808)
+  22.  0.8038   convnext_base_22k_u_selftrain_consol_only       (val200=0.8799)
+  23.  0.8036   swin_base_22k                                   (val200=0.8570)
+  24.  0.8034   convnext_base_22k_seed7                         (val200=0.8809)
+  25.  0.8034   densenet121_temp                                (val200=0.8529)
+  26.  0.8030   convnext_base_22k_1600x1312                     (val200=0.8964)
+  27.  0.8029   densenet201                                     (val200=0.8540)
+  28.  0.8028   convnext_base_22k_seed1337                      (val200=0.8780)
+  29.  0.8028   densenet121                                     (val200=0.8566)
+  30.  0.8026   coatnet_1_12k                                   (val200=0.8352)
+  31.  0.8023   densenet121_seed7                               (val200=0.8533)
+  32.  0.8022   swin_base                                       (val200=0.8523)
+  33.  0.8020   efficientnetv2_m                                (val200=0.8567)
+  34.  0.7996   convnext_base_22k_valid200                      (val200=n/a)
+  35.  0.7994   resnet50_without_clahe                          (val200=0.8381)
+  36.  0.7990   resnet50_u_zeros                                (val200=0.8307)
+  37.  0.7984   convnext_base_22k_curriculum                    (val200=0.8648)
+  38.  0.7983   convnext_base_22k_u_selftrain_all               (val200=0.8651)
+  39.  0.7983   convnext_base_22k_certain_only                  (val200=0.8631)
+  40.  0.7973   resnet50_with_clahe                             (val200=0.8390)
+  41.  0.7548   convnext_base_22k_aucm_no_ce                    (val200=0.8286)
+  ---- no val19k value recorded (listed for completeness) ----
+      n/a      densenet121_seed123                             (val200=0.8461)
+      n/a      medmae_vitb_nih_B_448_s1                        (val200=n/a)
+      n/a      rad_dino_vitB_768                               (val200=n/a)
+
+========================================================================================
+Ranked by  val200   (mean AUROC, best first)
+========================================================================================
+   1.  0.8964   convnext_base_22k_1600x1312                     (val19k=0.8030)
+   2.  0.8934   medmae_vitb_nih_B_768_s2                        (val19k=0.8076)
+   3.  0.8891   medmae_vitb_nih                                 (val19k=0.8085)
+   4.  0.8854   convnext_base_22k_768x640                       (val19k=0.8065)
+   5.  0.8809   convnext_base_22k_seed7                         (val19k=0.8034)
+   6.  0.8808   convnext_base_22k_final_stage1                  (val19k=0.8038)
+   7.  0.8805   medmae_vitb_raw                                 (val19k=0.8065)
+   8.  0.8799   convnext_base_22k_u_selftrain_consol_only       (val19k=0.8038)
+   9.  0.8789   medmae_vitb_chexpert                            (val19k=0.8161)
+  10.  0.8780   convnext_base_22k_seed1337                      (val19k=0.8028)
+  11.  0.8774   convnext_large_22k_768x640                      (val19k=0.8062)
+  12.  0.8750   convnext_base_22k_aucm                          (val19k=0.8069)
+  13.  0.8747   convnext_base_22k_cxr14_pretrain_lowlr          (val19k=0.8062)
+  14.  0.8743   convnext_base_22k                               (val19k=0.8062)
+  15.  0.8736   convnext_base_22k_cxr14_pretrain_lowlr_all      (val19k=0.8070)
+  16.  0.8723   convnext_base_22k_u_selftrain                   (val19k=0.8220)
+  17.  0.8695   convnext_large_22k_cxr14_pretrain               (val19k=0.8067)
+  18.  0.8671   convnext_tiny                                   (val19k=0.8043)
+  19.  0.8651   convnext_base_22k_u_selftrain_all               (val19k=0.7983)
+  20.  0.8648   convnext_base_22k_curriculum                    (val19k=0.7984)
+  21.  0.8631   convnext_base_22k_certain_only                  (val19k=0.7983)
+  22.  0.8628   convnext_base_22k_cxr14_pretrain                (val19k=0.8061)
+  23.  0.8625   convnext_tiny_22k                               (val19k=0.8045)
+  24.  0.8603   convnext_base_22k_5pct_val                      (val19k=0.8045)
+  25.  0.8570   swin_base_22k                                   (val19k=0.8036)
+  26.  0.8567   efficientnetv2_m                                (val19k=0.8020)
+  27.  0.8566   densenet121                                     (val19k=0.8028)
+  28.  0.8540   densenet201                                     (val19k=0.8029)
+  29.  0.8535   convnext_small                                  (val19k=0.8056)
+  30.  0.8533   densenet121_seed7                               (val19k=0.8023)
+  31.  0.8529   densenet121_temp                                (val19k=0.8034)
+  32.  0.8523   swin_base                                       (val19k=0.8022)
+  33.  0.8519   convnext_large_22k                              (val19k=0.8064)
+  34.  0.8461   densenet121_seed123                             (val19k=n/a)
+  35.  0.8451   densenet121_cons_zeros                          (val19k=0.8085)
+  36.  0.8411   densenet121_u_mixed                             (val19k=0.8159)
+  37.  0.8390   resnet50_with_clahe                             (val19k=0.7973)
+  38.  0.8381   resnet50_without_clahe                          (val19k=0.7994)
+  39.  0.8352   coatnet_1_12k                                   (val19k=0.8026)
+  40.  0.8307   resnet50_u_zeros                                (val19k=0.7990)
+  41.  0.8286   convnext_base_22k_aucm_no_ce                    (val19k=0.7548)
+  ---- no val200 value recorded (listed for completeness) ----
+      n/a      convnext_base_22k_valid200                      (val19k=0.7996)
+      n/a      medmae_vitb_nih_B_448_s1                        (val19k=n/a)
+      n/a      rad_dino_vitB_768                               (val19k=n/a)
+
+========================================================================================
+omitted (single-task runs - single-class AUROC, not the 5-task mean): 10
+========================================================================================
+  - convnext_base_22k_atelectasis_only
+  - convnext_base_22k_cardiomegaly_only
+  - convnext_base_22k_consolidation_only
+  - convnext_base_22k_edema_only
+  - convnext_base_22k_final_stage2_atelectasis
+  - convnext_base_22k_final_stage2_cardiomegaly
+  - convnext_base_22k_final_stage2_consolidation
+  - convnext_base_22k_final_stage2_edema
+  - convnext_base_22k_final_stage2_pleural_effusion
+  - convnext_base_22k_pleural_effusion_only

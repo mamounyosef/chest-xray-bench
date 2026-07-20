@@ -2279,6 +2279,15 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     # validation but never affecting best.pt / early stopping. Empty for runs whose
     # config has no (enabled) validation.extra_subsets.
     extra_val_loaders = build_extra_val_loaders(cfg)
+    # Human-readable size label per validation subset, derived from its IMAGE COUNT
+    # (not hardcoded): >=1000 -> "val<k>k" (19392 -> "val19k"), else "val<n>" (200 ->
+    # "val200"). Used to key each subset's block inside best_metrics in the summary so
+    # the 19k primary val and the valid200 radiologist set are recorded SEPARATELY.
+    def _sz_label(n: int) -> str:
+        return f"val{round(n / 1000)}k" if n >= 1000 else f"val{n}"
+    subset_labels = {"val": _sz_label(len(val_loader.dataset))}
+    for _n, _ldr in extra_val_loaders:
+        subset_labels[_n] = _sz_label(len(_ldr.dataset))
     model = model.to(device)
     print_model_summary(model, cfg)
 
@@ -2623,7 +2632,21 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         if is_best:
             track["best"], track["no_improve"] = current, 0
             track["best_step"], track["best_epoch"] = gstep, epoch + 1
-            track["best_metrics"] = {**macro, "val_loss": val_loss}
+            # Record EVERY validated subset's metrics AT this best step, each under its
+            # own size label (val19k, val200, ...): macro means + val_loss + full per-
+            # task breakdown. "monitored" names the subset that actually drove best.pt /
+            # early stopping (mon_src). This keeps the 19k primary val and the valid200
+            # radiologist set distinct in the summary instead of conflating them.
+            def _subset_block(mac, loss, per_task):
+                blk = {**mac, "val_loss": loss}
+                blk["per_task"] = {t: dict(per_task[t]) for t in cfg["tasks"]}
+                return blk
+            bm = {"monitored": subset_labels.get(mon_src, mon_src)}
+            bm[subset_labels["val"]] = _subset_block(macro, val_loss, metrics["per_task"])
+            for _n, _em in extra.items():
+                bm[subset_labels.get(_n, _n)] = _subset_block(
+                    _em["macro"], extra_loss[_n], _em["per_task"])
+            track["best_metrics"] = bm
         else:
             track["no_improve"] += 1
         _safe("best-checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
