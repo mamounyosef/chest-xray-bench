@@ -1,0 +1,23 @@
+{
+  "experiment": "rad_dino_vitB_768",
+  "status": "early_stopped",
+  "monitor": "val_mean_auroc",
+  "mode": "max",
+  "best_value": 0.8929197023720391,
+  "best_step": 4500,
+  "best_epoch": 2,
+  "best_metrics": {
+    "mean_auroc": 0.8043499739566979,
+    "mean_auprc": 0.6051564666322238,
+    "mean_f1": 0.4540248319716536,
+    "mean_precision": 0.5579469296662799,
+    "mean_recall": 0.3994482353708923,
+    "mean_specificity": 0.9168832106290388,
+    "val_loss": 0.43131259747824746
+  },
+  "last_step": 12000,
+  "total_steps": 13435,
+  "elapsed_sec": 18903.46,
+  "elapsed_human": "5h 15m",
+  "updated": "2026-07-19T18:19:52"
+}
