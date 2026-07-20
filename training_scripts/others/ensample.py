@@ -32,7 +32,7 @@ from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "modal"        # "modal" | "local" 
-SET    = "val"      # scored split — "valid200" or "test500" or "val"
+SET    = "test500"      # scored split — "valid200" or "test500" or "val"
 GPU    = "B200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each run's
@@ -62,6 +62,7 @@ REFRESH_CACHE = False
 FULL_MODELS = [
     "convnext_base_22k_1600x1312",
     "medmae_vitb_nih_B_768_s2",
+    "rad_dino_vitB_768",
     # "medmae_vitb_nih",
     # "convnext_base_22k_768x640",
     # "convnext_base_22k_final_stage1",
@@ -93,9 +94,10 @@ CHECKPOINT_MEMBERS = [
 ]
 
 # Per-class thresholds for the F1/precision/recall/specificity of the ENSEMBLE come
-# from this run's results/thresholds.json (AUROC/AUPRC stay threshold-free). Missing
-# file/task -> 0.5 fallback.
-THRESHOLDS_FROM = "convnext_base_22k_final_stage1"
+# from this run's results/thresholds.json (AUROC/AUPRC stay threshold-free). Defaults
+# to the FIRST member in FULL_MODELS (its thresholds.json is on the runs volume because
+# it's an ensemble member). Set to any run name to override. Missing file/task -> 0.5.
+THRESHOLDS_FROM = FULL_MODELS[0]
 
 # Each ensemble run writes into its OWN timestamped subfolder under
 # ensembling_results/, so trying different ensembles never overwrites the last.
@@ -154,6 +156,11 @@ def build_model_generic(cfg: dict):
     # False -> best.pt supplies the weights (no Google-Drive checkpoint reload).
     if cfg["model"].get("arch") == "medmae_vitb":
         return sc.build_medmae_vit(cfg, load_pretrained=False)
+    # RAD-DINO runs (model.arch == "raddino") are a HF Dinov2 backbone wrapped in
+    # sc.RadDinoClassifier (NOT a timm model) — build the identical architecture from
+    # the HF config (load_pretrained=False -> no weight download; best.pt supplies them).
+    if cfg["model"].get("arch") == "raddino":
+        return sc.build_raddino_vit(cfg, load_pretrained=False)
     if "." in name:                                  # timm id (e.g. convnext_base.fb_in22k...)
         return timm.create_model(name, pretrained=False, num_classes=n)
     low = name.lower()
@@ -465,12 +472,16 @@ def _ckpt_member_label(run: str, checkpoint) -> str:
     return f"{run} @ {checkpoint}"
 
 
-def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
+def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
+                 thr_source: str = ""):
     """Core routine. `load_cfg(run)` -> that run's cfg (data paths already correct
     for this environment); `ckpt_path_of(run, checkpoint=None)` -> a checkpoint path
     (None -> that run's best.pt/CKPT_SUBPATH; else a specific best|last|<step>|file);
-    `thr_json` -> a thresholds.json whose per-class thresholds are used for F1/
-    precision/recall/specificity (AUROC/AUPRC are threshold-free)."""
+    `thr_map` -> {task: threshold} per-class thresholds for F1/precision/recall/
+    specificity (AUROC/AUPRC are threshold-free); `thr_source` -> a human label of
+    where they came from (for the summary/logs). The thresholds are resolved by the
+    LAUNCHER from the local repo and passed in, so they always load regardless of what
+    happens to be on the runs volume."""
     import json, pandas as pd
     from datetime import datetime
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -485,13 +496,13 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
     cache_dir = Path(out_dir).parent.parent / "cache_runs"
     print(f"[cache] dir: {cache_dir / SET}")
 
-    # per-class thresholds for F1/P/R/Spec (AUROC/AUPRC ignore them).
-    thr_map = {}
-    if thr_json is not None and Path(thr_json).exists():
-        thr_map = json.load(open(thr_json, encoding="utf-8")).get("thresholds", {})
-        print(f"[ensemble] thresholds from {thr_json}")
+    # per-class thresholds for F1/P/R/Spec (AUROC/AUPRC ignore them). Resolved by the
+    # launcher from the local repo and passed in as a dict -> never depends on the vol.
+    thr_map = thr_map or {}
+    if thr_map:
+        print(f"[ensemble] thresholds from {thr_source or '(provided)'}")
     else:
-        print(f"[ensemble] WARNING: {thr_json} not found -> F1/P/R/Spec at 0.5")
+        print(f"[ensemble] WARNING: no thresholds ({thr_source or 'none'}) -> F1/P/R/Spec at 0.5")
     thr_vec = [float(thr_map.get(t, 0.5)) for t in tasks]
 
     # ground truth labels are FIXED per SET -> cache them too, so an ALL-cached run
@@ -565,7 +576,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
         "generated": datetime.now().isoformat(timespec="seconds"),
         "set": SET, "n_images": int(len(df)),
         "members": list(members.keys()),
-        "thresholds_source": str(thr_json),
+        "thresholds_source": thr_source or "(none -> 0.5)",
         "thresholds": {t: thr_vec[i] for i, t in enumerate(tasks)},
         "ensemble_mean_auroc": ens_metrics["macro"]["mean_auroc"],
         "ensemble_macro": ens_metrics["macro"],
@@ -578,7 +589,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
     lines = ["=" * 78,
              f"ENSEMBLE (prob-average)  —  set={SET}  images={len(df)}",
              f"generated: {summary['generated']}",
-             f"thresholds (F1/P/R/Spec): {thr_json}", "=" * 78,
+             f"thresholds (F1/P/R/Spec): {thr_source or '(none -> 0.5)'}", "=" * 78,
              f"  ENSEMBLE mean AUROC={mac['mean_auroc']:.4f}  AUPRC={mac['mean_auprc']:.4f}  "
              f"F1={mac['mean_f1']:.4f}  P={mac['mean_precision']:.4f}  "
              f"R={mac['mean_recall']:.4f}  Spec={mac['mean_specificity']:.4f}",
@@ -604,6 +615,20 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_json: Path = None):
     print(f"wrote -> {txt_path}")
 
 
+def _load_thresholds(run_name: str):
+    """Read {task: threshold} from a run's LOCAL results/thresholds.json (the repo
+    always ships it, unlike the runs volume). Runs on the LAUNCHER; the resolved dict
+    is then passed to run_ensemble (local) or handed to the remote function (modal), so
+    the thresholds always load even if this run isn't a member / isn't on the volume.
+    Returns (thr_map, source_label); a missing file -> ({}, "<...> (MISSING)")."""
+    import json
+    p = PKG_ROOT / run_name / "results" / "thresholds.json"
+    if p.exists():
+        thr_map = json.load(open(p, encoding="utf-8")).get("thresholds", {})
+        return thr_map, f"{run_name}/results/thresholds.json (local)"
+    return {}, f"{run_name}/results/thresholds.json (MISSING)"
+
+
 # ----------------------------- local execution -----------------------------
 def run_local():
     def load_cfg(run):
@@ -620,9 +645,9 @@ def run_local():
             return p
         return sc._resolve_resume(checkpoint, base / Path(sub).parent)   # honor stage subfolder
 
-    thr_json = PKG_ROOT / THRESHOLDS_FROM / "results" / "thresholds.json"
+    thr_map, thr_src = _load_thresholds(THRESHOLDS_FROM)
     out_dir = _out_subdir(Path(__file__).resolve().parent)   # others/ensembling_results/<stamp>
-    run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_json)
+    run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_map, thr_src)
     return out_dir
 
 
@@ -639,7 +664,6 @@ except ImportError:
 if _MODAL_OK and modal.is_local():
     _ref_cfg = sc.load_config(PKG_ROOT / FULL_MODELS[0], verbose=False)
     app = modal.App(f"ensemble-{SET}")
-    _image = sc.modal_image(python_version=f"{sys.version_info.major}.{sys.version_info.minor}")
     _runs_vol = modal.Volume.from_name(_ref_cfg["modal"]["runs_volume"], create_if_missing=True)
 
     # Mount EVERY distinct data volume any member uses, each at its own mount point,
@@ -650,11 +674,21 @@ if _MODAL_OK and modal.is_local():
                  + [m["run"] for m in CHECKPOINT_MEMBERS]
                  + (list(STAGE2_GROUP.values()) if USE_STAGE2 else []))
     _volumes = {_ref_cfg["modal"]["runs_mount"]: _runs_vol}
+    _needs_transformers = False
     for _run in _all_runs:
-        _mc = sc.load_config(PKG_ROOT / _run, verbose=False)["modal"]
+        _rcfg = sc.load_config(PKG_ROOT / _run, verbose=False)
+        _mc = _rcfg["modal"]
         _mount, _vname = _mc["data_mount"], _mc["data_volume"]
         if _mount not in _volumes:
             _volumes[_mount] = modal.Volume.from_name(_vname, create_if_missing=True)
+        if _rcfg["model"].get("arch") == "raddino":
+            _needs_transformers = True   # RAD-DINO is a HF model — timm can't load it
+
+    # RAD-DINO members need `transformers` in the image (added in a second pip layer so
+    # the shared base layer/cache is untouched when no raddino member is present).
+    _image = sc.modal_image(
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+        extra_pip=["transformers"] if _needs_transformers else None)
 
     # If EVERY member (and the labels) is already cached locally, the remote run is
     # pure CPU averaging -> reserve NO GPU (don't idle-book a B200). Otherwise use the
@@ -680,7 +714,7 @@ if _MODAL_OK and modal.is_local():
         serialized=True,
         **_resources,
     )
-    def ensemble_remote():
+    def ensemble_remote(thr_map=None, thr_source=""):
         # Self-contained: import everything INSIDE so nothing from __main__ (which
         # references shared_code) gets cloudpickled. Reuse run_ensemble from the
         # MOUNTED module (imported here, where shared_code is importable).
@@ -704,10 +738,11 @@ if _MODAL_OK and modal.is_local():
                 return base / sub
             return _sc._resolve_resume(checkpoint, base / _P(sub).parent)   # honor stage subfolder
 
-        thr_json = runs_mount / _E.THRESHOLDS_FROM / "results" / "thresholds.json"
         out_dir = _E._out_subdir(runs_mount)         # /runs/ensembling_results/<timestamp>
         try:
-            _E.run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_json)
+            # thresholds are resolved locally by the launcher and passed in (thr_map),
+            # so they load regardless of what's on the runs volume.
+            _E.run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_map, thr_source)
         finally:
             _runs_vol.commit()                        # persist before the local fetch reads it
         # hand the volume-relative POSIX subpath back so the launcher can download it
@@ -721,9 +756,10 @@ if __name__ == "__main__":
         _base_local = Path(__file__).resolve().parent
         _runs_volume = _ref_cfg["modal"]["runs_volume"]
         _sync_cache_up(_runs_volume, _base_local)    # push local cache so remote can reuse it
+        _thr_map, _thr_src = _load_thresholds(THRESHOLDS_FROM)   # resolve locally -> pass to remote
         with modal.enable_output():
             with app.run():
-                remote_sub = ensemble_remote.remote()   # volume-relative POSIX subpath
+                remote_sub = ensemble_remote.remote(_thr_map, _thr_src)   # volume-relative POSIX subpath
         _sync_cache_down(_runs_volume, _base_local)  # pull GPU-computed cache back to this PC
         # remote run + volume commit are done; pull the results folder down locally.
         if remote_sub:
