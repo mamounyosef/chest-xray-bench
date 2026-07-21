@@ -71,21 +71,19 @@ model:
 reproducibility:
   seed: 42
 
-# FRESH run (resume: null) — no full-state resume. Setting resume to null is what lets
-# init_weights_from_remote below take effect: the engine only warm-starts weights when
-# resume is None; any non-null resume would instead restore a FULL checkpoint (optimizer,
-# scheduler, step/epoch, early-stopping) and skip the warm-start entirely.
-resume: null
+# CONTINUE this run from its OWN best.pt (global step 9000) with a BUMPED LR.
+# resume: 'best' restores the weights + progress (step/epoch) + best/early-stopping
+# tracking; resume_fresh_schedule then DISCARDS the restored optimizer/scheduler and
+# rebuilds them from the config below, so the new LR (6e-6 peak) + fresh 900-step warmup
+# + cosine take effect over the REMAINING steps (16122 total for 6 epochs - 9000 = 7122,
+# ~2.65 more epochs). Warmup begins at warmup_start_factor*lr = 0.145*6e-6 = 8.7e-7,
+# i.e. exactly where the head LR left off (embed correspondingly at ~1.11e-7).
+resume: 'best'
+resume_fresh_schedule: true
 
-# ----------------------------------------------------------------------------
-# Weights-only warm-start from rad_dino_vitB_768's step-1600 checkpoint (end of its
-# ~first epoch), which lives on the runs volume. remote_cfg() maps this to
-# init_weights_from at run time; the engine loads ONLY the model state_dict (backbone +
-# head) and starts everything else fresh (step/epoch=0, new optimizer + scheduler + the
-# low LR & 900-step warmup below). NOT backbone-only: the head shape is unchanged, so the
-# full model loads. Local runs (which don't mount /runs) would ignore this — this run is
-# Modal-only.
-init_weights_from_remote: "/runs/rad_dino_vitB_768/results/checkpoints/ckpt_step1600.pt"
+# init_weights_from_remote is DISABLED now: it only fires on a fresh (resume: null) start,
+# and this is a full resume from the run's own best.pt.
+# init_weights_from_remote: "/runs/rad_dino_vitB_768/results/checkpoints/ckpt_step1600.pt"
 
 # ----------------------------------------------------------------------------
 # Labels  —  MIXED per-task uncertainty: U-Ones everywhere except Consolidation
@@ -152,25 +150,26 @@ performance:
   compile_mode: "default"
 
 # ----------------------------------------------------------------------------
-# Training  —  LOW-LR high-res continuation from step-1600 weights: lr 1e-5 -> 1e-7 (1%),
-# LLRD 0.75, 900-step LINEAR warmup then cosine, grad_clip 1.0, label_smoothing 0.05,
-# AdamW wd 1e-5. warmup_steps (absolute) is used INSTEAD of warmup_epochs so the ramp is
-# a fixed 900 optimizer steps regardless of epoch length.
+# Training  —  BUMPED-LR continuation (resume: 'best' + resume_fresh_schedule): the
+# rebuilt schedule ramps the head LR 8.7e-7 -> 6e-6 over a 900-step linear warmup, then
+# cosine -> 1e-7 over the REMAINING steps (7122, to the end of epoch 6). LLRD 0.75,
+# grad_clip 1.0, label_smoothing 0.05, AdamW wd 1e-5. warmup_start_factor 0.145 sets the
+# warmup START = 0.145*6e-6 = 8.7e-7 (head), i.e. exactly where the run left off.
 # ----------------------------------------------------------------------------
 training:
-  epochs:        4
+  epochs:        6
   amp:           true
   grad_clip:     1.0
 
   optimizer:
-    lr:           1.0e-5
+    lr:           6.0e-6
     weight_decay: 1.0e-5
     layer_decay:  0.75
 
   scheduler:
     name:        "cosine"
-    warmup_steps: 1000
-    warmup_start_factor: 0.001
+    warmup_steps: 900
+    warmup_start_factor: 0.145
     min_lr:      1.0e-7
     plateau_patience: 2
 

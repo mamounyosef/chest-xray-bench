@@ -2406,9 +2406,19 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
              "no_improve": 0, "last_monitor": 0.0,
              "best_step": 0, "best_epoch": 0, "best_metrics": None,
              "prev_macro": None, "prev_per_task": None, "prev_val_loss": None}
+    # resume_fresh_schedule (opt-in): on resume, keep the WEIGHTS + progress
+    # (global_step/epoch) + best/early-stopping tracking, but DO NOT restore the
+    # optimizer / scheduler / scaler. They're rebuilt below from the CURRENT config so a
+    # NEW (e.g. higher) LR, fresh warmup and (optionally) more epochs take effect
+    # mid-run, with the cosine re-anchored over the steps that REMAIN. A normal resume
+    # (flag off/absent) restores all state and continues the old LR schedule unchanged.
+    fresh_sched = bool(cfg.get("resume_fresh_schedule")) and resume is not None
     if resume is not None:
-        info = load_checkpoint(resume, model, ckpt_dir, optimizer, scheduler,
-                               scaler, device, restore_rng=True)
+        info = load_checkpoint(resume, model, ckpt_dir,
+                               None if fresh_sched else optimizer,
+                               None if fresh_sched else scheduler,
+                               None if fresh_sched else scaler,
+                               device, restore_rng=True)
         global_step = info["global_step"]
         prior_elapsed = info["elapsed_sec"]
         # global_step is the single source of truth for WHERE we are: this handles
@@ -2433,6 +2443,32 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         # without a saved track fall back to best_score only (no_improve=0).
         if info.get("track"):
             track.update(info["track"])
+        if fresh_sched:
+            # Rebuild optimizer + scheduler from the CURRENT config. The cosine is
+            # re-anchored over the REMAINING steps (from here to the possibly-extended
+            # end) with a fresh linear warmup, so LR ramps back up to the new base_lr and
+            # then anneals to min_lr exactly at the finish. train_one_epoch does NOT step
+            # the scheduler over the fast-forwarded resume_skip batches, so the fresh
+            # warmup begins at the true continuation point.
+            if use_curriculum:
+                _spe_f = warmup_ref_spe
+                _remaining = max(1, curr_total_steps - global_step)
+            else:
+                _spe_f = math.ceil(len(train_loader) / grad_accum)
+                _remaining = max(1, epochs * _spe_f - global_step)
+            optimizer = build_optimizer(model, cfg, loss_fn)
+            scheduler, sched_mode = build_scheduler(
+                optimizer, cfg, steps_per_epoch=_spe_f, total_steps_override=_remaining)
+            warmup_steps = _warmup_steps_for(cfg, _spe_f, _remaining)
+            _newlr = float(cfg["training"]["optimizer"]["lr"])
+            _minlr = float(cfg["training"]["scheduler"].get("min_lr", 0.0))
+            print("=" * 70)
+            print(f"🔁 [resume-fresh-schedule] weights + step {global_step} + best-tracking "
+                  f"KEPT; optimizer/scheduler/scaler state DISCARDED.")
+            print(f"   rebuilt from config: base_lr={_newlr:.3e}, {warmup_steps}-step linear "
+                  f"warmup then cosine → {_minlr:.3e} over {_remaining} remaining optimizer "
+                  f"steps (to the end of epoch {epochs}).")
+            print("=" * 70)
 
     run_start = time.time()
     console_log_every = int(out["console_log_every"])

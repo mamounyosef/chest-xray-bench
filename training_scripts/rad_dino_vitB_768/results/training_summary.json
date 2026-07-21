@@ -6,14 +6,85 @@
   "best_value": 0.8929197023720391,
   "best_step": 4500,
   "best_epoch": 2,
+  "_note": "best_metrics migrated to the two-split schema. This run monitored valid200, so the OLD file stored val200 in best_value and val19k in best_metrics.mean_auroc. val19k below keeps its in-training macro means (per-task was never recorded in-training -> null). val200 below is taken from the post-training eval at the SAME best checkpoint (step 4500, results/valid200_results.json), which is the only source of its per-task / full macro breakdown; val200.mean_auroc is pinned to best_value (the monitored in-training number, ~2.5e-5 from the post-eval macro).",
   "best_metrics": {
-    "mean_auroc": 0.8043499739566979,
-    "mean_auprc": 0.6051564666322238,
-    "mean_f1": 0.4540248319716536,
-    "mean_precision": 0.5579469296662799,
-    "mean_recall": 0.3994482353708923,
-    "mean_specificity": 0.9168832106290388,
-    "val_loss": 0.43131259747824746
+    "monitored": "val200",
+    "val19k": {
+      "mean_auroc": 0.8043499739566979,
+      "mean_auprc": 0.6051564666322238,
+      "mean_f1": 0.4540248319716536,
+      "mean_precision": 0.5579469296662799,
+      "mean_recall": 0.3994482353708923,
+      "mean_specificity": 0.9168832106290388,
+      "val_loss": 0.43131259747824746,
+      "per_task": null
+    },
+    "val200": {
+      "mean_auroc": 0.8929197023720391,
+      "mean_auprc": 0.7426280461612249,
+      "mean_f1": 0.6444912632193587,
+      "mean_precision": 0.6218105876224482,
+      "mean_recall": 0.7945558969856599,
+      "mean_specificity": 0.8134405698492415,
+      "val_loss": 0.4384969174861908,
+      "per_task": {
+        "Atelectasis": {
+          "auroc": 0.8314123376623377,
+          "auprc": 0.6725908143793553,
+          "f1": 0.6960784313725491,
+          "precision": 0.5725806451612904,
+          "recall": 0.8875,
+          "specificity": 0.6558441558441559,
+          "n_pos": 80,
+          "n_excluded": 0,
+          "threshold": 0.2835891842842102
+        },
+        "Cardiomegaly": {
+          "auroc": 0.8299964564138909,
+          "auprc": 0.7222166095643819,
+          "f1": 0.5,
+          "precision": 0.8571428571428571,
+          "recall": 0.35294117647058826,
+          "specificity": 0.9759036144578314,
+          "n_pos": 68,
+          "n_excluded": 0,
+          "threshold": 0.24527095258235931
+        },
+        "Consolidation": {
+          "auroc": 0.9300467360168854,
+          "auprc": 0.6342653996326524,
+          "f1": 0.532258064516129,
+          "precision": 0.3626373626373626,
+          "recall": 1.0,
+          "specificity": 0.7114427860696517,
+          "n_pos": 33,
+          "n_excluded": 0,
+          "threshold": 0.08245544135570526
+        },
+        "Edema": {
+          "auroc": 0.9359200470311582,
+          "auprc": 0.8218786615418555,
+          "f1": 0.7155963302752294,
+          "precision": 0.609375,
+          "recall": 0.8666666666666667,
+          "specificity": 0.8677248677248677,
+          "n_pos": 45,
+          "n_excluded": 0,
+          "threshold": 0.27162784337997437
+        },
+        "Pleural Effusion": {
+          "auroc": 0.9373491822325497,
+          "auprc": 0.8621887456878795,
+          "f1": 0.7785234899328859,
+          "precision": 0.7073170731707317,
+          "recall": 0.8656716417910447,
+          "specificity": 0.8562874251497006,
+          "n_pos": 67,
+          "n_excluded": 0,
+          "threshold": 0.3985850512981415
+        }
+      }
+    }
   },
   "last_step": 12000,
   "total_steps": 13435,
