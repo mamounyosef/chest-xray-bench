@@ -2708,7 +2708,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         # Per-source ⭐/⚠️ status: the primary val AND every extra subset (e.g.
         # valid200), each vs its OWN running best (bbs, seeded above), so each gets its
         # OWN ⭐/⚠️ independently. Only mon_src drives best.pt + early stopping — it is
-        # the ONLY line that shows the patience counter and the 💾 save marker.
+        # the ONLY line with the ← marker and the 💾 save marker; the shared patience
+        # counter is shown on EVERY no-improvement line for visibility.
         mon_vals = {"val": _monitor_value(macro, val_loss, monitor)}
         for _n in extra:
             mon_vals[_n] = _monitor_value(extra[_n]["macro"], extra_loss[_n], monitor)
@@ -2728,7 +2729,11 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                 saved = "   💾 saved best.pt" if (src == mon_src and is_best) else ""
                 print(f"     ⭐ {label} NEW BEST  {monitor}={v:.4f} ({sign}{g:.4f}){saved}{drives}")
             else:
-                cnt = f"  ({track['no_improve']}/{es_patience})" if src == mon_src else ""
+                # the shared early-stop patience counter is shown on EVERY subset's
+                # no-improvement line (there is only one counter — driven by mon_src —
+                # but it's displayed on all for visibility); the ← marker still flags
+                # which subset actually drives it.
+                cnt = f"  ({track['no_improve']}/{es_patience})"
                 print(f"     ⚠️  {label} no improvement  best {monitor}={bbs[src]:.4f}{cnt}{drives}")
         print("-" * 70)
 
@@ -3508,7 +3513,8 @@ def calibrate_thresholds(cfg, model, df_val, device, amp: bool = False,
           f"(bs={batch_size}, workers={num_workers}) ...")
     y_true, y_prob, excl, _ = _predict_dataframe(
         cfg, model, df_val, device, loss_fn, amp, channels_last=False,
-        batch_size=batch_size, num_workers=num_workers)
+        batch_size=batch_size, num_workers=num_workers,
+        progress_desc="calibrate/val")
     thresholds = {}
     for k, t in enumerate(tasks):
         keep = ~excl[:, k]                       # drop uncertain rows (multiclass tasks)
@@ -3755,7 +3761,8 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
         print(f"  rows: {len(df)}  ->  running inference ...")
         y_true, y_prob, excl, val_loss = _predict_dataframe(
             cfg, model, df, device, loss_fn, amp, channels_last=False,
-            batch_size=batch_size, num_workers=num_workers)
+            batch_size=batch_size, num_workers=num_workers,
+            progress_desc=f"eval/{set_name}")
         metrics = compute_metrics(y_true, y_prob, tasks, threshold=thr_vec,
                                   exclude_mask=excl)
 
