@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : rad_dino_vitB_1064x896
+  checkpoint : /runs/rad_dino_vitB_1064x896/results/checkpoints/best.pt
+  images     : 234    device: cuda    amp: False
+  use_clahe  : False    u_policy: mixed    val_loss: 0.43280
+  thresholds : per-task (f1-optimal on 01_val.csv)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8940        mean AUPRC : 0.7353
+    mean F1    : 0.6359    mean precision: 0.6344    mean recall: 0.7723    mean spec: 0.8230
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.271  0.8446  0.6880  0.7100  0.5917  0.8875  0.6818      80
+    Cardiomegaly        0.292  0.8301  0.7307  0.4731  0.8800  0.3235  0.9819      68
+    Consolidation       0.076  0.9300  0.5948  0.5156  0.3474  1.0000  0.6915      33
+    Edema               0.337  0.9285  0.8030  0.7037  0.6032  0.8444  0.8677      45
+    Pleural Effusion    0.427  0.9370  0.8600  0.7770  0.7500  0.8060  0.8922      67
+======================================================================================

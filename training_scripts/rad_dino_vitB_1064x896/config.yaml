@@ -78,8 +78,8 @@ reproducibility:
 # + cosine take effect over the REMAINING steps (16122 total for 6 epochs - 9000 = 7122,
 # ~2.65 more epochs). Warmup begins at warmup_start_factor*lr = 0.145*6e-6 = 8.7e-7,
 # i.e. exactly where the head LR left off (embed correspondingly at ~1.11e-7).
-resume: 'best'
-resume_fresh_schedule: true
+resume:  11600
+resume_fresh_schedule: false
 
 # init_weights_from_remote is DISABLED now: it only fires on a fresh (resume: null) start,
 # and this is a full resume from the run's own best.pt.
@@ -131,7 +131,7 @@ dataloader:
   prefetch_factor:    4
   persistent_workers: true
   drop_last:          false
-  val_batch_size:         512
+  val_batch_size:         256
   val_num_workers:        26
   val_pin_memory:         true
   val_prefetch_factor:    4
@@ -188,7 +188,7 @@ evaluation:
   metric: "mean_auroc"
   eval_level: "image"
   eval_every_epochs: null
-  eval_every_steps: 500
+  eval_every_steps: 150
 
 # ----------------------------------------------------------------------------
 # Paths  —  the native tree stores images under CheXpert-v1.0 (not the small
@@ -206,8 +206,8 @@ paths:
 # ----------------------------------------------------------------------------
 modal:
   gpu: "H200"
-  cpu_cores: 26
-  memory_gb: 45
+  cpu_cores: 32
+  memory_gb: 68
   timeout_seconds: 43200      # 12 hours
   data_volume: "chexpert-native-data"
   runs_volume: "chexpert-runs"
