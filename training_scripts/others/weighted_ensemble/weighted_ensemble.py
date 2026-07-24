@@ -41,10 +41,25 @@ MEMBERS = [
     "convnext_base_22k_1600x1312",
     "medmae_vitb_nih_B_768_s2",
     "rad_dino_vitB_768",
+    # "rad_dino_vitB_1064x896",
+    # "convnext_base_22k_768x640",
+]
+
+# Extra members from SPECIFIC checkpoints — each is its own independent voter in the
+# weight search, ADDED on top of MEMBERS (mirrors ensample.py's CHECKPOINT_MEMBERS). Lets
+# you weight several checkpoints of the SAME run as separate members (e.g. best.pt via
+# MEMBERS + step 7500 here). Each entry: {"run": <run>, "checkpoint": "best"|"last"|<int step>|<file.pt>}.
+# Resolved in that run's checkpoints dir like `resume` (7500 -> ckpt_step7500.pt; two-stage
+# subfolder from CKPT_SUBPATH honored). Labeled "<run> @ step<N>" so it never collides with
+# the plain "<run>" best.pt member — and matches ensample.py's label, so the weights file
+# this writes drops straight into ensample.py's WEIGHTS_FROM. Empty list = off.
+CHECKPOINT_MEMBERS = [
+    # {"run": "convnext_base_22k_1600x1312", "checkpoint": 7500},
+    # {"run": "medmae_vitb_nih_B_768_s2", "checkpoint": 4400},
 ]
 
 # ---- weight-search knobs --------------------------------------------------
-GRID_STEP = 0.1         # each member weight ∈ {0, STEP, 2*STEP, ..., 1}, summing to 1.
+GRID_STEP = 0.25         # each member weight ∈ {0, STEP, 2*STEP, ..., 1}, summing to 1.
                         # 0.1 -> 66 weight vectors per class (3 members). Finer = more.
 N_FOLDS   = 5           # cross-validation folds over the split (fit on N_FOLDS-1, repeat).
 SEED      = 42          # KFold shuffle seed (reproducible fold assignment).
@@ -131,11 +146,45 @@ def _dummy_loss(logits, targets):
     return logits.sum() * 0.0        # we only need probabilities, not the loss
 
 
+# ==================== member identity (run and/or checkpoint) ===============
+# A "member" is either a plain best.pt run (label = run name) or a specific checkpoint
+# of a run (label = "<run> @ step<N>"). These labels + cache stems match ensample.py's
+# exactly, so the shared cache and the weights file interoperate with it verbatim.
+def _ckpt_member_label(run: str, checkpoint) -> str:
+    """Distinct label for a specific-checkpoint member (never collides with the plain
+    '<run>' best.pt member): '<run> @ step7500' for an int, '<run> @ <spec>' else."""
+    if isinstance(checkpoint, int) or (isinstance(checkpoint, str) and checkpoint.isdigit()):
+        return f"{run} @ step{int(checkpoint)}"
+    return f"{run} @ {checkpoint}"
+
+
+def _member_ckpt_stem(run: str, checkpoint=None):
+    """The checkpoint-file stem used in a member's cache name (f'{run}_{stem}'), WITHOUT
+    touching any volume. Returns None when it can't be known offline ('last' -> needs a
+    directory listing); the caller then resolves it. Mirrors ensample.py's naming."""
+    sub = CKPT_SUBPATH.get(run, "best.pt")
+    if checkpoint is None or checkpoint == "best":
+        return Path(sub).stem                              # "best" for best.pt
+    if isinstance(checkpoint, int) or (isinstance(checkpoint, str) and checkpoint.isdigit()):
+        return f"ckpt_step{int(checkpoint)}"
+    if isinstance(checkpoint, str) and checkpoint.endswith(".pt"):
+        return Path(checkpoint).stem
+    return None                                            # e.g. "last" -> undecidable offline
+
+
+def _member_specs():
+    """Ordered (label, run, checkpoint) for EVERY member: the plain best.pt MEMBERS
+    first, then the specific-checkpoint CHECKPOINT_MEMBERS. This ordered list is the
+    single source of truth for member identity + axis order everywhere below."""
+    specs = [(run, run, None) for run in MEMBERS]
+    for m in CHECKPOINT_MEMBERS:
+        specs.append((_ckpt_member_label(m["run"], m["checkpoint"]), m["run"], m["checkpoint"]))
+    return specs
+
+
 # ==================== per-member prob cache (shared with ensample) ==========
-# SAME cache as ensample.py: others/cache_runs/<set>/<run>_best.npy (+ _y_true.npy).
+# SAME cache as ensample.py: others/cache_runs/<set>/<run>_<stem>.npy (+ _y_true.npy).
 # NAME-based: a present .npy is a HIT reused as-is (no GPU, no checkpoint needed).
-def _member_ckpt_stem(run: str) -> str:
-    return Path(CKPT_SUBPATH.get(run, "best.pt")).stem       # "best" for best.pt
 
 
 def _cache_npy(cache_dir: Path, set_name: str, cache_name: str) -> Path:
@@ -188,16 +237,29 @@ def _predict_member(cfg, ckpt_resolver, df, device, cache_dir, set_name, cache_n
 
 
 def _expected_cache_names():
-    return [f"{run}_{_member_ckpt_stem(run)}" for run in MEMBERS]
+    """(names, undecidable): the cache basenames every member will look up, and whether
+    any member's name can't be resolved offline (e.g. a 'last' checkpoint)."""
+    names, undecidable = [], False
+    for _label, run, ckpt in _member_specs():
+        stem = _member_ckpt_stem(run, ckpt)
+        if stem is None:
+            undecidable = True
+        else:
+            names.append(f"{run}_{stem}")
+    return names, undecidable
 
 
 def _members_all_cached(cache_dir: Path, set_name: str) -> bool:
     """True iff EVERY member's probs AND the labels are already cached for `set_name`
-    -> the Modal VM can run CPU-only (no GPU). REFRESH_CACHE -> False."""
+    -> the Modal VM can run CPU-only (no GPU). Any undecidable member ('last') -> False;
+    REFRESH_CACHE -> False."""
     if REFRESH_CACHE:
         return False
+    names, undecidable = _expected_cache_names()
+    if undecidable or not names:
+        return False
     cdir = Path(cache_dir) / set_name
-    needed = [f"{n}.npy" for n in _expected_cache_names()] + ["_y_true.npy"]
+    needed = [f"{n}.npy" for n in names] + ["_y_true.npy"]
     missing = [f for f in needed if not (cdir / f).exists()]
     if missing:
         print(f"[gpu] not all cached for {set_name} — missing: {missing}")
@@ -319,7 +381,7 @@ def _pick_weights_on(idx, probs, y_true, c, grid, uniform):
     return np.asarray(best), best_auc
 
 
-def _cv_weight_search(probs, y_true, tasks):
+def _cv_weight_search(probs, y_true, tasks, member_labels):
     """Per-class 5-fold-CV weighted search. Returns a dict per task with the final
     (fold-averaged) weight vector, the 5 per-fold vectors, and the OOF AUROC (each
     fold's own weights scored on its held-out fold — the honest estimate)."""
@@ -343,7 +405,7 @@ def _cv_weight_search(probs, y_true, tasks):
         final_w = fold_ws.mean(axis=0)                       # sums to 1 (each row does)
         oof = float(np.nanmean(oof_scores)) if np.any(~np.isnan(oof_scores)) else float("nan")
         result[t] = {"weights": final_w, "fold_weights": fold_ws, "oof_auroc": oof}
-        _wtxt = "  ".join(f"{MEMBERS[m]}={final_w[m]:.3f}" for m in range(M))
+        _wtxt = "  ".join(f"{member_labels[m]}={final_w[m]:.3f}" for m in range(M))
         print(f"[search] {t:<18} OOF AUROC={oof:.4f}  weights: {_wtxt}")
     return result
 
@@ -368,7 +430,9 @@ def run_weighted_ensemble(load_cfg, ckpt_path_of, out_dir: Path, cache_dir: Path
     from datetime import datetime
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ref = load_cfg(MEMBERS[0])
+    specs = _member_specs()                          # [(label, run, checkpoint), ...]
+    member_labels = [lab for lab, _, _ in specs]
+    ref = load_cfg(specs[0][1])
     tasks = list(ref["tasks"])
     data_dir = Path(ref["paths"]["data_dir"])
     df = pd.read_csv(data_dir / ref["paths"][f"{SET}_csv"])
@@ -390,13 +454,14 @@ def run_weighted_ensemble(load_cfg, ckpt_path_of, out_dir: Path, cache_dir: Path
 
     # --- gather every member's (N, T) prob matrix (cache or compute) ---
     member_probs = {}
-    for i, run in enumerate(MEMBERS, 1):
+    for i, (label, run, ckpt) in enumerate(specs, 1):
         cfg = load_cfg(run)
-        print(f"[member {i}/{len(MEMBERS)}] {run}", flush=True)
-        cname = f"{run}_{_member_ckpt_stem(run)}"
-        p = _predict_member(cfg, (lambda run=run: ckpt_path_of(run)),
-                            df, device, cache_dir, SET, cname)
-        member_probs[run] = np.asarray(p)
+        print(f"[member {i}/{len(specs)}] {label}", flush=True)
+        resolver = (lambda run=run, ckpt=ckpt: ckpt_path_of(run, ckpt))
+        stem = _member_ckpt_stem(run, ckpt) or Path(resolver()).stem   # resolve only if 'last'
+        cname = f"{run}_{stem}"
+        p = _predict_member(cfg, resolver, df, device, cache_dir, SET, cname)
+        member_probs[label] = np.asarray(p)
         if y_true is None:                       # compute + cache labels once (cheap)
             yt, _, _, _ = sc._predict_dataframe(
                 cfg, build_model_generic(cfg).to(device).eval(),
@@ -407,11 +472,11 @@ def run_weighted_ensemble(load_cfg, ckpt_path_of, out_dir: Path, cache_dir: Path
             np.save(_yt_npy, y_true)
             print(f"[cache] save {SET}/_y_true  {y_true.shape} (labels)")
 
-    probs = np.stack([member_probs[r] for r in MEMBERS], axis=0)      # (M, N, T)
+    probs = np.stack([member_probs[lab] for lab in member_labels], axis=0)   # (M, N, T)
     y_true = np.asarray(y_true)
 
     # --- per-class CV weighted search ---
-    per_class = _cv_weight_search(probs, y_true, tasks)
+    per_class = _cv_weight_search(probs, y_true, tasks, member_labels)
 
     # --- assemble blends + metrics ---
     _PC = ("auroc", "auprc", "f1", "precision", "recall", "specificity")
@@ -421,25 +486,26 @@ def run_weighted_ensemble(load_cfg, ckpt_path_of, out_dir: Path, cache_dir: Path
         return {"macro": m["macro"],
                 "per_class": {t: {k: m["per_task"][t][k] for k in _PC} for t in tasks}}
 
-    weighted = _metrics(_apply_weights(probs, per_class))            # per-class weighted
-    flat = _metrics(probs.mean(axis=0))                             # 1/M baseline
-    per_member = {r: _metrics(member_probs[r]) for r in MEMBERS}    # each model, per class
+    weighted = _metrics(_apply_weights(probs, per_class))                 # per-class weighted
+    flat = _metrics(probs.mean(axis=0))                                  # 1/M baseline
+    per_member = {lab: _metrics(member_probs[lab]) for lab in member_labels}  # each member, per class
 
     oof_mean = float(np.nanmean([per_class[t]["oof_auroc"] for t in tasks]))
+    _M = len(member_labels)
 
     summary = {
         "generated": datetime.now().isoformat(timespec="seconds"),
         "set": SET, "n_images": int(len(df)),
-        "members": list(MEMBERS),
+        "members": list(member_labels),
         "grid_step": GRID_STEP, "n_folds": N_FOLDS, "seed": SEED,
         "thresholds_source": thr_source or "(none -> 0.5)",
         "thresholds": {t: thr_vec[i] for i, t in enumerate(tasks)},
         # the searched decision rule (per class, per member) + fold detail
-        "weights_per_class": {t: {MEMBERS[m]: float(per_class[t]["weights"][m])
-                                  for m in range(len(MEMBERS))} for t in tasks},
+        "weights_per_class": {t: {member_labels[m]: float(per_class[t]["weights"][m])
+                                  for m in range(_M)} for t in tasks},
         "fold_weights_per_class": {
-            t: [{MEMBERS[m]: float(per_class[t]["fold_weights"][f, m])
-                 for m in range(len(MEMBERS))} for f in range(N_FOLDS)] for t in tasks},
+            t: [{member_labels[m]: float(per_class[t]["fold_weights"][f, m])
+                 for m in range(_M)} for f in range(N_FOLDS)] for t in tasks},
         # honest (OOF) vs in-sample vs baseline
         "oof_mean_auroc": oof_mean,
         "oof_auroc_per_class": {t: per_class[t]["oof_auroc"] for t in tasks},
@@ -451,8 +517,8 @@ def run_weighted_ensemble(load_cfg, ckpt_path_of, out_dir: Path, cache_dir: Path
         "flat_per_class": flat["per_class"],
         "gain_mean_auroc_vs_flat": weighted["macro"]["mean_auroc"] - flat["macro"]["mean_auroc"],
         # comprehensive per-member × per-class breakdown
-        "per_member": {r: {"macro": per_member[r]["macro"],
-                           "per_class": per_member[r]["per_class"]} for r in MEMBERS},
+        "per_member": {lab: {"macro": per_member[lab]["macro"],
+                             "per_class": per_member[lab]["per_class"]} for lab in member_labels},
     }
 
     txt = _render_txt(summary, tasks, _PC)
@@ -568,7 +634,8 @@ if _MODAL_OK and modal.is_local():
     # volumes: small-res -> chexpert-data, native-res -> chexpert-native-data).
     _volumes = {_ref_cfg["modal"]["runs_mount"]: _runs_vol}
     _needs_transformers = False
-    for _run in MEMBERS:
+    _all_runs = list(MEMBERS) + [m["run"] for m in CHECKPOINT_MEMBERS]
+    for _run in _all_runs:
         _rcfg = sc.load_config(PKG_ROOT / _run, verbose=False)
         _mc = _rcfg["modal"]
         if _mc["data_mount"] not in _volumes:

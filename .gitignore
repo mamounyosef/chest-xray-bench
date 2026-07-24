@@ -5,6 +5,7 @@ train_config/
 ensembling_results/
 cache_runs/
 training_scripts/others/ci/results/
+training_scripts/others/weighted_ensemble/results/
 
 modal_commants.txt
 # Byte-compiled / optimized / DLL files

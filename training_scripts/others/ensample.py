@@ -31,11 +31,11 @@ import sys
 from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
-RUN_ON = "modal"        # "modal" | "local" 
-SET    = "test500"      # scored split — "valid200" or "test500" or "val"
-GPU    = "B200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
+RUN_ON = "local"        # "modal" | "local" 
+SET    = "valid200"      # scored split — "valid200" or "test500" or "val"
+GPU    = "H200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
-BATCH_SIZE = 176        # inference batch size for EVERY member (None -> each run's
+BATCH_SIZE = 512        # 176
                         # own dataloader.val_batch_size). valid200 is 200 imgs, so
                         # any value >=200 is one batch; lower it only to cap VRAM.
 
@@ -63,6 +63,7 @@ FULL_MODELS = [
     "convnext_base_22k_1600x1312",
     "medmae_vitb_nih_B_768_s2",
     "rad_dino_vitB_768",
+    # "rad_dino_vitB_1064x896",
     # "medmae_vitb_nih",
     # "convnext_base_22k_768x640",
     # "convnext_base_22k_final_stage1",
@@ -98,6 +99,17 @@ CHECKPOINT_MEMBERS = [
 # to the FIRST member in FULL_MODELS (its thresholds.json is on the runs volume because
 # it's an ensemble member). Set to any run name to override. Missing file/task -> 0.5.
 THRESHOLDS_FROM = FULL_MODELS[0]
+
+# WEIGHTED blend (per class, per member) instead of the flat 1/M probability average.
+# Point WEIGHTS_FROM at a weighted_ensemble summary produced by
+# others/weighted_ensemble/weighted_ensemble.py — either the json file itself or the
+# folder containing it (weighted_<set>_summary.json); its "weights_per_class" block
+# ({task: {member: weight}}) drives the blend. None -> equal-weight average (default).
+# Resolved on the launcher and passed in, so it also works on Modal. Every ensemble
+# member's label must have a weight for every class; weights are renormalized per class
+# over the members actually present (so dropping/adding a member stays well-defined).
+#   e.g. WEIGHTS_FROM = "weighted_ensemble/results/2026-07-22_14-30-05"
+WEIGHTS_FROM = "weighted_ensemble/results/2026-07-22_15-22-14"
 
 # Each ensemble run writes into its OWN timestamped subfolder under
 # ensembling_results/, so trying different ensembles never overwrites the last.
@@ -473,7 +485,8 @@ def _ckpt_member_label(run: str, checkpoint) -> str:
 
 
 def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
-                 thr_source: str = ""):
+                 thr_source: str = "", class_weights: dict = None,
+                 weights_source: str = ""):
     """Core routine. `load_cfg(run)` -> that run's cfg (data paths already correct
     for this environment); `ckpt_path_of(run, checkpoint=None)` -> a checkpoint path
     (None -> that run's best.pt/CKPT_SUBPATH; else a specific best|last|<step>|file);
@@ -562,9 +575,19 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
             comp[:, tasks.index(disease)] = p[:, 0]
         members["final_stage2 (5 per-disease composite)"] = comp
 
-    # --- average + metrics (F1/P/R/Spec at the calibrated per-class thresholds) ---
-    stack = np.stack(list(members.values()), axis=0)           # (M, N, 5)
-    ens = stack.mean(axis=0)
+    # --- combine members + metrics (F1/P/R/Spec at the calibrated per-class thresholds).
+    # class_weights (from a weighted_ensemble summary) -> per-class weighted blend;
+    # otherwise the flat equal-weight probability average. ---
+    _labels_order = list(members.keys())
+    stack = np.stack([members[l] for l in _labels_order], axis=0)   # (M, N, 5)
+    if class_weights:
+        ens, _used_weights = _weighted_blend(stack, _labels_order, tasks, class_weights)
+        _blend = "weighted"
+        print(f"[ensemble] WEIGHTED per-class blend from {weights_source}")
+    else:
+        ens = stack.mean(axis=0)
+        _used_weights = None
+        _blend = "prob-average"
     ens_metrics = sc.compute_metrics(y_true, ens, tasks, threshold=thr_vec)
 
     # each member's own mean AUROC (for reference; AUROC is threshold-free)
@@ -576,6 +599,9 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
         "generated": datetime.now().isoformat(timespec="seconds"),
         "set": SET, "n_images": int(len(df)),
         "members": list(members.keys()),
+        "blend": _blend,
+        "weights_source": weights_source or None,
+        "class_weights": _used_weights,          # per-class normalized weights, or None (flat)
         "thresholds_source": thr_source or "(none -> 0.5)",
         "thresholds": {t: thr_vec[i] for i, t in enumerate(tasks)},
         "ensemble_mean_auroc": ens_metrics["macro"]["mean_auroc"],
@@ -587,18 +613,26 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
 
     mac = ens_metrics["macro"]
     lines = ["=" * 78,
-             f"ENSEMBLE (prob-average)  —  set={SET}  images={len(df)}",
+             f"ENSEMBLE ({_blend})  —  set={SET}  images={len(df)}",
              f"generated: {summary['generated']}",
-             f"thresholds (F1/P/R/Spec): {thr_source or '(none -> 0.5)'}", "=" * 78,
-             f"  ENSEMBLE mean AUROC={mac['mean_auroc']:.4f}  AUPRC={mac['mean_auprc']:.4f}  "
-             f"F1={mac['mean_f1']:.4f}  P={mac['mean_precision']:.4f}  "
-             f"R={mac['mean_recall']:.4f}  Spec={mac['mean_specificity']:.4f}",
-             "  per-class:"]
+             f"thresholds (F1/P/R/Spec): {thr_source or '(none -> 0.5)'}"]
+    if _used_weights is not None:
+        lines.append(f"weights: {weights_source}")
+    lines += ["=" * 78,
+              f"  ENSEMBLE mean AUROC={mac['mean_auroc']:.4f}  AUPRC={mac['mean_auprc']:.4f}  "
+              f"F1={mac['mean_f1']:.4f}  P={mac['mean_precision']:.4f}  "
+              f"R={mac['mean_recall']:.4f}  Spec={mac['mean_specificity']:.4f}",
+              "  per-class:"]
     for t in tasks:
         pc = summary["ensemble_per_class"][t]
         lines.append(f"    {t:<18} AUROC={pc['auroc']:.4f}  AUPRC={pc['auprc']:.4f}  "
                      f"F1={pc['f1']:.4f}  P={pc['precision']:.4f}  R={pc['recall']:.4f}  "
                      f"Spec={pc['specificity']:.4f}  (thr={summary['thresholds'][t]:.4f})")
+    if _used_weights is not None:
+        lines += ["  " + "-" * 74, "  per-class weights (renormalized over members):"]
+        for t in tasks:
+            lines.append(f"    {t:<18} " + "  ".join(f"{lab}={w:.3f}"
+                         for lab, w in _used_weights[t].items()))
     lines += ["  " + "-" * 74, "  members (own mean AUROC):"]
     for lab, a in per_member.items():
         lines.append(f"    {a:.4f}   {lab}")
@@ -613,6 +647,56 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     print(txt)
     print(f"wrote -> {json_path}")
     print(f"wrote -> {txt_path}")
+
+
+def _load_class_weights(spec):
+    """Load per-class member weights from a weighted_ensemble summary (its json file, or
+    a folder containing weighted_*_summary.json). Runs on the LAUNCHER; the resolved dict
+    is passed into run_ensemble (local) / handed to the remote (modal), so it loads
+    regardless of the runs volume. Returns (weights_per_class, source_label), or
+    (None, "") when spec is falsy. weights_per_class = {task: {member_label: weight}}."""
+    if not spec:
+        return None, ""
+    import json
+    p = Path(spec)
+    if not p.is_absolute():                       # try relative to others/, then CWD
+        cand = Path(__file__).resolve().parent / p
+        p = cand if cand.exists() else p
+    if p.is_dir():
+        hits = sorted(p.glob("weighted_*_summary.json"))
+        if not hits:
+            raise FileNotFoundError(f"no weighted_*_summary.json in {p}")
+        p = hits[0]
+    data = json.load(open(p, encoding="utf-8"))
+    w = data.get("weights_per_class")
+    if not w:
+        raise ValueError(f"{p} has no 'weights_per_class' block")
+    return w, str(p)
+
+
+def _weighted_blend(stack, labels_order, tasks, class_weights):
+    """Per-class weighted average of the members. stack is (M, N, T) with axis 0 aligned
+    to labels_order; class_weights = {task: {member_label: weight}}. Weights are
+    renormalized per class over the members present (all-zero -> uniform). Returns
+    (ens (N, T), used_weights {task: {label: normalized_weight}})."""
+    M, N, T = stack.shape
+    ens = np.zeros((N, T), dtype=float)
+    used = {}
+    for c, t in enumerate(tasks):
+        wmap = class_weights.get(t)
+        if wmap is None:
+            raise KeyError(f"weights file has no class '{t}' (has: {list(class_weights)})")
+        raw = np.empty(M, dtype=float)
+        for i, lab in enumerate(labels_order):
+            if lab not in wmap:
+                raise KeyError(f"weights file class '{t}' has no member '{lab}' "
+                               f"(file members: {list(wmap)})")
+            raw[i] = float(wmap[lab])
+        s = raw.sum()
+        w = raw / s if s > 0 else np.full(M, 1.0 / M)      # renormalize; degenerate -> uniform
+        ens[:, c] = np.tensordot(w, stack[:, :, c], axes=(0, 0))
+        used[t] = {lab: float(w[i]) for i, lab in enumerate(labels_order)}
+    return ens, used
 
 
 def _load_thresholds(run_name: str):
@@ -646,8 +730,9 @@ def run_local():
         return sc._resolve_resume(checkpoint, base / Path(sub).parent)   # honor stage subfolder
 
     thr_map, thr_src = _load_thresholds(THRESHOLDS_FROM)
+    cw_map, cw_src = _load_class_weights(WEIGHTS_FROM)
     out_dir = _out_subdir(Path(__file__).resolve().parent)   # others/ensembling_results/<stamp>
-    run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_map, thr_src)
+    run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_map, thr_src, cw_map, cw_src)
     return out_dir
 
 
@@ -714,7 +799,7 @@ if _MODAL_OK and modal.is_local():
         serialized=True,
         **_resources,
     )
-    def ensemble_remote(thr_map=None, thr_source=""):
+    def ensemble_remote(thr_map=None, thr_source="", class_weights=None, weights_source=""):
         # Self-contained: import everything INSIDE so nothing from __main__ (which
         # references shared_code) gets cloudpickled. Reuse run_ensemble from the
         # MOUNTED module (imported here, where shared_code is importable).
@@ -740,9 +825,10 @@ if _MODAL_OK and modal.is_local():
 
         out_dir = _E._out_subdir(runs_mount)         # /runs/ensembling_results/<timestamp>
         try:
-            # thresholds are resolved locally by the launcher and passed in (thr_map),
-            # so they load regardless of what's on the runs volume.
-            _E.run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_map, thr_source)
+            # thresholds AND per-class weights are resolved locally by the launcher and
+            # passed in, so they load regardless of what's on the runs volume.
+            _E.run_ensemble(load_cfg, ckpt_path_of, out_dir, thr_map, thr_source,
+                            class_weights, weights_source)
         finally:
             _runs_vol.commit()                        # persist before the local fetch reads it
         # hand the volume-relative POSIX subpath back so the launcher can download it
@@ -757,9 +843,11 @@ if __name__ == "__main__":
         _runs_volume = _ref_cfg["modal"]["runs_volume"]
         _sync_cache_up(_runs_volume, _base_local)    # push local cache so remote can reuse it
         _thr_map, _thr_src = _load_thresholds(THRESHOLDS_FROM)   # resolve locally -> pass to remote
+        _cw_map, _cw_src = _load_class_weights(WEIGHTS_FROM)     # weighted blend (or None)
         with modal.enable_output():
             with app.run():
-                remote_sub = ensemble_remote.remote(_thr_map, _thr_src)   # volume-relative POSIX subpath
+                remote_sub = ensemble_remote.remote(_thr_map, _thr_src,
+                                                    _cw_map, _cw_src)   # volume-relative POSIX subpath
         _sync_cache_down(_runs_volume, _base_local)  # pull GPU-computed cache back to this PC
         # remote run + volume commit are done; pull the results folder down locally.
         if remote_sub:
