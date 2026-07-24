@@ -1,0 +1,13 @@
+==============================================================================
+SEED NOISE ANALYSIS — mean AUROC across seeds (std = sample, ddof=1)
+==============================================================================
+
+convnext_base_22k   (n=3 seeds: default, 7, 1337)
+  runs: convnext_base_22k, convnext_base_22k_seed7, convnext_base_22k_seed1337
+  val200  mean AUROC : 0.8777 ± 0.0033     [0.8743, 0.8809, 0.8780]
+  val19k  mean AUROC : 0.8041 ± 0.0018     [0.8062, 0.8034, 0.8028]
+
+densenet121   (n=3 seeds: default, 7, 123)
+  runs: densenet121, densenet121_seed7, densenet121_seed123
+  val200  mean AUROC : 0.8520 ± 0.0054     [0.8566, 0.8533, 0.8461]
+  val19k  mean AUROC : 0.8025 ± 0.0003     [0.8028, 0.8023, 0.8023]
