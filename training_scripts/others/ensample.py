@@ -111,6 +111,19 @@ THRESHOLDS_FROM = FULL_MODELS[0]
 #   e.g. WEIGHTS_FROM = "weighted_ensemble/results/2026-07-22_14-30-05"
 WEIGHTS_FROM = "weighted_ensemble/results/2026-07-22_15-22-14"
 
+# SPACE in which members are combined (a fixed, parameter-free transform applied per
+# member before the flat/weighted blend — composes with WEIGHTS_FROM). AUROC/AUPRC are
+# ranking metrics, so this can only help when members are calibrated differently (e.g.
+# ConvNeXt@1600 vs the two ViTs).
+#   "prob"  : average probabilities (default; current behaviour).
+#   "logit" : average log-odds, then sigmoid back to a probability. F1/P/R/Spec still
+#             use the frozen thresholds (sigmoid(mean logit) is a valid probability).
+#   "rank"  : average per-class normalized ranks (∈(0,1], ties averaged). Best for
+#             AUROC/AUPRC when scales differ, but the blended score is NOT a probability,
+#             so the frozen prob-thresholds don't transfer -> F1/P/R/Spec are reported as
+#             n/a in rank mode (would need separate rank-space calibration).
+COMBINE_SPACE = "rank"
+
 # Each ensemble run writes into its OWN timestamped subfolder under
 # ensembling_results/, so trying different ensembles never overwrites the last.
 # RUN_TAG (optional) is appended to the timestamp to make a run self-describing,
@@ -495,7 +508,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     where they came from (for the summary/logs). The thresholds are resolved by the
     LAUNCHER from the local repo and passed in, so they always load regardless of what
     happens to be on the runs volume."""
-    import json, pandas as pd
+    import json, math, pandas as pd
     from datetime import datetime
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -576,19 +589,25 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
         members["final_stage2 (5 per-disease composite)"] = comp
 
     # --- combine members + metrics (F1/P/R/Spec at the calibrated per-class thresholds).
-    # class_weights (from a weighted_ensemble summary) -> per-class weighted blend;
-    # otherwise the flat equal-weight probability average. ---
+    # Members are combined in COMBINE_SPACE (prob | logit | rank): a fixed per-member
+    # transform, blended (flat or per-class weighted from a weighted_ensemble summary),
+    # then mapped back to a [0,1] decision score. ---
     _labels_order = list(members.keys())
-    stack = np.stack([members[l] for l in _labels_order], axis=0)   # (M, N, 5)
+    stack = _to_space(np.stack([members[l] for l in _labels_order], axis=0), COMBINE_SPACE)
     if class_weights:
-        ens, _used_weights = _weighted_blend(stack, _labels_order, tasks, class_weights)
+        ens_t, _used_weights = _weighted_blend(stack, _labels_order, tasks, class_weights)
         _blend = "weighted"
         print(f"[ensemble] WEIGHTED per-class blend from {weights_source}")
     else:
-        ens = stack.mean(axis=0)
+        ens_t = stack.mean(axis=0)
         _used_weights = None
         _blend = "prob-average"
+    if COMBINE_SPACE != "prob":
+        print(f"[ensemble] combine space: {COMBINE_SPACE}")
+    ens = _from_space(ens_t, COMBINE_SPACE)
     ens_metrics = sc.compute_metrics(y_true, ens, tasks, threshold=thr_vec)
+    if COMBINE_SPACE == "rank":                 # thresholds don't transfer to the rank scale
+        _null_threshold_metrics(ens_metrics, tasks)
 
     # each member's own mean AUROC (for reference; AUROC is threshold-free)
     per_member = {lab: sc.compute_metrics(y_true, p, tasks)["macro"]["mean_auroc"]
@@ -600,6 +619,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
         "set": SET, "n_images": int(len(df)),
         "members": list(members.keys()),
         "blend": _blend,
+        "combine_space": COMBINE_SPACE,
         "weights_source": weights_source or None,
         "class_weights": _used_weights,          # per-class normalized weights, or None (flat)
         "thresholds_source": thr_source or "(none -> 0.5)",
@@ -611,23 +631,28 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
         "per_member_mean_auroc": per_member,
     }
 
+    def _f4(x):                                 # None (rank mode) / NaN -> "n/a"
+        return f"{x:.4f}" if isinstance(x, float) and math.isfinite(x) else " n/a"
+
     mac = ens_metrics["macro"]
+    _blend_lbl = _blend if COMBINE_SPACE == "prob" else f"{_blend}, {COMBINE_SPACE}-space"
     lines = ["=" * 78,
-             f"ENSEMBLE ({_blend})  —  set={SET}  images={len(df)}",
+             f"ENSEMBLE ({_blend_lbl})  —  set={SET}  images={len(df)}",
              f"generated: {summary['generated']}",
-             f"thresholds (F1/P/R/Spec): {thr_source or '(none -> 0.5)'}"]
+             f"thresholds (F1/P/R/Spec): {thr_source or '(none -> 0.5)'}"
+             + ("   [n/a in rank space]" if COMBINE_SPACE == "rank" else "")]
     if _used_weights is not None:
         lines.append(f"weights: {weights_source}")
     lines += ["=" * 78,
-              f"  ENSEMBLE mean AUROC={mac['mean_auroc']:.4f}  AUPRC={mac['mean_auprc']:.4f}  "
-              f"F1={mac['mean_f1']:.4f}  P={mac['mean_precision']:.4f}  "
-              f"R={mac['mean_recall']:.4f}  Spec={mac['mean_specificity']:.4f}",
+              f"  ENSEMBLE mean AUROC={_f4(mac['mean_auroc'])}  AUPRC={_f4(mac['mean_auprc'])}  "
+              f"F1={_f4(mac['mean_f1'])}  P={_f4(mac['mean_precision'])}  "
+              f"R={_f4(mac['mean_recall'])}  Spec={_f4(mac['mean_specificity'])}",
               "  per-class:"]
     for t in tasks:
         pc = summary["ensemble_per_class"][t]
-        lines.append(f"    {t:<18} AUROC={pc['auroc']:.4f}  AUPRC={pc['auprc']:.4f}  "
-                     f"F1={pc['f1']:.4f}  P={pc['precision']:.4f}  R={pc['recall']:.4f}  "
-                     f"Spec={pc['specificity']:.4f}  (thr={summary['thresholds'][t]:.4f})")
+        lines.append(f"    {t:<18} AUROC={_f4(pc['auroc'])}  AUPRC={_f4(pc['auprc'])}  "
+                     f"F1={_f4(pc['f1'])}  P={_f4(pc['precision'])}  R={_f4(pc['recall'])}  "
+                     f"Spec={_f4(pc['specificity'])}  (thr={summary['thresholds'][t]:.4f})")
     if _used_weights is not None:
         lines += ["  " + "-" * 74, "  per-class weights (renormalized over members):"]
         for t in tasks:
@@ -647,6 +672,48 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     print(txt)
     print(f"wrote -> {json_path}")
     print(f"wrote -> {txt_path}")
+
+
+def _to_space(stack, space):
+    """Transform each member's (M, N, T) probability stack into the combine space.
+    prob -> identity; logit -> log-odds (clipped); rank -> per-member, per-class
+    normalized ranks in (0,1] (ties averaged). The transform is per member & per class,
+    so it never mixes members or classes."""
+    if space == "prob":
+        return stack
+    if space == "logit":
+        eps = 1e-6
+        p = np.clip(stack, eps, 1.0 - eps)
+        return np.log(p / (1.0 - p))
+    if space == "rank":
+        from scipy.stats import rankdata
+        M, N, T = stack.shape
+        out = np.empty_like(stack, dtype=float)
+        for m in range(M):
+            for c in range(T):
+                out[m, :, c] = rankdata(stack[m, :, c], method="average") / N
+        return out
+    raise ValueError(f"COMBINE_SPACE must be 'prob' | 'logit' | 'rank', got {space!r}")
+
+
+def _from_space(ens, space):
+    """Map the blended score back to a [0,1] decision score for the thresholded metrics.
+    logit -> sigmoid (a valid probability); prob/rank are already in [0,1] (rank is a
+    normalized rank, NOT a probability — the caller nulls F1/P/R/Spec in rank mode)."""
+    if space == "logit":
+        return 1.0 / (1.0 + np.exp(-ens))
+    return ens
+
+
+def _null_threshold_metrics(metrics, tasks):
+    """In rank mode the blended score isn't on the probability scale, so the frozen
+    prob-thresholds don't transfer — void the threshold-dependent metrics (AUROC/AUPRC
+    stay, being threshold-free)."""
+    for t in tasks:
+        for k in ("f1", "precision", "recall", "specificity"):
+            metrics["per_task"][t][k] = None
+    for k in ("mean_f1", "mean_precision", "mean_recall", "mean_specificity"):
+        metrics["macro"][k] = None
 
 
 def _load_class_weights(spec):
