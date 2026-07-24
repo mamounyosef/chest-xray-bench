@@ -1,0 +1,31 @@
+================================================================================================
+BOOTSTRAP 95% CI  —  3-member per-class WEIGHTED ensemble (prob-average)
+generated : 2026-07-24T22:36:32   |   iterations : 10000   |   seed : 42
+members   : convnext_base_22k_1600x1312, medmae_vitb_nih_B_768_s2, rad_dino_vitB_768
+weights   : D:\My Projects\chest-xray-bench\training_scripts\others\weighted_ensemble\results\2026-07-22_15-22-14\weighted_valid200_summary.json  (FROZEN — not re-fit inside the bootstrap)
+================================================================================================
+
+[test500]  N=668 images
+  MEAN AUROC : 0.9110   95% CI [0.8970, 0.9242]   (width 0.0272, boot sd 0.0070)
+  class                 point         95% CI          width
+  Atelectasis          0.8752   [0.8480, 0.9006]   0.0526
+  Cardiomegaly         0.8891   [0.8589, 0.9161]   0.0572
+  Consolidation        0.8945   [0.8516, 0.9328]   0.0812
+  Edema                0.9331   [0.9080, 0.9551]   0.0471
+  Pleural Effusion     0.9634   [0.9478, 0.9768]   0.0289
+  ------------------------------------------------------------------------------------------
+  vs single 'convnext_base_22k_1600x1312' (same resampled patients):
+    single   mean AUROC : 0.8879   95% CI [0.8691, 0.9055]
+    diff (ens - single) : +0.0232   95% CI [+0.0145, +0.0324]   P(ens>single)=100.0%
+    -> CI excludes 0 -> ensemble genuinely better
+      Atelectasis        +0.0076   [-0.0020, +0.0173]   P>0=94%
+      Cardiomegaly       +0.0241   [+0.0115, +0.0377]   P>0=100%
+      Consolidation      +0.0534   [+0.0186, +0.0919]   P>0=100%
+      Edema              +0.0199   [+0.0103, +0.0306]   P>0=100%
+      Pleural Effusion   +0.0109   [+0.0006, +0.0231]   P>0=98%
+
+================================================================================================
+notes: each iteration resamples image rows with replacement and applies the SAME
+       rows to every member before blending (paired / patient-level). Weights are
+       frozen. A class with one label value in a resample -> NaN that iteration.
+================================================================================================

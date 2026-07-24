@@ -1,40 +1,49 @@
 """
 bootstrap_ci.py
 ===============
-Bootstrap 95% confidence intervals for CheXpert mean-AUROC on a chosen split (set
-SET below — e.g. the ~19k patient-grouped 10% val split, or the valid200 / test500
-radiologist sets), to answer ONE question: is the ENSEMBLE genuinely better than the
-best SINGLE model, or is the gap within noise?
+Bootstrap 95% confidence intervals for the FINAL 3-member per-class-WEIGHTED ensemble,
+computed independently on valid200 (234 images) and test500 (668 images).
+No retraining, no re-evaluation: it reads the per-image probabilities + labels straight
+from the ensemble prob-cache (training_scripts/others/cache_runs/<set>/), which
+ensample.py / weighted_ensemble.py already wrote.
 
-It reads the per-image predicted probabilities + true labels straight from the
-ensemble prob-cache (training_scripts/others/cache_runs/<set>/), so it never
-loads a model or an image — nothing to recompute. Those .npy files are produced by
-ensample.py (each member's (N,5) probabilities; _y_true.npy holds the (N,5) labels).
+Procedure (paired, patient-level bootstrap), per set:
+  - Each iteration draws N row indices WITH replacement (N = 234 on valid200, 668 on
+    test500). The SAME indices are applied to ALL members before blending, so every
+    member sees exactly the same resampled patients — the resample is of PATIENTS, not
+    of predictions.
+  - The members are blended in PROBABILITY space with the FROZEN per-class weights
+    read from WEIGHTS_FROM (the weighted_ensemble summary json). Weights are fixed —
+    they are NOT re-fit inside the bootstrap (re-fitting would leak and inflate the CI).
+  - Per iteration: per-class AUROC + the mean across the 5 classes.
+  - A class whose resample contains only one label value has an undefined AUROC -> NaN
+    for that iteration; it is dropped from that iteration's mean (nanmean) and from
+    that class's percentiles.
+  - Reported: the POINT ESTIMATE on the full set (not the bootstrap median) together
+    with the 2.5 / 97.5 percentile CI, overall and per class.
 
-Procedure (paired bootstrap):
-  - Resample the N rows WITH replacement, N_BOOT times. The SAME resampled indices
-    are applied to every model each iteration (paired), so the difference is on the
-    same patients.
-  - Per iteration compute per-class AUROC and the mean across the 5 classes for the
-    single model, the ensemble, and their difference (ensemble - single).
-  - A class whose resample has only one label present (AUROC undefined) is set to
-    NaN for that iteration and excluded from that iteration's mean (nanmean); its
-    per-class CI then uses only the valid iterations.
-  - Report median + 95% CI (2.5 / 97.5 pct) for each, the CI of the DIFFERENCE, and
-    the fraction of iterations where ensemble > single (the key number) — overall
-    and per class, so you can see which classes are resolvable at this sample size.
+PAIRED_SINGLE (optional) additionally bootstraps the best single member on the SAME
+resampled indices and reports the CI of the DIFFERENCE (ensemble - single), i.e.
+whether the ensemble's gain survives resampling noise.
 
-Output: a clean table printed to the console AND written to a fresh timestamped file
-under ci/results/<timestamp>.txt (one file per run).
+Combining space is PROBABILITY average only (COMBINE_SPACE in ensample.py = "prob").
+Rank/logit space would change the numbers and is deliberately not offered here.
+
+Output: one folder per run, results/<YYYY-MM-DD_HH-MM-SS>_<set>/  (the set(s) in SETS,
+joined by '+' if more than one), holding
+        bootstrap_ci.json  (machine-readable)
+        bootstrap_ci.txt   (the printed summary)
 
 Run:  python training_scripts/others/ci/bootstrap_ci.py
 """
 
+import json
 import sys
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import rankdata
 from sklearn.metrics import roc_auc_score
 
 # Windows consoles default to cp1252 and choke on non-ASCII; force UTF-8.
@@ -45,191 +54,283 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 # ============================ CONFIG (edit here) ============================
-SET     = "val"                # scored split whose cache to read: "val" = the ~19k
-                              # patient-grouped 10% val split (01_val.csv); also
-                              # "valid200" / "test500" (radiologist sets)
+SETS = ["test500"]   # scored splits, each bootstrapped SEPARATELY
 
-# U_IGNORE : uncertain-label handling for the METRIC only (predictions are reused
-#   from cache either way — nothing is recomputed).
-#     False (default) : U-Ones — uncertain (-1) cells scored as POSITIVE (1). Uses
-#                       the cached _y_true.npy directly (matches ensample.py scoring).
-#     True            : U-Ignore — for each task, DROP its uncertain (-1) rows from
-#                       that class's AUROC. Labels are rebuilt from VAL_CSV (blank->0,
-#                       1->1, 0->0, -1->NaN=excluded); verified row-aligned to cache.
-#                       Only valid for SET whose raw CSV is available (VAL_CSV below).
-U_IGNORE = True
-VAL_CSV  = "data/chexpert/01_val.csv"   # raw split (repo-relative); only read if U_IGNORE
+# Frozen per-class weights: path to a weighted_ensemble summary json (or its folder).
+# These are the weights behind the best valid200 ensemble
+# (others/ensembling_results/2026-07-22_15-34-57  (best valid200)).
+WEIGHTS_FROM = ("../weighted_ensemble/results/2026-07-22_15-22-14/"
+                "weighted_valid200_summary.json")
 
-N_BOOT  = 2000                 # bootstrap iterations
-SEED    = 42                   # RNG seed (reproducible)
-CI_LOW, CI_HIGH = 2.5, 97.5    # percentiles for the 95% CI
+# Members, as the labels used in the weights file (a best.pt member is just the run
+# name; a checkpoint member is "<run> @ step<N>"). None -> take them from the weights
+# file itself, in its stored order.
+MEMBERS = None
+
+COMBINE_SPACE = "prob"           # probability-average blend (fixed; see docstring)
+
+N_BOOT = 10000                   # bootstrap iterations
+SEED = 42                        # RNG seed (reproducible)
+CI_LOW, CI_HIGH = 2.5, 97.5      # percentiles for the 95% CI
+
+# Optional paired comparison: bootstrap this single member on the SAME indices and
+# report the CI of (ensemble - single). None -> skip.
+PAIRED_SINGLE = "convnext_base_22k_1600x1312"
 
 # The 5 competition tasks, in the column order of every cached (N,5) matrix.
 TASKS = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]
-
-# Cache basenames (without .npy) under cache_runs/<SET>/. The ensemble is the
-# equal-weight probability-average of ENSEMBLE_MEMBERS.
-SINGLE_MEMBER    = "convnext_base_22k_1600x1312_best"
-ENSEMBLE_MEMBERS = ["convnext_base_22k_1600x1312_best", "medmae_vitb_nih_B_768_s2_best"]
 # ===========================================================================
 
-CI_DIR    = Path(__file__).resolve().parent          # training_scripts/others/ci
-CACHE_DIR = CI_DIR.parent / "cache_runs" / SET   # .../others/cache_runs/<set>
-RESULTS_DIR = CI_DIR / "results"
+CI_DIR = Path(__file__).resolve().parent             # training_scripts/others/ci
+CACHE_ROOT = CI_DIR.parent / "cache_runs"            # .../others/cache_runs
+RESULTS_DIR = CI_DIR / "results"     # each run gets its own <timestamp>_<set> folder
 
 
-def _load(name: str) -> np.ndarray:
-    p = CACHE_DIR / f"{name}.npy"
+# --------------------------------------------------------------------------- cache
+def _cache_stem(label: str) -> str:
+    """Cache basename for a member label, matching ensample.py's naming:
+    'run' -> 'run_best';  'run @ step7500' -> 'run_ckpt_step7500'."""
+    if " @ " not in label:
+        return f"{label}_best"
+    run, ckpt = label.split(" @ ", 1)
+    ckpt = ckpt.strip()
+    if ckpt.startswith("step") and ckpt[4:].isdigit():
+        return f"{run}_ckpt_step{int(ckpt[4:])}"
+    if ckpt in ("best", ""):
+        return f"{run}_best"
+    return f"{run}_{ckpt}"
+
+
+def _load(set_name: str, stem: str) -> np.ndarray:
+    p = CACHE_ROOT / set_name / f"{stem}.npy"
     if not p.exists():
         raise FileNotFoundError(
             f"missing cache file: {p}\n"
-            f"    run ensample.py for SET='{SET}' with this member first so its "
+            f"    run ensample.py for SET='{set_name}' with this member first so its "
             f"probabilities get cached.")
     return np.load(p)
 
 
-def per_class_auroc(y: np.ndarray, p: np.ndarray) -> np.ndarray:
-    """(C,) per-class AUROC. Rows whose label is NaN for a class are dropped from
-    that class (this is how U-Ignore excludes uncertain cells; in U-Ones there are
-    no NaNs so nothing is dropped). NaN for any class with <2 label values left."""
-    C = p.shape[1]
-    out = np.full(C, np.nan)
-    for c in range(C):
-        yc = y[:, c]
-        m = ~np.isnan(yc)               # keep only labelled rows for this class
-        ycm = yc[m]
-        if np.unique(ycm).size >= 2:
-            out[c] = roc_auc_score(ycm, p[m, c])
+def _load_weights():
+    """-> (weights_per_class dict, member label order, resolved source path)."""
+    p = Path(WEIGHTS_FROM)
+    if not p.is_absolute():
+        p = (CI_DIR / p).resolve()
+    if p.is_dir():
+        cands = sorted(p.glob("weighted_*_summary.json"))
+        if not cands:
+            raise FileNotFoundError(f"no weighted_*_summary.json under {p}")
+        p = cands[0]
+    d = json.load(open(p, encoding="utf-8"))
+    wpc = d["weights_per_class"]
+    labels = list(MEMBERS) if MEMBERS else list(d["members"])
+    for t in TASKS:
+        if t not in wpc:
+            raise KeyError(f"weights file has no class '{t}'")
+        missing = [m for m in labels if m not in wpc[t]]
+        if missing:
+            raise KeyError(f"weights file has no weight for {missing} on '{t}'")
+    return wpc, labels, p
+
+
+def _weighted_blend(stack: np.ndarray, labels, wpc) -> np.ndarray:
+    """(M,N,T) member probabilities -> (N,T) per-class weighted average.
+    Weights are renormalized per class over the members present; an all-zero class
+    falls back to the uniform average."""
+    M, N, T = stack.shape
+    out = np.empty((N, T))
+    for c, t in enumerate(TASKS):
+        w = np.array([float(wpc[t][m]) for m in labels])
+        w = w / w.sum() if w.sum() > 0 else np.full(M, 1.0 / M)
+        out[:, c] = np.tensordot(w, stack[:, :, c], axes=(0, 0))
     return out
 
 
-def _load_uignore_labels(cached_y: np.ndarray) -> np.ndarray:
-    """Rebuild (N,5) labels from the raw split CSV with uncertain(-1)->NaN (U-Ignore).
-    Verifies row alignment by reconstructing the U-Ones labels and matching them to
-    the cached _y_true.npy (fails loudly if the CSV and cache ever drift)."""
-    import pandas as pd
-    csv = (CI_DIR.parent.parent.parent / VAL_CSV)      # repo root / VAL_CSV
-    if not csv.exists():
-        raise FileNotFoundError(f"U_IGNORE=True but VAL_CSV not found: {csv}")
-    raw = pd.read_csv(csv)[TASKS].values.astype(float)  # blank->NaN, plus 0/1/-1
-    if raw.shape != cached_y.shape:
-        raise ValueError(f"CSV rows {raw.shape} != cache {cached_y.shape}")
-    uones = np.where(np.isnan(raw), 0.0, np.where(raw == -1.0, 1.0, raw))
-    if not np.array_equal(uones, cached_y):
-        raise ValueError("CSV/cache row mismatch — U-Ones reconstruction != cached "
-                         "_y_true.npy; cannot trust the uncertain mask.")
-    y = np.where(np.isnan(raw), 0.0, raw)               # blank->0
-    y[raw == -1.0] = np.nan                             # uncertain -> excluded
-    n_unc = int((raw == -1.0).sum())
-    print(f"[U-Ignore] rebuilt labels from {csv.name}; excluded {n_unc} uncertain "
-          f"cells: " + ", ".join(f"{t}={int((raw[:, i] == -1.0).sum())}"
-                                  for i, t in enumerate(TASKS)))
-    return y
+# --------------------------------------------------------------------------- metric
+def _auroc(y: np.ndarray, s: np.ndarray) -> float:
+    """AUROC via the rank (Mann-Whitney U) identity — identical to
+    sklearn.roc_auc_score including tie handling, but fast enough for 10k iterations.
+    NaN when only one label value is present."""
+    n_pos = float(y.sum())
+    n_neg = float(y.size - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        return np.nan
+    r = rankdata(s)
+    return float((r[y == 1].sum() - n_pos * (n_pos + 1.0) / 2.0) / (n_pos * n_neg))
 
 
-def summarize(dist: np.ndarray):
-    """(low, median, high) over a 1-D bootstrap distribution, ignoring NaNs."""
-    return (np.nanpercentile(dist, CI_LOW),
-            np.nanmedian(dist),
-            np.nanpercentile(dist, CI_HIGH))
+def per_class_auroc(y: np.ndarray, p: np.ndarray) -> np.ndarray:
+    return np.array([_auroc(y[:, c], p[:, c]) for c in range(p.shape[1])])
 
 
-def frac_positive(diff: np.ndarray) -> float:
-    """Fraction of finite iterations with diff > 0 (ensemble strictly beats single)."""
-    finite = np.isfinite(diff)
-    return float(np.mean(diff[finite] > 0)) if finite.any() else float("nan")
+def _ci(dist: np.ndarray):
+    """(2.5%, 97.5%) over a 1-D bootstrap distribution, ignoring NaNs."""
+    return (float(np.nanpercentile(dist, CI_LOW)),
+            float(np.nanpercentile(dist, CI_HIGH)))
+
+
+# --------------------------------------------------------------------------- core
+def bootstrap_set(set_name, wpc, labels, single_label):
+    y_true = _load(set_name, "_y_true")
+    N, C = y_true.shape
+    stack = np.stack([_load(set_name, _cache_stem(m)) for m in labels], axis=0)
+    if stack.shape[1:] != (N, C):
+        raise ValueError(f"{set_name}: member shape {stack.shape[1:]} != labels {(N, C)}")
+    ens = _weighted_blend(stack, labels, wpc)
+    single = _load(set_name, _cache_stem(single_label)) if single_label else None
+
+    # point estimates on the FULL set (cross-checked against sklearn once)
+    ens_pt_pc = per_class_auroc(y_true, ens)
+    ref = np.array([roc_auc_score(y_true[:, c], ens[:, c]) for c in range(C)])
+    assert np.allclose(ens_pt_pc, ref, atol=1e-12), "fast AUROC != sklearn"
+    ens_pt = float(np.nanmean(ens_pt_pc))
+    sgl_pt_pc = per_class_auroc(y_true, single) if single is not None else None
+    sgl_pt = float(np.nanmean(sgl_pt_pc)) if single is not None else None
+
+    # paired bootstrap: one index draw per iteration, shared by every member
+    rng = np.random.default_rng(SEED)
+    ens_pc = np.empty((N_BOOT, C))
+    sgl_pc = np.empty((N_BOOT, C)) if single is not None else None
+    for b in range(N_BOOT):
+        idx = rng.integers(0, N, N)          # resample PATIENTS with replacement
+        yb = y_true[idx]
+        ens_pc[b] = per_class_auroc(yb, ens[idx])
+        if single is not None:
+            sgl_pc[b] = per_class_auroc(yb, single[idx])
+    ens_mean = np.nanmean(ens_pc, axis=1)
+
+    res = {
+        "set": set_name, "n_images": int(N), "n_boot": N_BOOT, "seed": SEED,
+        "combine_space": COMBINE_SPACE, "blend": "weighted (per-class, frozen)",
+        "members": list(labels),
+        "weights_per_class": {t: {m: float(wpc[t][m]) for m in labels} for t in TASKS},
+        "ensemble": {
+            "mean_auroc": {"point": ens_pt,
+                           "ci_low": _ci(ens_mean)[0], "ci_high": _ci(ens_mean)[1],
+                           "boot_median": float(np.nanmedian(ens_mean)),
+                           "boot_std": float(np.nanstd(ens_mean, ddof=1))},
+            "per_class": {},
+        },
+    }
+    for c, t in enumerate(TASKS):
+        lo, hi = _ci(ens_pc[:, c])
+        res["ensemble"]["per_class"][t] = {
+            "point": float(ens_pt_pc[c]), "ci_low": lo, "ci_high": hi,
+            "boot_median": float(np.nanmedian(ens_pc[:, c])),
+            "boot_std": float(np.nanstd(ens_pc[:, c], ddof=1)),
+            "n_degenerate_iters": int(np.isnan(ens_pc[:, c]).sum()),
+        }
+
+    if single is not None:
+        sgl_mean = np.nanmean(sgl_pc, axis=1)
+        d_mean = ens_mean - sgl_mean
+        d_pc = ens_pc - sgl_pc
+        fin = np.isfinite(d_mean)
+        lo, hi = _ci(d_mean)
+        res["paired_single"] = {
+            "member": single_label,
+            "mean_auroc": {"point": sgl_pt,
+                           "ci_low": _ci(sgl_mean)[0], "ci_high": _ci(sgl_mean)[1]},
+            "per_class": {t: dict(zip(("point", "ci_low", "ci_high"),
+                                      (float(sgl_pt_pc[c]), *_ci(sgl_pc[:, c]))))
+                          for c, t in enumerate(TASKS)},
+            "diff_mean_auroc": {
+                "point": ens_pt - sgl_pt, "ci_low": lo, "ci_high": hi,
+                "p_ensemble_better": float(np.mean(d_mean[fin] > 0)) if fin.any() else None,
+            },
+            "diff_per_class": {},
+        }
+        for c, t in enumerate(TASKS):
+            dlo, dhi = _ci(d_pc[:, c])
+            f = np.isfinite(d_pc[:, c])
+            res["paired_single"]["diff_per_class"][t] = {
+                "point": float(ens_pt_pc[c] - sgl_pt_pc[c]), "ci_low": dlo, "ci_high": dhi,
+                "p_ensemble_better": float(np.mean(d_pc[f, c] > 0)) if f.any() else None,
+            }
+    return res
+
+
+# --------------------------------------------------------------------------- report
+def format_report(all_res, weights_path, ts):
+    L = []
+    w = L.append
+    w("=" * 96)
+    w(f"BOOTSTRAP 95% CI  —  3-member per-class WEIGHTED ensemble ({COMBINE_SPACE}-average)")
+    w(f"generated : {ts}   |   iterations : {N_BOOT}   |   seed : {SEED}")
+    w(f"members   : {', '.join(all_res[0]['members'])}")
+    w(f"weights   : {weights_path}  (FROZEN — not re-fit inside the bootstrap)")
+    w("=" * 96)
+    for r in all_res:
+        e = r["ensemble"]["mean_auroc"]
+        w("")
+        w(f"[{r['set']}]  N={r['n_images']} images")
+        w(f"  MEAN AUROC : {e['point']:.4f}   95% CI [{e['ci_low']:.4f}, {e['ci_high']:.4f}]"
+          f"   (width {e['ci_high'] - e['ci_low']:.4f}, boot sd {e['boot_std']:.4f})")
+        w(f"  {'class':<18}{'point':>9}   {'95% CI':^18}{'width':>9}")
+        for t in TASKS:
+            d = r["ensemble"]["per_class"][t]
+            w(f"  {t:<18}{d['point']:>9.4f}   [{d['ci_low']:.4f}, {d['ci_high']:.4f}]"
+              f"{d['ci_high'] - d['ci_low']:>9.4f}"
+              + (f"   (NaN x{d['n_degenerate_iters']})" if d["n_degenerate_iters"] else ""))
+        if "paired_single" in r:
+            ps = r["paired_single"]
+            dm = ps["diff_mean_auroc"]
+            verdict = ("CI excludes 0 -> ensemble genuinely better" if dm["ci_low"] > 0 else
+                       "CI excludes 0 -> ensemble genuinely WORSE" if dm["ci_high"] < 0 else
+                       "CI includes 0 -> within noise")
+            w("  " + "-" * 90)
+            w(f"  vs single '{ps['member']}' (same resampled patients):")
+            w(f"    single   mean AUROC : {ps['mean_auroc']['point']:.4f}"
+              f"   95% CI [{ps['mean_auroc']['ci_low']:.4f}, {ps['mean_auroc']['ci_high']:.4f}]")
+            w(f"    diff (ens - single) : {dm['point']:+.4f}"
+              f"   95% CI [{dm['ci_low']:+.4f}, {dm['ci_high']:+.4f}]"
+              f"   P(ens>single)={dm['p_ensemble_better']:.1%}")
+            w(f"    -> {verdict}")
+            for t in TASKS:
+                d = ps["diff_per_class"][t]
+                w(f"      {t:<18}{d['point']:>+8.4f}   [{d['ci_low']:+.4f}, {d['ci_high']:+.4f}]"
+                  f"   P>0={d['p_ensemble_better']:.0%}")
+    w("")
+    w("=" * 96)
+    w("notes: each iteration resamples image rows with replacement and applies the SAME")
+    w("       rows to every member before blending (paired / patient-level). Weights are")
+    w("       frozen. A class with one label value in a resample -> NaN that iteration.")
+    w("=" * 96)
+    return "\n".join(L) + "\n"
 
 
 def main():
-    # --- load probabilities + labels (all (N, 5)) -------------------------------
-    y_true = _load("_y_true")
-    if U_IGNORE:
-        y_true = _load_uignore_labels(y_true)   # -1 cells -> NaN (excluded per class)
-    single = _load(SINGLE_MEMBER)
-    ens = np.mean([_load(m) for m in ENSEMBLE_MEMBERS], axis=0)   # prob-average
-    N, C = y_true.shape
-    assert single.shape == (N, C) and ens.shape == (N, C), "shape mismatch vs labels"
+    wpc, labels, weights_path = _load_weights()
+    now = datetime.now()
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S")
+    # one folder per run: results/<YYYY-MM-DD_HH-MM-SS>_<set>/  (sets joined by '+'
+    # if SETS holds more than one), containing bootstrap_ci.json + bootstrap_ci.txt
+    out_dir = RESULTS_DIR / f"{now.strftime('%Y-%m-%d_%H-%M-%S')}_{'+'.join(SETS)}"
+    print(f"[boot] members: {labels}")
+    print(f"[boot] weights: {weights_path}")
+    all_res = []
+    for s in SETS:
+        print(f"[boot] bootstrapping {s} ({N_BOOT} iters) ...", flush=True)
+        all_res.append(bootstrap_set(s, wpc, labels, PAIRED_SINGLE))
 
-    # --- point estimates on the full set ---------------------------------------
-    single_obs_pc = per_class_auroc(y_true, single)
-    ens_obs_pc = per_class_auroc(y_true, ens)
-    single_obs = np.nanmean(single_obs_pc)
-    ens_obs = np.nanmean(ens_obs_pc)
-
-    # --- paired bootstrap ------------------------------------------------------
-    rng = np.random.default_rng(SEED)
-    single_pc = np.empty((N_BOOT, C))     # per-class AUROC per iteration
-    ens_pc = np.empty((N_BOOT, C))
-    for b in range(N_BOOT):
-        idx = rng.integers(0, N, N)       # resample rows WITH replacement
-        yb = y_true[idx]
-        single_pc[b] = per_class_auroc(yb, single[idx])
-        ens_pc[b] = per_class_auroc(yb, ens[idx])   # SAME idx (paired)
-
-    single_mean = np.nanmean(single_pc, axis=1)     # (N_BOOT,) mean-across-5 per iter
-    ens_mean = np.nanmean(ens_pc, axis=1)
-    diff_mean = ens_mean - single_mean
-    diff_pc = ens_pc - single_pc                    # (N_BOOT, C)
-
-    # --- build the report ------------------------------------------------------
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    L = []
-    def w(line=""):
-        L.append(line)
-
-    w("=" * 92)
-    w(f"BOOTSTRAP 95% CI  —  mean AUROC on {SET} ({N} images)")
-    w(f"uncertain : {'U-Ignore (uncertain rows dropped per class)' if U_IGNORE else 'U-Ones (uncertain scored as positive)'}")
-    w(f"generated : {ts}   |   iterations : {N_BOOT}   |   seed : {SEED}")
-    w(f"single    : {SINGLE_MEMBER}")
-    w(f"ensemble  : prob-average of {ENSEMBLE_MEMBERS}")
-    w("=" * 92)
-
-    # 1) headline: mean AUROC across the 5 classes
-    s_lo, s_md, s_hi = summarize(single_mean)
-    e_lo, e_md, e_hi = summarize(ens_mean)
-    d_lo, d_md, d_hi = summarize(diff_mean)
-    w("MEAN AUROC (across 5 classes)")
-    w(f"  {'model':<20}{'point':>9}{'median':>9}{'2.5%':>9}{'97.5%':>9}")
-    w(f"  {'single':<20}{single_obs:>9.4f}{s_md:>9.4f}{s_lo:>9.4f}{s_hi:>9.4f}")
-    w(f"  {'ensemble':<20}{ens_obs:>9.4f}{e_md:>9.4f}{e_lo:>9.4f}{e_hi:>9.4f}")
-    w("  " + "-" * 66)
-    w(f"  {'diff (ens-single)':<20}{ens_obs - single_obs:>9.4f}{d_md:>9.4f}"
-      f"{d_lo:>9.4f}{d_hi:>9.4f}")
-    frac = frac_positive(diff_mean)
-    verdict = ("CI excludes 0 -> ensemble genuinely better" if d_lo > 0 else
-               "CI excludes 0 -> ensemble genuinely WORSE" if d_hi < 0 else
-               "CI includes 0 -> within noise (not distinguishable)")
-    w(f"  P(ensemble > single) = {frac:6.1%}     [{verdict}]")
-    w("=" * 92)
-
-    # 2) per-class breakdown (which classes are resolvable at this sample size)
-    w("PER-CLASS AUROC  (median [2.5%, 97.5%]);  diff = ensemble - single")
-    w(f"  {'class':<18}{'single':>22}{'ensemble':>22}{'diff (95% CI)':>24}{'P>0':>7}")
-    for c, t in enumerate(TASKS):
-        s_lo, s_md, s_hi = summarize(single_pc[:, c])
-        e_lo, e_md, e_hi = summarize(ens_pc[:, c])
-        dc_lo, dc_md, dc_hi = summarize(diff_pc[:, c])
-        fc = frac_positive(diff_pc[:, c])
-        n_bad = int(np.isnan(diff_pc[:, c]).sum())     # degenerate iterations
-        s_str = f"{s_md:.3f}[{s_lo:.3f},{s_hi:.3f}]"
-        e_str = f"{e_md:.3f}[{e_lo:.3f},{e_hi:.3f}]"
-        d_str = f"{dc_md:+.3f}[{dc_lo:+.3f},{dc_hi:+.3f}]"
-        w(f"  {t:<18}{s_str:>22}{e_str:>22}{d_str:>24}{fc:>7.0%}"
-          + (f"   (NaN x{n_bad})" if n_bad else ""))
-    w("=" * 92)
-    w("notes: paired bootstrap (same resampled patients for both models each iter).")
-    w("       a class with one label present in a resample -> NaN that iter (excluded")
-    w("       from that iter's mean). 'P>0' = fraction of iters with ensemble>single.")
-    w("=" * 92)
-
-    report = "\n".join(L) + "\n"
+    report = format_report(all_res, weights_path, ts)
+    print()
     print(report)
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = RESULTS_DIR / f"{ts}_{SET}_{'uignore' if U_IGNORE else 'uones'}.txt"
-    out_path.write_text(report, encoding="utf-8")
-    print(f"wrote -> {out_path}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_json = out_dir / "bootstrap_ci.json"
+    out_txt = out_dir / "bootstrap_ci.txt"
+    out_json.write_text(json.dumps({
+        "generated": ts, "n_boot": N_BOOT, "seed": SEED,
+        "ci_percentiles": [CI_LOW, CI_HIGH],
+        "combine_space": COMBINE_SPACE,
+        "weights_source": str(weights_path),
+        "tasks": TASKS,
+        "sets": {r["set"]: r for r in all_res},
+    }, indent=2), encoding="utf-8")
+    out_txt.write_text(report, encoding="utf-8")
+    print(f"wrote -> {out_json}")
+    print(f"wrote -> {out_txt}")
 
 
 if __name__ == "__main__":

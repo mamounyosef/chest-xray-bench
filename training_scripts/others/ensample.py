@@ -32,7 +32,7 @@ from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON = "local"        # "modal" | "local" 
-SET    = "valid200"      # scored split — "valid200" or "test500" or "val"
+SET    = "test500"      # scored split — "valid200" or "test500" or "val"
 GPU    = "H200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
 BATCH_SIZE = 512        # 176
@@ -122,7 +122,7 @@ WEIGHTS_FROM = "weighted_ensemble/results/2026-07-22_15-22-14"
 #             AUROC/AUPRC when scales differ, but the blended score is NOT a probability,
 #             so the frozen prob-thresholds don't transfer -> F1/P/R/Spec are reported as
 #             n/a in rank mode (would need separate rank-space calibration).
-COMBINE_SPACE = "rank"
+COMBINE_SPACE = "prob"
 
 # Each ensemble run writes into its OWN timestamped subfolder under
 # ensembling_results/, so trying different ensembles never overwrites the last.
