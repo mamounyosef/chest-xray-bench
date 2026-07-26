@@ -1879,6 +1879,87 @@ def save_checkpoint(ckpt_dir: Path, cfg, model, optimizer, scheduler, scaler,
         torch.save(state, ckpt_dir / name)         # persistent named ckpt (not pruned)
 
 
+def update_top_k(ckpt_dir: Path, cfg, model, epoch: int, global_step: int,
+                 score: float, track: dict, mode: str = "max",
+                 monitor: str = "", subset: str = "", optimizer=None,
+                 scheduler=None, scaler=None, device=None,
+                 elapsed_sec: float = 0.0) -> dict | None:
+    """Maintain a leaderboard of the K best-scoring validations of the run.
+
+    best.pt only ever holds the single best state (it is overwritten on every
+    improvement), so the 2nd..Kth best checkpoints are normally lost and can only be
+    APPROXIMATED afterwards by the nearest periodic ckpt_step file. This keeps them
+    exactly: each validation that makes the top K is written as top_step{N}.pt and
+    the checkpoint it evicted is deleted, so at most K files exist at any time.
+
+    Ranked by `score` — the same monitored value that drives best.pt / early stopping
+    — under output.keep_top_k (0 disables). Ties never displace an incumbent, so the
+    EARLIER checkpoint wins a tie. The board is stored in `track` (hence saved into
+    every checkpoint and restored on resume) and mirrored to checkpoints/top_k.json.
+
+    output.top_k_weights_only=true (default) stores model weights + cfg + step only:
+    enough for evaluate/ensemble/warm-start, ~3x smaller, NOT resumable.
+
+    Returns the new entry when the checkpoint made the cut, else None."""
+    out = cfg["output"]
+    keep = int(out.get("keep_top_k", 0) or 0)
+    if keep <= 0 or score is None or not math.isfinite(float(score)):
+        return None
+    sign = -1.0 if mode == "max" else 1.0        # sort key -> best first
+
+    # Drop any stale entry for this step (re-validation at the same step), then insert.
+    board = [e for e in (track.get("top_k") or []) if e["step"] != global_step]
+    entry = {"step": int(global_step), "epoch": int(epoch) + 1, "score": float(score),
+             "file": f"top_step{int(global_step)}.pt"}
+    board.append(entry)
+    # (sign*score, step): best score first; on a tie the SMALLER step ranks higher, so
+    # an incumbent always outranks a later challenger with an equal score.
+    board.sort(key=lambda e: (sign * e["score"], e["step"]))
+    dropped, board = board[keep:], board[:keep]
+    if any(d["step"] == entry["step"] for d in dropped):
+        return None                              # didn't make the cut — nothing written
+
+    state = {"model": _unwrap(model).state_dict(), "cfg": cfg,
+             "epoch": epoch, "global_step": global_step, "best_score": float(score),
+             "score": float(score), "monitor": monitor, "subset": subset}
+    if not bool(out.get("top_k_weights_only", True)):
+        state.update({                           # full, resumable state
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict() if scaler is not None else None,
+            "track": dict(track), "elapsed_sec": elapsed_sec,
+            "rng": _rng_state(device) if device is not None else None})
+    torch.save(state, ckpt_dir / entry["file"])
+    for d in dropped:                            # evicted -> delete its file
+        (ckpt_dir / d["file"]).unlink(missing_ok=True)
+
+    track["top_k"] = board
+    ranked = [{"rank": i, **e, "same_weights_as": (out["best_name"] if i == 1 else None)}
+              for i, e in enumerate(board, 1)]
+    manifest = {"monitor": monitor, "subset": subset, "mode": mode, "keep_top_k": keep,
+                "weights_only": bool(out.get("top_k_weights_only", True)),
+                "note": (f"rank 1 is the same checkpoint as {out['best_name']}; ranks are "
+                         f"by {monitor} on '{subset}' and change as training proceeds — "
+                         f"the FILENAME encodes the step, never the rank."),
+                "checkpoints": ranked}
+    (ckpt_dir / "top_k.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    # human-readable twin of the JSON, so the ranking is legible without parsing
+    w = max(max((len(e["file"]) for e in board), default=4), 4)
+    lines = [f"TOP-{keep} CHECKPOINTS  —  ranked by {monitor} on '{subset}' ({mode})",
+             f"rank 1 == {out['best_name']} (identical weights). Filenames encode the "
+             f"STEP, not the rank.",
+             "",
+             f"{'rank':<5} {'file':<{w}} {'step':>8} {'epoch':>6} {monitor:>14}",
+             "-" * (5 + w + 8 + 6 + 14 + 4)]
+    lines += [f"{e['rank']:<5} {e['file']:<{w}} {e['step']:>8} {e['epoch']:>6} "
+              f"{e['score']:>14.6f}" for e in ranked]
+    (ckpt_dir / "top_k.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # Reported (not printed here) so the caller can print the whole top-K status as one
+    # block inside the validation summary, in the right order.
+    return {"entry": entry, "rank": board.index(entry) + 1, "kept": len(board),
+            "dropped": dropped, "cutoff": board[-1]["score"] if len(board) >= keep else None}
+
+
 def load_checkpoint(resume, model, ckpt_dir: Path, optimizer=None, scheduler=None,
                     scaler=None, device=None, restore_rng: bool = True) -> dict:
     """Resume from a checkpoint. `resume` may be 'best', 'last', or a path.
@@ -2405,7 +2486,8 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     track = {"best": (-math.inf if mode == "max" else math.inf),
              "no_improve": 0, "last_monitor": 0.0,
              "best_step": 0, "best_epoch": 0, "best_metrics": None,
-             "prev_macro": None, "prev_per_task": None, "prev_val_loss": None}
+             "prev_macro": None, "prev_per_task": None, "prev_val_loss": None,
+             "top_k": []}          # leaderboard of the K best validations (see update_top_k)
     # resume_fresh_schedule (opt-in): on resume, keep the WEIGHTS + progress
     # (global_step/epoch) + best/early-stopping tracking, but DO NOT restore the
     # optimizer / scheduler / scaler. They're rebuilt below from the CURRENT config so a
@@ -2486,6 +2568,19 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     else:
         print(f"[checkpoint] periodic rolling checkpoint every "
               f"{ckpt_every if ckpt_every > 0 else 'OFF'} steps; best.pt at validation")
+    _keep_top_k = int(out.get("keep_top_k", 0) or 0)
+    if _keep_top_k > 0:
+        print(f"[checkpoint] top-K leaderboard: keeping the {_keep_top_k} best "
+              f"validations as top_step{{N}}.pt (ranked by {monitor} on "
+              f"'{monitor_subset}', "
+              f"{'weights-only' if out.get('top_k_weights_only', True) else 'full state'}"
+              f"), manifest -> {out['checkpoints_dir']}/top_k.json")
+        _resumed_board = track.get("top_k") or []
+        if _resumed_board:
+            print(f"[checkpoint] resumed top-K board: {len(_resumed_board)} entries, "
+                  f"best={_resumed_board[0]['score']:.4f} @ step {_resumed_board[0]['step']}")
+    else:
+        print("[checkpoint] top-K leaderboard: OFF (output.keep_top_k = 0)")
 
     # debug-image saving (assurance that preprocessing/augmentation look right)
     _dbg = cfg.get("debug", {})
@@ -2688,6 +2783,14 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         _safe("best-checkpoint", save_checkpoint, ckpt_dir, cfg, model, optimizer,
               scheduler, scaler, epoch, gstep, track["best"], device, elapsed(),
               rolling=False, is_best=is_best, track=track)
+        # Top-K leaderboard: keep the K best-scoring validations of the whole run as
+        # their OWN files, so runners-up survive instead of being overwritten in
+        # best.pt. Ranked by `current` — the same monitored value as best.pt. Runs at
+        # every validation and is independent of the periodic ckpt_step cadence.
+        top_res = _safe("top-k", update_top_k, ckpt_dir, cfg, model, epoch, gstep,
+                          current, track, mode=mode, monitor=monitor, subset=mon_src,
+                          optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+                          device=device, elapsed_sec=elapsed())
         _safe("summary", _persist_summary, "running")
         if log_fn is not None:            # W&B: same scores as the val CSV (no system stats)
             wb = {f"{wandb_prefix}val/loss": val_loss}
@@ -2735,6 +2838,30 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                 # which subset actually drives it.
                 cnt = f"  ({track['no_improve']}/{es_patience})"
                 print(f"     ⚠️  {label} no improvement  best {monitor}={bbs[src]:.4f}{cnt}{drives}")
+        # Top-K leaderboard status — printed here (not inside update_top_k) so the whole
+        # block lands in order, right after the best/early-stop lines. This is the
+        # SCORE-ranked keep, entirely separate from the periodic ckpt_step cadence.
+        _tk = int(out.get("keep_top_k", 0) or 0)
+        if _tk > 0:
+            _board = track.get("top_k") or []
+            print("     " + "· · · · · · · · · ·  top-K checkpoints  · · · · · · · · · ·")
+            if top_res is not None:
+                print(f"     🏅 [top-{_tk}] SAVED at rank {top_res['rank']}/{_tk}  "
+                      f"{monitor}={current:.4f}  ->  {top_res['entry']['file']}")
+                for _d in top_res["dropped"]:
+                    print(f"        🗑️  evicted {_d['file']} "
+                          f"({monitor}={_d['score']:.4f}, step {_d['step']}) — "
+                          f"fell out of the top {_tk}")
+            else:
+                _cut = _board[-1]["score"] if len(_board) >= _tk else None
+                _cut_s = (f"cutoff {monitor}={_cut:.4f} (rank {_tk})" if _cut is not None
+                          else "board not full yet")
+                print(f"     ○  [top-{_tk}] not kept  {monitor}={current:.4f}  —  {_cut_s}")
+            # compact leaderboard: rank1 (=best.pt) .. rankN, so the whole board is
+            # visible at every validation without opening top_k.json
+            _rows = ", ".join(f"{i}:{e['score']:.4f}@{e['step']}"
+                              for i, e in enumerate(_board, 1))
+            print(f"        board ({len(_board)}/{_tk}) {_rows}")
         print("-" * 70)
 
         # track["allow_stop"] is set False during curriculum Phase A so those

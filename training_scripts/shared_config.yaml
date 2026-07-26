@@ -149,3 +149,20 @@ output:
     after_steps:  200                  # epoch 2 onward: every 200 steps
   keep_last_n: 60
   # keep_last_n lives in each experiment's config.yaml (output: keep_last_n)
+  # ---- top-K leaderboard --------------------------------------------------
+  # best.pt is a single file that gets OVERWRITTEN every time the monitored subset
+  # improves, so every runner-up checkpoint is lost. keep_top_k additionally keeps
+  # the K best-scoring validations of the whole run as top_step{N}.pt, ranked by the
+  # SAME metric+subset that drives best.pt (training.early_stopping.monitor read from
+  # validation.monitor_subset). When a new validation beats the current #K, it is
+  # written and the evicted one is deleted, so at most K files ever exist. The
+  # ranking is mirrored to checkpoints/top_k.json and survives resume (it lives in
+  # the saved `track`). 0 disables the feature (old behavior).
+  # NOTE: rank 1 duplicates best.pt by design — best.pt stays exactly as it was so
+  # resume/evaluate/warm-start paths are untouched.
+  keep_top_k: 10
+  # Top-K files store MODEL WEIGHTS ONLY (no optimizer/scheduler/scaler/RNG): they
+  # exist for evaluation and ensembling, not for resuming. That is ~3x smaller —
+  # for ViT-B, ~0.3 GB vs ~1 GB each, i.e. ~3 GB vs ~10 GB for K=10. Set false to
+  # write fully-resumable states instead.
+  top_k_weights_only: true
