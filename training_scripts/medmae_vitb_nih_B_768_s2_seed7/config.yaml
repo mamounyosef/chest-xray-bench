@@ -1,0 +1,131 @@
+# =============================================================================
+# config.yaml  —  experiment: medmae_vitb_nih_B_768_s2_seed7
+#   RUN B, STAGE 2 (FINAL) of the from-scratch ramp to 768x640.
+#       Stage 1 : 448x384   (medmae_vitb_nih_B_448_s1_seed7, fresh head)
+#       Stage 2 (THIS run): 768x640   <- final resolution
+# -----------------------------------------------------------------------------
+# WARM-START from Stage 1's best.pt (KEEP the head trained in Stage 1). build_medmae
+# _vit resamples the absolute pos_embed from Stage 1's 28x24 grid to this stage's
+# 48x40 grid (768/16 x 640/16 = 48x40 = 1920 tokens). resume null -> fresh 200-step
+# warmup then cosine. RUN THIS ONLY AFTER Stage 1 has produced
+# /runs/medmae_vitb_nih_B_448_s1_seed7/results/checkpoints/best.pt.
+# -----------------------------------------------------------------------------
+# DATA = NATIVE full-res tree. Holds only what VARIES; common settings from
+# ../shared_config.yaml.
+# =============================================================================
+
+experiment:
+  name: "medmae_vitb_nih_B_768_s2_seed7"
+
+model:
+  name: "vit_base_patch16_224"
+  arch: "medmae_vitb"
+  global_pool: "avg"
+  pretrained: false
+  checkpoint_path: "/runs/medmae_vitb_nih_B_448_s1_seed7/results/checkpoints/best.pt"
+  checkpoint_kind: "chexpert_run"  # Stage-1 (448x384) best.pt, head now trained
+  keep_head: true                  # KEEP the head trained through Stage 1
+
+reproducibility:
+  seed: 7
+
+resume: null
+
+labels:
+  u_policy: "mixed"
+  per_task:
+    Atelectasis:      "ones"
+    Cardiomegaly:     "ones"
+    Consolidation:    "selftrained"
+    Edema:            "ones"
+    Pleural Effusion: "ones"
+  selftrained_csv: "01_train_softlabels.csv"
+  val_ignore_uncertain: false
+
+clahe:
+  use_clahe: false
+  clip_limit: 2.0
+  tile_grid:  [8, 8]
+
+# ----------------------------------------------------------------------------
+# Image geometry  —  FINAL resolution 768x640 (48x40 patch grid, 1920 tokens).
+# ----------------------------------------------------------------------------
+image:
+  width:  768
+  height: 640
+
+dataloader:
+  batch_size:         64
+  num_workers:        30
+  pin_memory:         true
+  prefetch_factor:    4
+  persistent_workers: true
+  drop_last:          false
+  val_batch_size:         512
+  val_num_workers:        24
+  val_pin_memory:         true
+  val_prefetch_factor:    4
+  val_persistent_workers: true
+
+performance:
+  channels_last: true
+  fused_optimizer: true
+  compile: true
+  compile_mode: "default"
+
+# ----------------------------------------------------------------------------
+# Training  —  RUN B LR: 5.0e-5 -> 5.0e-7 (1%), LLRD 0.75, 200-step warmup at the
+# jump, then cosine. Stage 2 = 5 epochs (Run B split 1 @448 + 5 @768).
+# ----------------------------------------------------------------------------
+training:
+  epochs:        8
+  amp:           true
+  grad_clip:     1.0
+
+  optimizer:
+    lr:           5.0e-5
+    weight_decay: 1.0e-5
+    layer_decay:  0.75
+
+  scheduler:
+    name:        "cosine"
+    warmup_steps: 600
+    warmup_start_factor: 0.01   # begin warmup at 1% of base 
+
+    min_lr:      5.0e-7        # 1% of lr (multi-epoch stage)
+    plateau_patience: 2
+
+  loss:
+    name: "bce_with_logits"
+    pos_weight: null
+    label_smoothing: 0.05
+
+  early_stopping:
+    enable:   true
+    monitor:  "val_mean_auroc"
+    mode:     "max"
+    patience: 15
+
+evaluation:
+  metric: "mean_auroc"
+  eval_level: "image"
+  eval_every_epochs: null
+  eval_every_steps: 500
+
+paths:
+  path_remap:
+    from: "CheXpert-v1.0-small"
+    to:   "CheXpert-v1.0"
+
+modal:
+  gpu: "A100-80GB"
+  cpu_cores: 24
+  memory_gb: 45
+  timeout_seconds: 43200
+  data_volume: "chexpert-native-data"
+  runs_volume: "chexpert-runs"
+  data_mount:  "/data_native"
+  runs_mount:  "/runs"
+  remote_data_root: "/data_native/CheXpert-v1.0"
+  remote_data_dir:  "/data_native/splits"
+  wandb_secret: "wandb-secret"
