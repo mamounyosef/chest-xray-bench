@@ -31,26 +31,30 @@ import sys
 from pathlib import Path
 
 # ============================ CONFIG (edit here) ============================
-RUN_ON = "local"        # "modal" | "local" 
-SET    = "test500"      # scored split — "valid200" or "test500" or "val"
-GPU    = "H200"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
+RUN_ON = "auto"         # "auto" | "modal" | "local"
+                        # "auto": if EVERY member's probs are already cached locally the
+                        # ensemble is just a CPU average over .npy files -> run here. If
+                        # any member is missing it needs its checkpoint AND the images
+                        # (both of which live on the Modal volumes) -> run on Modal.
+SET    = "valid200"      # scored split — "valid200" or "test500" or "val"
+GPU    = "A100"         # Modal GPU for the ensemble run: T4|L4|A10G|A100|A100-80GB|
                         # H100|H200. Overrides the reference run's gpu; None -> use its.
-BATCH_SIZE = 512        # 176
+BATCH_SIZE = 176        # 176
                         # own dataloader.val_batch_size). valid200 is 200 imgs, so
                         # any value >=200 is one batch; lower it only to cap VRAM.
 
 # Modal container compute for the ensemble run (None -> inherit the reference run's
 # modal.cpu_cores / modal.memory_gb). These size what `modal` allocates.
-CPU_CORES = 14        # requested CPU cores for the Modal container
+CPU_CORES = 16        # requested CPU cores for the Modal container
 MEMORY_GB = 50        # requested RAM in GB for the Modal container
 
 # DataLoader knobs applied to EVERY member's inference pass (None -> that run's own
 # dataloader.val_* value). Raise workers toward the available cores to speed decoding.
 # Separate worker counts per environment (Modal has many vCPUs; a local run is bound
 # by this PC's cores). The active one is picked from RUN_ON below.
-NUM_WORKERS_MODAL = 24   # DataLoader workers per member when RUN_ON == "modal"
-NUM_WORKERS_LOCAL = 2    # DataLoader workers per member when RUN_ON == "local"
-NUM_WORKERS = NUM_WORKERS_MODAL if RUN_ON == "modal" else NUM_WORKERS_LOCAL
+NUM_WORKERS_MODAL = 30   # DataLoader workers per member when running on Modal
+NUM_WORKERS_LOCAL = 2    # DataLoader workers per member when running locally
+NUM_WORKERS = NUM_WORKERS_LOCAL   # rebound below, once RUN_ON="auto" is resolved to MODE
 PREFETCH_FACTOR = 4   # batches prefetched per worker (only used when workers > 0)
 
 # Per-member prob cache (cache_runs/<set>/<run>_<ckpt>.npy). A present file is a
@@ -60,17 +64,18 @@ REFRESH_CACHE = False
 
 # Full 5-class models — each contributes ALL five classes. Just list run names.
 FULL_MODELS = [
-    "convnext_base_22k_1600x1312",
-    "medmae_vitb_nih_B_768_s2",
-    "rad_dino_vitB_768",
+    # "convnext_base_22k_1600x1312",
+    # "medmae_vitb_nih_B_768_s2",
+    # "rad_dino_vitB_768",
+
     # "rad_dino_vitB_1064x896",
     # "medmae_vitb_nih",
     # "convnext_base_22k_768x640",
-    # "convnext_base_22k_final_stage1",
+    "convnext_base_22k_final_stage1",
 
     # "medmae_vitb_raw",
-    # "convnext_base_22k_seed1337",
-    # "convnext_base_22k_seed7",
+    "convnext_base_22k_seed1337",
+    "convnext_base_22k_seed7",
 ]
 
 # Per-run checkpoint file under results/checkpoints/ (default "best.pt"). Two-stage
@@ -88,17 +93,27 @@ CKPT_SUBPATH = {
 #   two-stage subfolder from CKPT_SUBPATH honored). Labeled "<run> @ step<N>" so it
 #   never collides with the plain "<run>" best.pt member. Empty list = off.
 CHECKPOINT_MEMBERS = [
-    # {"run": "convnext_base_22k_1600x1312", "checkpoint": 7500},
-    # {"run": "convnext_base_22k_1600x1312", "checkpoint": 8700},
-    # {"run": "medmae_vitb_nih", "checkpoint": 7500},
-    # {"run": "medmae_vitb_nih_B_768_s2", "checkpoint": 4400},
+    # {"run": "rad_dino_vitB_1064x896", "checkpoint": "best"},   # 0.8940  (= step12000)
+    # {"run": "rad_dino_vitB_1064x896", "checkpoint": 11800},    # 0.8921
+    # {"run": "rad_dino_vitB_1064x896", "checkpoint": 12800},    # 0.8918
+    # {"run": "rad_dino_vitB_1064x896", "checkpoint": 13200},    # 0.8911
+    # {"run": "rad_dino_vitB_1064x896", "checkpoint": 13000},    # 0.8909
 ]
+
+
+# Reference run: supplies the canonical task order, the split CSV and the Modal
+# settings. The first FULL_MODELS entry, or — when FULL_MODELS is empty and the
+# ensemble is built purely from CHECKPOINT_MEMBERS — the first checkpoint member's run.
+REF_RUN = (FULL_MODELS[0] if FULL_MODELS else
+           CHECKPOINT_MEMBERS[0]["run"] if CHECKPOINT_MEMBERS else None)
+if REF_RUN is None:
+    raise SystemExit("no members: fill FULL_MODELS and/or CHECKPOINT_MEMBERS.")
 
 # Per-class thresholds for the F1/precision/recall/specificity of the ENSEMBLE come
 # from this run's results/thresholds.json (AUROC/AUPRC stay threshold-free). Defaults
-# to the FIRST member in FULL_MODELS (its thresholds.json is on the runs volume because
-# it's an ensemble member). Set to any run name to override. Missing file/task -> 0.5.
-THRESHOLDS_FROM = FULL_MODELS[0]
+# to REF_RUN (its thresholds.json is on the runs volume because it's an ensemble
+# member). Set to any run name to override. Missing file/task -> 0.5.
+THRESHOLDS_FROM = REF_RUN
 
 # WEIGHTED blend (per class, per member) instead of the flat 1/M probability average.
 # Point WEIGHTS_FROM at a weighted_ensemble summary produced by
@@ -109,7 +124,7 @@ THRESHOLDS_FROM = FULL_MODELS[0]
 # member's label must have a weight for every class; weights are renormalized per class
 # over the members actually present (so dropping/adding a member stays well-defined).
 #   e.g. WEIGHTS_FROM = "weighted_ensemble/results/2026-07-22_14-30-05"
-WEIGHTS_FROM = "weighted_ensemble/results/2026-07-22_15-22-14"
+WEIGHTS_FROM = None # "weighted_ensemble/results/2026-07-22_15-22-14"
 
 # SPACE in which members are combined (a fixed, parameter-free transform applied per
 # member before the flat/weighted blend — composes with WEIGHTS_FROM). AUROC/AUPRC are
@@ -512,8 +527,8 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     from datetime import datetime
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # reference cfg (first full model) fixes the canonical task order + the split df.
-    ref = load_cfg(FULL_MODELS[0])
+    # reference cfg fixes the canonical task order + the split df.
+    ref = load_cfg(REF_RUN)
     tasks = list(ref["tasks"])
     data_dir = Path(ref["paths"]["data_dir"])
     df = pd.read_csv(data_dir / ref["paths"][f"{SET}_csv"])
@@ -810,11 +825,42 @@ try:
 except ImportError:
     _MODAL_OK = False
 
-# Build the app ONLY on the launching (local) side. In the remote container this
-# module is imported (to reuse run_ensemble), and modal.is_local() is False there,
-# so we skip rebuilding the app/image/volumes.
-if _MODAL_OK and modal.is_local():
-    _ref_cfg = sc.load_config(PKG_ROOT / FULL_MODELS[0], verbose=False)
+# --------------------- resolve RUN_ON ("auto") -> MODE ---------------------
+# A member is FREE if its probs are already cached: the ensemble is then a CPU average
+# over .npy files, no checkpoint and no images needed. A missing member needs BOTH its
+# checkpoint and the image tree — which live on the Modal volumes, not on this PC — so
+# "auto" sends the run to Modal exactly when something has to be computed.
+# In the REMOTE container this module is re-imported; there the answer is always
+# "modal" (never re-decide from a container-local cache dir).
+_IS_REMOTE = _MODAL_OK and not modal.is_local()
+if _IS_REMOTE:
+    MODE, _ALL_CACHED = "modal", False
+else:
+    _ALL_CACHED = _members_all_cached(Path(__file__).resolve().parent, SET)
+    if RUN_ON == "auto":
+        MODE = "local" if _ALL_CACHED else "modal"
+        print(f"[auto] {SET}: "
+              + ("every member is cached -> running LOCAL (CPU, no GPU, no images)"
+                 if _ALL_CACHED else
+                 "some members need compute -> running on MODAL"))
+        if MODE == "modal" and not _MODAL_OK:
+            raise SystemExit(
+                "RUN_ON='auto' needs Modal (some members aren't cached) but modal isn't "
+                "installed. Install it, or cache those members first.")
+    elif RUN_ON in ("local", "modal"):
+        MODE = RUN_ON
+        if MODE == "local" and not _ALL_CACHED:
+            print("[warn] RUN_ON='local' but some members aren't cached — this needs the "
+                  "image tree, which is NOT on this PC. Use RUN_ON='auto' or 'modal'.")
+    else:
+        raise SystemExit(f"RUN_ON must be 'auto' | 'local' | 'modal', got {RUN_ON!r}")
+NUM_WORKERS = NUM_WORKERS_MODAL if MODE == "modal" else NUM_WORKERS_LOCAL
+
+# Build the app ONLY on the launching (local) side, and only when we're actually going
+# to Modal. In the remote container this module is imported (to reuse run_ensemble),
+# and modal.is_local() is False there, so we skip rebuilding the app/image/volumes.
+if _MODAL_OK and modal.is_local() and MODE == "modal":
+    _ref_cfg = sc.load_config(PKG_ROOT / REF_RUN, verbose=False)
     app = modal.App(f"ensemble-{SET}")
     _runs_vol = modal.Volume.from_name(_ref_cfg["modal"]["runs_volume"], create_if_missing=True)
 
@@ -846,7 +892,7 @@ if _MODAL_OK and modal.is_local():
     # pure CPU averaging -> reserve NO GPU (don't idle-book a B200). Otherwise use the
     # configured GPU. Decided at VM-build time from the LOCAL cache (kept in sync by
     # _sync_cache_down); the up-sync then mirrors it to the volume the remote reads.
-    _all_cached = _members_all_cached(Path(__file__).resolve().parent, SET)
+    _all_cached = _ALL_CACHED             # already decided above (single check)
     _resources = sc.modal_resources(_ref_cfg)
     if _all_cached:
         _resources.pop("gpu", None)           # all members cached -> CPU-only VM
@@ -903,7 +949,7 @@ if _MODAL_OK and modal.is_local():
 
 
 if __name__ == "__main__":
-    if RUN_ON == "modal":
+    if MODE == "modal":
         if not _MODAL_OK:
             raise SystemExit("RUN_ON='modal' but modal isn't installed; set RUN_ON='local'.")
         _base_local = Path(__file__).resolve().parent
@@ -920,8 +966,6 @@ if __name__ == "__main__":
         if remote_sub:
             local_dir = _fetch_results_from_modal(_runs_volume, remote_sub, _base_local)
             _update_best_tracker(SET, local_dir)     # promote if it beats the local best
-    elif RUN_ON == "local":
+    else:
         out_dir = run_local()
         _update_best_tracker(SET, out_dir)           # promote if it beats the local best
-    else:
-        raise SystemExit(f"RUN_ON must be 'modal' or 'local', got {RUN_ON!r}")
