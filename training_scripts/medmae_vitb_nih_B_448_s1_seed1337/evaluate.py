@@ -27,9 +27,12 @@ import timm
 
 # ============================ CONFIG (edit here) ============================
 RUN_ON     = "modal"     # "modal" -> run on Modal GPU ; "local" -> this machine
-CHECKPOINT = "best"      # which checkpoint to score: best | last | <int step> | path
+CHECKPOINT =  2600      # which checkpoint to score: best | last | <int step> | path
 AMP        = False       # False -> full fp32 for the cleanest final metrics
 OBJECTIVE  = "f1"        # threshold objective if thresholds.json must be (re)calibrated
+EVAL_SETS  = ["valid200"]   # official sets to score: ["valid200"], ["test500"], or both
+CALIBRATE  = False       # False -> never run the slow 01_val.csv threshold calibration;
+                         # if thresholds.json is missing, fall back to 0.5 per task
 # ===========================================================================
 
 # Windows consoles default to cp1252 and choke on the emoji in the logs; force
@@ -75,7 +78,8 @@ def build_model(cfg: dict) -> nn.Module:
 def run_local():
     model = build_model(cfg)
     sc.evaluate_official(cfg, model, EXP_DIR,
-                         checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE)
+                         checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
+                         eval_sets=EVAL_SETS, calibrate_if_missing=CALIBRATE)
 
 
 # -----------------------------------------------------------------------------
@@ -121,6 +125,7 @@ if _MODAL_OK:
         try:
             _sc.evaluate_official(rcfg, model, out_dir,
                                   checkpoint=CHECKPOINT, amp=AMP, objective=OBJECTIVE,
+                                  eval_sets=EVAL_SETS, calibrate_if_missing=CALIBRATE,
                                   num_workers=int(rcfg["dataloader"]["val_num_workers"]))
         finally:
             _runs_vol.commit()                          # persist result files

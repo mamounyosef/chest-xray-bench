@@ -22,7 +22,7 @@ model:
   arch: "medmae_vitb"
   global_pool: "avg"
   pretrained: false
-  checkpoint_path: "/runs/medmae_vitb_nih_B_448_s1_seed1337/results/checkpoints/best.pt"
+  checkpoint_path: "/runs/medmae_vitb_nih_B_448_s1_seed1337/results/checkpoints/ckpt_step2400.pt"
   checkpoint_kind: "chexpert_run"  # Stage-1 (448x384) best.pt, head now trained
   keep_head: true                  # KEEP the head trained through Stage 1
 
@@ -110,7 +110,18 @@ evaluation:
   metric: "mean_auroc"
   eval_level: "image"
   eval_every_epochs: null
-  eval_every_steps: 500
+  eval_every_steps: 200     # base rhythm: validation fires every 200 steps
+
+# ----------------------------------------------------------------------------
+# Split validation cadence: the cheap 200-image radiologist set is scored at EVERY
+# firing (200 steps), the expensive 19k primary val only every second one (400).
+# So: step 200 -> val200 only, step 400 -> both, step 600 -> val200 only, ...
+# valid200 is monitor_subset, so it drives best.pt / early stopping at every firing.
+# ----------------------------------------------------------------------------
+validation:
+  primary_every_steps: 400
+  extra_every_steps:
+    valid200: 200
 
 paths:
   path_remap:

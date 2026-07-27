@@ -105,6 +105,31 @@ validation:
   # A named subset must be enabled; if it's missing/disabled at runtime, best/early-
   # stop fall back to "val" with a warning.
   monitor_subset: "valid200"
+
+  # --------------------------------------------------------------------------
+  # PER-SUBSET VALIDATION CADENCE (optimizer steps).
+  # evaluation.eval_every_steps is the BASE rhythm — how often validation fires at
+  # all. These let an EXPENSIVE subset be scored on only some of those firings,
+  # e.g. the 19k primary val every 400 steps while the 200-image radiologist set
+  # is scored every 200:
+  #     evaluation.eval_every_steps: 200
+  #     primary_every_steps: 400
+  #     extra_every_steps: {valid200: 200}
+  # Rules:
+  #   null / absent / <=0  -> that subset is scored at EVERY validation (default,
+  #                           i.e. unchanged behavior).
+  #   a value              -> must be a POSITIVE MULTIPLE of eval_every_steps,
+  #                           else the run fails loudly at startup (a non-multiple
+  #                           would starve the subset).
+  #   monitor_subset       -> always scored at every validation; a cadence set on
+  #                           it is ignored with a warning (best.pt / early stopping
+  #                           need a score at every firing).
+  # Skipped subsets are ANNOUNCED in the log, get empty cells in val_log.csv (the
+  # header never changes) and are simply not logged to W&B at that step. Epoch-end
+  # validations (eval_every_epochs) always score every subset.
+  primary_every_steps: null       # cadence for the primary val_csv subset ("val")
+  extra_every_steps: {}           # {<extra subset name>: steps}
+
   extra_subsets:
     - name: "valid200"
       csv: "01_valid200.csv"       # official 200-study radiologist set

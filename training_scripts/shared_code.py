@@ -246,6 +246,31 @@ def num_output_logits(cfg: dict) -> int:
     return task_layout(cfg)["n_logits"]
 
 
+def resume_requested(cfg: dict) -> bool:
+    """True when cfg['resume'] asks for a checkpoint ('best' | 'last' | <step> |
+    <path>). null / false / '' -> a fresh run."""
+    r = cfg.get("resume")
+    if r is None or r is False:
+        return False
+    return not (isinstance(r, str) and not r.strip())
+
+
+def _skip_warmstart_on_resume(cfg: dict, load_pretrained: bool, tag: str) -> bool:
+    """Model builders call this to demote load_pretrained when the run is RESUMING.
+
+    A resume restores every weight from the run's own checkpoint, so seeding the
+    backbone from the start-checkpoint first is pure waste — and, worse, it makes
+    the resume HARD-DEPEND on that start file still existing (e.g. a Stage-1
+    best.pt that has since been pruned), which is what fails a resume that would
+    otherwise be fine. Returns the effective load_pretrained."""
+    if load_pretrained and resume_requested(cfg):
+        print(f"[{tag}] resume={cfg.get('resume')!r} -> SKIPPING the start-checkpoint "
+              f"warm-start; the resumed checkpoint supplies all weights "
+              f"(architecture built with random init).")
+        return False
+    return load_pretrained
+
+
 def build_medmae_vit(cfg: dict, load_pretrained: bool = False) -> nn.Module:
     """Build a Medical-MAE ViT-B/16 for the 3-way starting-checkpoint comparison
     (lambert-x/medical_mae). Architecture is timm's VisionTransformer with GLOBAL
@@ -285,6 +310,7 @@ def build_medmae_vit(cfg: dict, load_pretrained: bool = False) -> nn.Module:
     if not keep_head:                       # fresh head, Medical-MAE finetune init
         nn.init.trunc_normal_(model.head.weight, std=2e-5)
         nn.init.zeros_(model.head.bias)
+    load_pretrained = _skip_warmstart_on_resume(cfg, load_pretrained, "medmae")
     if not load_pretrained:
         return model
 
@@ -378,6 +404,7 @@ class RadDinoClassifier(nn.Module):
 
         m = cfg["model"]
         rev = m.get("hf_revision")                 # optional pin for reproducibility
+        load_pretrained = _skip_warmstart_on_resume(cfg, load_pretrained, "raddino")
         if load_pretrained:
             print("=" * 70)
             print(f"[raddino] loading RAD-DINO backbone from {_RADDINO_HF_ID}"
@@ -1005,6 +1032,12 @@ def set_seed(seed: int, deterministic: bool = True):
     print(f"[set_seed] seed={seed}  deterministic={deterministic}")
 
 
+# Macro keys compute_metrics returns, in order. Named so the CSV logger can emit
+# the same columns (empty) for a subset that a cadence skipped at a given step.
+MACRO_KEYS = ("mean_auroc", "mean_auprc", "mean_f1", "mean_precision",
+              "mean_recall", "mean_specificity")
+
+
 def compute_metrics(y_true, y_prob, tasks: list, threshold=0.5, exclude_mask=None) -> dict:
     """Multi-label metrics from ground-truth (N,T) 0/1 and probabilities (N,T).
 
@@ -1540,7 +1573,8 @@ def fmt_duration(seconds: float) -> str:
 
 def _flatten_val_row(epoch: int, gstep: int, val_loss: float, metrics: dict,
                      tasks: list, elapsed_sec: float, eta_sec: float,
-                     stage_tag: str = None, extra: dict = None) -> dict:
+                     stage_tag: str = None, extra: dict = None,
+                     extra_names=None) -> dict:
     """Flatten validation metrics into one wide CSV row (macro + per-task). When a
     stage_tag is given (two-stage runs), a 'stage' column is added so the two
     stages' rows — stacked in the SAME val_log.csv — stay distinguishable. When it
@@ -1555,22 +1589,36 @@ def _flatten_val_row(epoch: int, gstep: int, val_loss: float, metrics: dict,
         row["stage"] = stage_tag
     row.update({"elapsed_sec": round(elapsed_sec, 2),
                 "eta_sec": round(eta_sec, 2) if math.isfinite(eta_sec) else "",
-                "val_loss": round(val_loss, 6)})
-    for k, v in metrics["macro"].items():
-        row[k] = round(v, 6)
+                "val_loss": round(val_loss, 6) if metrics is not None else ""})
+    # metrics is None when the primary val's own cadence skipped this step
+    # (validation.primary_every_steps). Its columns are still emitted, EMPTY, so the
+    # CSV header stays identical for every row.
+    for k in MACRO_KEYS:
+        row[k] = round(metrics["macro"][k], 6) if metrics is not None else ""
     for t in tasks:
-        m = metrics["per_task"][t]
+        m = metrics["per_task"][t] if metrics is not None else None
         for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity",
                     "n_pos", "n_excluded"):
+            if m is None:
+                row[f"{key}/{t}"] = ""
+                continue
             val = m[key]
             row[f"{key}/{t}"] = round(val, 6) if isinstance(val, float) else val
-    for name, em in (extra or {}).items():
-        for k, v in em["macro"].items():
-            row[f"{name}_{k}"] = round(v, 6)
+    # `extra_names` pins the extra-subset COLUMN SET (all configured subsets), while
+    # `extra` holds only the ones actually scored at this step — a subset skipped by
+    # its cadence gets empty cells instead of vanishing columns.
+    extra = extra or {}
+    for name in (extra_names if extra_names is not None else list(extra.keys())):
+        em = extra.get(name)
+        for k in MACRO_KEYS:
+            row[f"{name}_{k}"] = round(em["macro"][k], 6) if em is not None else ""
         for t in tasks:
-            m = em["per_task"][t]
+            m = em["per_task"][t] if em is not None else None
             for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity",
                         "n_pos", "n_excluded"):
+                if m is None:
+                    row[f"{name}_{key}/{t}"] = ""
+                    continue
                 val = m[key]
                 row[f"{name}_{key}/{t}"] = round(val, 6) if isinstance(val, float) else val
     return row
@@ -2237,6 +2285,59 @@ def _resolve_eval_every_steps(cfg: dict, epoch: int):
     return after if (epoch + 1) >= thr else before
 
 
+def resolve_subset_cadences(cfg: dict, extra_names, monitor_subset: str) -> dict:
+    """Per-subset validation cadence, in OPTIMIZER steps.
+
+    `evaluation.eval_every_steps` sets the BASE cadence — the rhythm on which
+    on_eval fires at all. On top of that, each validation subset may run only on
+    SOME of those firings, so an expensive subset (the 19k primary val) can be
+    scored less often than a cheap one (the 200-image radiologist set):
+
+        validation:
+          primary_every_steps: 400      # the primary val_csv subset ("val")
+          extra_every_steps:
+            valid200: 200               # by extra-subset name
+
+    null / absent / <=0 -> that subset runs at EVERY validation (old behavior).
+    A cadence must be a positive multiple of the base, otherwise its step would
+    rarely or never coincide with a firing; a non-multiple is rejected loudly
+    rather than silently starving a subset.
+
+    The MONITORED subset (validation.monitor_subset — the one best.pt and early
+    stopping read) is always forced to every firing: skipping it would leave a
+    validation with no score to compare, so a cadence set on it is ignored with
+    a warning.
+
+    Returns {"val": every_or_None, "<extra name>": every_or_None}."""
+    val_cfg = (cfg.get("validation", {}) or {})
+    base = int(cfg["evaluation"].get("eval_every_steps") or 0)
+    raw = {"val": val_cfg.get("primary_every_steps")}
+    every_map = (val_cfg.get("extra_every_steps") or {})
+    for name in extra_names:
+        raw[name] = every_map.get(name)
+
+    out = {}
+    for name, v in raw.items():
+        every = int(v) if v not in (None, "") else 0
+        if every <= 0 or every == base:      # == base is just "every firing" spelled out
+            out[name] = None
+            continue
+        if name == monitor_subset:
+            print(f"[val-cadence] ⚠️  '{name}' is the monitored subset (drives best.pt "
+                  f"+ early stopping) — its every_steps={every} is IGNORED; it is "
+                  f"scored at every validation.")
+            out[name] = None
+            continue
+        if base > 0 and every % base != 0:
+            raise ValueError(
+                f"validation cadence for '{name}' is {every} steps, which is not a "
+                f"multiple of evaluation.eval_every_steps={base}. Validation only "
+                f"fires every {base} steps, so '{name}' would rarely (or never) be "
+                f"scored. Use a multiple of {base}.")
+        out[name] = every
+    return out
+
+
 def _resolve_checkpoint_every_steps(cfg: dict, epoch: int) -> int:
     """Effective periodic-checkpoint cadence (steps) for a 0-indexed `epoch`. Default
     is the flat output.checkpoint_every_steps. If output.checkpoint_schedule is
@@ -2369,6 +2470,21 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
     subset_labels = {"val": _sz_label(len(val_loader.dataset))}
     for _n, _ldr in extra_val_loaders:
         subset_labels[_n] = _sz_label(len(_ldr.dataset))
+    # Per-subset validation cadence (validation.primary_every_steps /
+    # validation.extra_every_steps). None -> that subset is scored at EVERY
+    # validation; an int -> only when global_step is a multiple of it.
+    # Frozen at startup: the val CSV's extra-subset columns. A subset skipped by its
+    # cadence (or disabled mid-run after an error) still gets empty cells, so
+    # DictWriter's header — fixed on the first row — stays valid for the whole run.
+    _val_csv_extra_names = [n for n, _ in extra_val_loaders]
+    subset_every = resolve_subset_cadences(
+        cfg, [n for n, _ in extra_val_loaders],
+        (cfg.get("validation", {}) or {}).get("monitor_subset", "val"))
+    if any(v for v in subset_every.values()):
+        print("[val-cadence] " + "  ".join(
+            f"{subset_labels.get(n, n)}=every "
+            + (f"{v} steps" if v else f"{cfg['evaluation']['eval_every_steps']} steps (base)")
+            for n, v in subset_every.items()))
     model = model.to(device)
     print_model_summary(model, cfg)
 
@@ -2653,17 +2769,40 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         _write_summary(summary_path, doc)
 
     # --- validation + checkpoint + early-stop, shared by step- and epoch-eval ---
-    def on_eval(epoch: int, gstep: int) -> bool:
+    def on_eval(epoch: int, gstep: int, force_all: bool = False) -> bool:
+        # Which subsets are due at THIS step (see resolve_subset_cadences). A subset
+        # with a coarser cadence is announced as skipped, never silently dropped, so
+        # the log makes clear why its numbers are absent from this block.
+        # force_all=True (epoch-end validation) scores everything regardless.
+        def _due(name: str) -> bool:
+            every = subset_every.get(name)
+            return force_all or not every or (gstep % int(every) == 0)
+        run_primary = _due("val")
         print("=" * 70)
         _stg = f"[{stage_tag}] " if stage_tag else ""
-        print(f"🔎 {_stg}VALIDATION START — epoch {epoch + 1}/{epochs}  step {gstep}  "
-              f"({len(val_loader)} batches, {len(val_loader.dataset)} images) ...")
-        val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device, amp, channels_last)
+        if run_primary:
+            print(f"🔎 {_stg}VALIDATION START — epoch {epoch + 1}/{epochs}  step {gstep}  "
+                  f"({len(val_loader)} batches, {len(val_loader.dataset)} images) ...")
+            val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device,
+                                         amp, channels_last)
+            macro = metrics["macro"]
+        else:
+            print(f"🔎 {_stg}VALIDATION START — epoch {epoch + 1}/{epochs}  step {gstep}")
+            print(f"     ⏭️  [{subset_labels['val']}] SKIPPED at this step — runs every "
+                  f"{subset_every['val']} steps (next @ step "
+                  f"{(gstep // int(subset_every['val']) + 1) * int(subset_every['val'])})")
+            val_loss, metrics, macro = None, None, None
         # Extra report-only subsets (e.g. valid200): score each, keep metrics for the
         # log row / print / W&B. These NEVER touch `current` / best / early stopping.
         extra, extra_loss, _failed = {}, {}, []
         for _entry in extra_val_loaders:
             _name, _ldr = _entry
+            if not _due(_name):
+                _ev = int(subset_every[_name])
+                print(f"     ⏭️  [{subset_labels.get(_name, _name)}] SKIPPED at this step "
+                      f"— runs every {_ev} steps (next @ step "
+                      f"{(gstep // _ev + 1) * _ev})")
+                continue
             try:
                 extra_loss[_name], extra[_name] = validate(
                     model, _ldr, loss_fn, cfg, device, amp, channels_last)
@@ -2675,7 +2814,6 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                 _failed.append(_entry)
         for _entry in _failed:
             extra_val_loaders.remove(_entry)
-        macro = metrics["macro"]
         # Which subset drives best.pt + early stopping: "val" (primary 10% val_csv) or
         # an extra subset's name (e.g. "valid200"). A named-but-unavailable subset
         # (disabled/missing) falls back to the primary val with a warning.
@@ -2687,6 +2825,16 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             if monitor_subset != "val" and monitor_subset not in extra:
                 print(f"     ⚠️  monitor_subset '{monitor_subset}' unavailable — best/"
                       f"early-stop falling back to primary val")
+            if not run_primary:
+                # Falling back to the primary val on a step where its cadence had
+                # skipped it: score it now, since best.pt/early stopping have no
+                # other source of a monitor value.
+                print(f"     ↩️  scoring the primary val anyway — it is now the "
+                      f"best/early-stop source")
+                val_loss, metrics = validate(model, val_loader, loss_fn, cfg, device,
+                                             amp, channels_last)
+                macro = metrics["macro"]
+                run_primary = True
             current = _monitor_value(macro, val_loss, monitor)
             mon_src = "val"
         # Seed the monitored source's remembered best from track["best"] BEFORE it is
@@ -2699,32 +2847,43 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         track["last_step"] = gstep
         _safe("val_log", val_logger.log,
               _flatten_val_row(epoch + 1, gstep, val_loss, metrics,
-                               cfg["tasks"], elapsed(), eta(gstep), stage_tag, extra=extra))
+                               cfg["tasks"], elapsed(), eta(gstep), stage_tag,
+                               extra=extra, extra_names=_val_csv_extra_names))
 
-        d_val_loss = _fmt_delta(val_loss, track["prev_val_loss"])   # vs last validation
         print("-" * 70)
-        print(f"  🔎 [VAL] epoch={epoch + 1}/{epochs} step={gstep}  elapsed={fmt_duration(elapsed())}  "
-              f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}{d_val_loss}"
-              f"{_gpu_mem_report(device)}")
-        pm = track["prev_macro"]            # previous validation's macro (None on 1st)
-        def _d(key):                        # delta vs last validation for a macro key
-            return _fmt_delta(macro[key], pm[key] if pm is not None else None)
-        print(f"     📊 mean AUROC={macro['mean_auroc']:.4f}{_d('mean_auroc')}  "
-              f"mean AUPRC={macro['mean_auprc']:.4f}{_d('mean_auprc')}  "
-              f"F1={macro['mean_f1']:.4f}{_d('mean_f1')}  "
-              f"P={macro['mean_precision']:.4f}{_d('mean_precision')}  "
-              f"R={macro['mean_recall']:.4f}{_d('mean_recall')}  "
-              f"Spec={macro['mean_specificity']:.4f}{_d('mean_specificity')}")
-        ppt = track["prev_per_task"]        # previous validation's per-task metrics
-        for t in cfg["tasks"]:
-            m = metrics["per_task"][t]
-            pt = ppt.get(t) if ppt is not None else None
-            d_auroc = _fmt_delta(m['auroc'], pt['auroc'] if pt is not None else None)
-            d_auprc = _fmt_delta(m['auprc'], pt['auprc'] if pt is not None else None)
-            n_excl = m.get('n_excluded', 0)
-            excl_str = f"  excl={n_excl}" if n_excl else ""   # uncertain rows dropped (multiclass)
-            print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
-                  f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']}{excl_str})")
+        if run_primary:
+            d_val_loss = _fmt_delta(val_loss, track["prev_val_loss"])   # vs last validation
+            print(f"  🔎 [VAL] epoch={epoch + 1}/{epochs} step={gstep}  elapsed={fmt_duration(elapsed())}  "
+                  f"ETA={fmt_duration(eta(gstep))}  val_loss={val_loss:.4f}{d_val_loss}"
+                  f"{_gpu_mem_report(device)}")
+            pm = track["prev_macro"]        # previous validation's macro (None on 1st)
+            def _d(key):                    # delta vs last validation for a macro key
+                return _fmt_delta(macro[key], pm[key] if pm is not None else None)
+            print(f"     📊 mean AUROC={macro['mean_auroc']:.4f}{_d('mean_auroc')}  "
+                  f"mean AUPRC={macro['mean_auprc']:.4f}{_d('mean_auprc')}  "
+                  f"F1={macro['mean_f1']:.4f}{_d('mean_f1')}  "
+                  f"P={macro['mean_precision']:.4f}{_d('mean_precision')}  "
+                  f"R={macro['mean_recall']:.4f}{_d('mean_recall')}  "
+                  f"Spec={macro['mean_specificity']:.4f}{_d('mean_specificity')}")
+            ppt = track["prev_per_task"]    # previous validation's per-task metrics
+            for t in cfg["tasks"]:
+                m = metrics["per_task"][t]
+                pt = ppt.get(t) if ppt is not None else None
+                d_auroc = _fmt_delta(m['auroc'], pt['auroc'] if pt is not None else None)
+                d_auprc = _fmt_delta(m['auprc'], pt['auprc'] if pt is not None else None)
+                n_excl = m.get('n_excluded', 0)
+                excl_str = f"  excl={n_excl}" if n_excl else ""   # uncertain rows dropped (multiclass)
+                print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
+                      f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']}{excl_str})")
+        else:
+            # deltas below are still vs each subset's OWN last scoring, so the
+            # skipped primary simply contributes nothing to this block.
+            print(f"  🔎 [VAL] epoch={epoch + 1}/{epochs} step={gstep}  "
+                  f"elapsed={fmt_duration(elapsed())}  ETA={fmt_duration(eta(gstep))}"
+                  f"{_gpu_mem_report(device)}")
+            print(f"     ⏭️  [{subset_labels['val']}] not scored at this step "
+                  f"(every {subset_every['val']} steps) — last scored @ step "
+                  f"{track.get('prev_val_step', '—')}")
         # Extra subsets (e.g. valid200): SAME macro + per-task print as the primary
         # val above, each with deltas vs that subset's OWN previous validation.
         prev_extra = track.get("prev_extra") or {}
@@ -2751,12 +2910,20 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                 excl_str = f"  excl={n_excl}" if n_excl else ""
                 print(f"        {t:<18} AUROC={m['auroc']:.4f}{d_auroc}  "
                       f"AUPRC={m['auprc']:.4f}{d_auprc}  (pos={m['n_pos']}{excl_str})")
-        track["prev_macro"] = dict(macro)            # baseline for next validation
-        track["prev_per_task"] = {t: dict(metrics["per_task"][t]) for t in cfg["tasks"]}
-        track["prev_val_loss"] = val_loss
-        track["prev_extra"] = {n: {"macro": dict(e["macro"]),
-                                   "per_task": {t: dict(e["per_task"][t]) for t in cfg["tasks"]}}
-                               for n, e in extra.items()}
+        # Baselines for the next validation's deltas. Only subsets actually scored
+        # here are refreshed, so a coarser-cadence subset compares against its own
+        # last scoring rather than against nothing.
+        if run_primary:
+            track["prev_macro"] = dict(macro)
+            track["prev_per_task"] = {t: dict(metrics["per_task"][t]) for t in cfg["tasks"]}
+            track["prev_val_loss"] = val_loss
+            track["prev_val_step"] = gstep
+        if not isinstance(track.get("prev_extra"), dict):
+            track["prev_extra"] = {}
+        track["prev_extra"].update(
+            {n: {"macro": dict(e["macro"]),
+                 "per_task": {t: dict(e["per_task"][t]) for t in cfg["tasks"]}}
+             for n, e in extra.items()})
 
         prev_best = track["best"]
         is_best = better(current, track["best"])
@@ -2773,7 +2940,14 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                 blk["per_task"] = {t: dict(per_task[t]) for t in cfg["tasks"]}
                 return blk
             bm = {"monitored": subset_labels.get(mon_src, mon_src)}
-            bm[subset_labels["val"]] = _subset_block(macro, val_loss, metrics["per_task"])
+            if run_primary:
+                bm[subset_labels["val"]] = _subset_block(macro, val_loss,
+                                                         metrics["per_task"])
+            else:
+                # the primary's cadence skipped this step: it has no numbers AT the
+                # best step, so record that instead of copying a stale scoring.
+                bm[subset_labels["val"]] = {"not_scored_at_best_step": True,
+                                            "last_scored_step": track.get("prev_val_step")}
             for _n, _em in extra.items():
                 bm[subset_labels.get(_n, _n)] = _subset_block(
                     _em["macro"], extra_loss[_n], _em["per_task"])
@@ -2793,12 +2967,14 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
                           device=device, elapsed_sec=elapsed())
         _safe("summary", _persist_summary, "running")
         if log_fn is not None:            # W&B: same scores as the val CSV (no system stats)
-            wb = {f"{wandb_prefix}val/loss": val_loss}
-            wb.update({f"{wandb_prefix}val/{k}": v for k, v in macro.items()})
-            for t in cfg["tasks"]:
-                pm = metrics["per_task"][t]
-                for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity"):
-                    wb[f"{wandb_prefix}val/{key}/{t}"] = pm[key]
+            wb = {}
+            if run_primary:      # skipped by cadence -> log nothing, no gap-filling
+                wb[f"{wandb_prefix}val/loss"] = val_loss
+                wb.update({f"{wandb_prefix}val/{k}": v for k, v in macro.items()})
+                for t in cfg["tasks"]:
+                    pm = metrics["per_task"][t]
+                    for key in ("auroc", "auprc", "f1", "precision", "recall", "specificity"):
+                        wb[f"{wandb_prefix}val/{key}/{t}"] = pm[key]
             for _name, _em in extra.items():          # report-only subsets under "<name>/..."
                 wb.update({f"{wandb_prefix}{_name}/{k}": v for k, v in _em["macro"].items()})
                 for t in cfg["tasks"]:
@@ -2813,13 +2989,18 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
         # OWN ⭐/⚠️ independently. Only mon_src drives best.pt + early stopping — it is
         # the ONLY line with the ← marker and the 💾 save marker; the shared patience
         # counter is shown on EVERY no-improvement line for visibility.
-        mon_vals = {"val": _monitor_value(macro, val_loss, monitor)}
+        # Only subsets scored at this step get a line; a cadence-skipped subset keeps
+        # its running best untouched (its ⭐/⚠️ resumes at its next scoring).
+        mon_vals = {}
+        if run_primary:
+            mon_vals["val"] = _monitor_value(macro, val_loss, monitor)
         for _n in extra:
             mon_vals[_n] = _monitor_value(extra[_n]["macro"], extra_loss[_n], monitor)
         sign = "+" if mode == "max" else ""
-        _w = max(len(s) for s in (["val"] + list(extra.keys())))   # align the [src] labels
+        _srcs = list(mon_vals.keys())
+        _w = max((len(s) for s in _srcs), default=1)   # align the [src] labels
         print("     " + "· · · · · · · · · ·  best / early-stop  · · · · · · · · · ·")
-        for src in ["val"] + list(extra.keys()):
+        for src in _srcs:
             v = mon_vals[src]
             prev = bbs.get(src)
             improved = prev is None or better(v, prev)
@@ -2928,7 +3109,9 @@ def _run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=No
             wandb_step_offset=wandb_offset, warmup_steps=warmup_steps)
 
         if not stop and ev_epochs and ((epoch + 1) % int(ev_epochs) == 0):
-            stop = on_eval(epoch, global_step)
+            # epoch boundary: score EVERY subset (force_all) — the step there is
+            # arbitrary and rarely lands on a coarse subset's cadence.
+            stop = on_eval(epoch, global_step, force_all=True)
 
         # persistent epoch-end checkpoint(s) for configured epochs (1-indexed), e.g.
         # output.save_epoch_checkpoints: [2] -> epoch_2.pt (a later stage's warm-start
@@ -3115,7 +3298,9 @@ def run_experiment(cfg: dict, model, experiment_dir, resume=None, persist_fn=Non
     wins over the config."""
     experiment_dir = Path(experiment_dir)
     if resume is None:
-        resume = cfg.get("resume")
+        # normalize false / "" to None so "no resume" has ONE representation here and
+        # in resume_requested (which the model builders use to skip the warm-start).
+        resume = cfg.get("resume") if resume_requested(cfg) else None
     cap_dir = experiment_dir / cfg["output"]["console_capture_dir"]
     cap_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -3812,7 +3997,8 @@ def _render_report_txt(report: dict) -> str:
 def evaluate_official(cfg: dict, model, experiment_dir, device=None,
                       checkpoint: str = "best", amp: bool = False,
                       batch_size: int = None, num_workers: int = 0,
-                      objective: str = "f1", eval_sets=("valid200", "test500")):
+                      objective: str = "f1", eval_sets=("valid200", "test500"),
+                      calibrate_if_missing: bool = True):
     """Load `checkpoint` (default best.pt) and score it on the official sets
     (valid200 + test500) INDEPENDENTLY, applying the FROZEN per-task thresholds
     from results/thresholds.json (calibrated on the validation set). If that file
@@ -3850,7 +4036,16 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
 
     # frozen per-task thresholds: load the saved file, else calibrate now + save.
     thr_map, thr_path = load_thresholds(results_dir, cfg)
-    if thr_map is None:
+    thr_source = cfg["paths"]["val_csv"]
+    if thr_map is None and not calibrate_if_missing:
+        # Explicitly opted out of the (slow) calibration pass over 01_val.csv.
+        # AUROC/AUPRC are unaffected; the thresholded metrics fall back to 0.5.
+        thr_map = {t: 0.5 for t in tasks}
+        thr_source = "uncalibrated (0.5)"
+        print(f"  ⚠️  no usable {thr_path.name} and calibrate_if_missing=False — "
+              f"using threshold 0.5 for every task (AUROC/AUPRC unaffected; "
+              f"F1/precision/recall/specificity are NOT the frozen-threshold numbers)")
+    elif thr_map is None:
         print(f"  ⚠️  no usable {thr_path.name} — calibrating per-task thresholds now "
               f"on {cfg['paths']['val_csv']} ...")
         df_val = pd.read_csv(data_dir / cfg["paths"]["val_csv"])
@@ -3873,7 +4068,15 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
     # ("test500",)) leaves the other set's existing files untouched.
     _all_sets = {"valid200": cfg["paths"]["valid200_csv"],
                  "test500":  cfg["paths"]["test500_csv"]}
-    sets = [(n, _all_sets[n]) for n in eval_sets if n in _all_sets]
+    # accept the obvious short aliases; anything else is a typo, not "score nothing"
+    _alias = {"val200": "valid200", "val": "valid200", "valid": "valid200",
+              "test": "test500", "test_500": "test500"}
+    eval_sets = [_alias.get(n, n) for n in eval_sets]
+    _bad = [n for n in eval_sets if n not in _all_sets]
+    if _bad:
+        raise ValueError(f"unknown eval_sets {_bad} — valid names are "
+                         f"{sorted(_all_sets)} (aliases: {sorted(_alias)})")
+    sets = [(n, _all_sets[n]) for n in eval_sets]
     print(f"[eval] scoring sets: {[n for n, _ in sets]}")
 
     reports = {}
@@ -3904,7 +4107,7 @@ def evaluate_official(cfg: dict, model, experiment_dir, device=None,
             "device": str(device),
             "amp": bool(amp),
             "threshold_objective": objective,
-            "threshold_source": cfg["paths"]["val_csv"],
+            "threshold_source": thr_source,
             "thresholds": {t: float(thr_map[t]) for t in tasks},
             "use_clahe": bool(cfg["clahe"]["use_clahe"]),
             "u_policy": cfg["labels"]["u_policy"],
