@@ -52,11 +52,11 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 # ============================ CONFIG (edit here) ============================
-RUN = "rad_dino_vitB_1064x896"   # run whose val_log.csv is ranked
+RUN = "convnext_base_22k_1600x1312"   # run whose val_log.csv is ranked
 
 # Column of val_log.csv to rank by. This run monitored valid200, so that is the
 # default; "mean_auroc" would rank by the ~19k in-training val split instead.
-METRIC = "valid200_mean_auroc"
+METRIC = "mean_auroc"
 MODE = "max"                     # "max" (AUROC) | "min" (loss)
 
 TOP_N = 10                       # how many validation points to report
@@ -249,16 +249,16 @@ def main():
       f"{max(gaps) / int(df['step'].diff().mode()[0]):.2f} of one validation interval, "
       f"so the approximated weights sit strictly between two measured validations.")
     w("")
-    w("COPY-PASTE  —  CHECKPOINT_MEMBERS for ensample.py / weighted_ensemble.py")
+    w("COPY-PASTE  —  members for ensample.py's FULL_MODELS. Each ('<run>', <step>) is")
+    w("one independent voter; wrap the whole block in [ ... ] to make them ONE averaged")
+    w("member instead.")
     for n in sorted({MARK_AT, TOP_N}):
         w(f"  # top-{n}")
-        w("  CHECKPOINT_MEMBERS = [")
         for r in rows[:n]:
             c = "best" if r["checkpoint"] == "best.pt" else r["checkpoint_step"]
-            w(f'      {{"run": "{RUN}", "checkpoint": {json.dumps(c)}}},'
+            w(f'      ("{RUN}", {json.dumps(c)}),'
               f'   # rank {r["rank"]}, {METRIC}={r["metric"]:.4f}'
               + ("" if r["exact"] else f", {r['gap_steps']:+d} steps"))
-        w("  ]")
     w("=" * 96)
 
     report = "\n".join(L) + "\n"

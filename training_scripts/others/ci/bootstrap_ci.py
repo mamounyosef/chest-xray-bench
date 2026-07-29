@@ -1,20 +1,20 @@
 """
 bootstrap_ci.py
 ===============
-Bootstrap 95% confidence intervals for the FINAL 3-member per-class-WEIGHTED ensemble,
+Bootstrap 95% confidence intervals for the FINAL per-class-WEIGHTED ensemble,
 computed independently on valid200 (234 images) and test500 (668 images).
 No retraining, no re-evaluation: it reads the per-image probabilities + labels straight
 from the ensemble prob-cache (training_scripts/others/cache_runs/<set>/), which
-ensample.py / weighted_ensemble.py already wrote.
+ensample.py already wrote.
 
 Procedure (paired, patient-level bootstrap), per set:
   - Each iteration draws N row indices WITH replacement (N = 234 on valid200, 668 on
     test500). The SAME indices are applied to ALL members before blending, so every
     member sees exactly the same resampled patients — the resample is of PATIENTS, not
     of predictions.
-  - The members are blended in PROBABILITY space with the FROZEN per-class weights
-    read from WEIGHTS_FROM (the weighted_ensemble summary json). Weights are fixed —
-    they are NOT re-fit inside the bootstrap (re-fitting would leak and inflate the CI).
+  - The members are blended in COMBINE_SPACE with the FROZEN per-class weights read
+    from WEIGHTS_FROM (an ensample.py summary json). Weights are fixed — they are
+    NOT re-fit inside the bootstrap (re-fitting would leak and inflate the CI).
   - Per iteration: per-class AUROC + the mean across the 5 classes.
   - A class whose resample contains only one label value has an undefined AUROC -> NaN
     for that iteration; it is dropped from that iteration's mean (nanmean) and from
@@ -26,8 +26,9 @@ PAIRED_SINGLE (optional) additionally bootstraps the best single member on the S
 resampled indices and reports the CI of the DIFFERENCE (ensemble - single), i.e.
 whether the ensemble's gain survives resampling noise.
 
-Combining space is PROBABILITY average only (COMBINE_SPACE in ensample.py = "prob").
-Rank/logit space would change the numbers and is deliberately not offered here.
+COMBINE_SPACE must match the ensample.py run being reported, or the point estimate
+here will not equal the one in that run's summary. "prob" and "logit" are supported;
+"rank" is not (a bootstrap resample changes the ranks themselves).
 
 Output: one folder per run, results/<YYYY-MM-DD_HH-MM-SS>_<set>/  (the set(s) in SETS,
 joined by '+' if more than one), holding
@@ -56,18 +57,19 @@ for _s in (sys.stdout, sys.stderr):
 # ============================ CONFIG (edit here) ============================
 SETS = ["test500"]   # scored splits, each bootstrapped SEPARATELY
 
-# Frozen per-class weights: path to a weighted_ensemble summary json (or its folder).
-# These are the weights behind the best valid200 ensemble
-# (others/ensembling_results/2026-07-22_15-34-57  (best valid200)).
-WEIGHTS_FROM = ("../weighted_ensemble/results/2026-07-22_15-22-14/"
-                "weighted_valid200_summary.json")
+# Frozen per-class weights: path to an ensample.py summary json (or its folder) —
+# either a weighted_*_summary.json (a fresh fit) or an ensemble_*_summary.json (a run
+# that reused a saved fit). This is the 6-member fit itself, searched on valid200 —
+# the same weights ensample.py currently loads, and the ones behind the 0.9130 test500
+# run. They never saw test500.
+WEIGHTS_FROM = "../ensembling_results/2026-07-28_12-24-39"
 
 # Members, as the labels used in the weights file (a best.pt member is just the run
 # name; a checkpoint member is "<run> @ step<N>"). None -> take them from the weights
 # file itself, in its stored order.
 MEMBERS = None
 
-COMBINE_SPACE = "prob"           # probability-average blend (fixed; see docstring)
+COMBINE_SPACE = "logit"          # "prob" | "logit" — MUST match the ensample.py run
 
 N_BOOT = 10000                   # bootstrap iterations
 SEED = 42                        # RNG seed (reproducible)
@@ -75,7 +77,7 @@ CI_LOW, CI_HIGH = 2.5, 97.5      # percentiles for the 95% CI
 
 # Optional paired comparison: bootstrap this single member on the SAME indices and
 # report the CI of (ensemble - single). None -> skip.
-PAIRED_SINGLE = "convnext_base_22k_1600x1312"
+PAIRED_SINGLE = "rad_dino_vitB_768"   # the best single member on test500 (0.9027)
 
 # The 5 competition tasks, in the column order of every cached (N,5) matrix.
 TASKS = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]
@@ -117,12 +119,22 @@ def _load_weights():
     if not p.is_absolute():
         p = (CI_DIR / p).resolve()
     if p.is_dir():
-        cands = sorted(p.glob("weighted_*_summary.json"))
+        cands = sorted(p.glob("weighted_*_summary.json")) + \
+                sorted(p.glob("ensemble_*_summary.json"))
         if not cands:
-            raise FileNotFoundError(f"no weighted_*_summary.json under {p}")
+            raise FileNotFoundError(
+                f"no weighted_*_summary.json / ensemble_*_summary.json under {p}")
         p = cands[0]
     d = json.load(open(p, encoding="utf-8"))
-    wpc = d["weights_per_class"]
+    # a fresh fit stores "weights_per_class"; a run that REUSED a fit stores the
+    # resolved weights as "class_weights" — both are {task: {member: weight}}
+    wpc = d.get("weights_per_class") or d.get("class_weights")
+    if wpc is None:
+        raise KeyError(f"{p} has neither 'weights_per_class' nor 'class_weights'")
+    if d.get("combine_space") and d["combine_space"] != COMBINE_SPACE:
+        raise ValueError(
+            f"COMBINE_SPACE={COMBINE_SPACE!r} but {p.name} was produced with "
+            f"{d['combine_space']!r} — the point estimate would not match that run.")
     labels = list(MEMBERS) if MEMBERS else list(d["members"])
     for t in TASKS:
         if t not in wpc:
@@ -133,17 +145,35 @@ def _load_weights():
     return wpc, labels, p
 
 
+def _to_space(stack: np.ndarray) -> np.ndarray:
+    """Probabilities -> COMBINE_SPACE, per member and per class (matches ensample.py)."""
+    if COMBINE_SPACE == "prob":
+        return stack
+    if COMBINE_SPACE == "logit":
+        eps = 1e-6
+        p = np.clip(stack, eps, 1.0 - eps)
+        return np.log(p / (1.0 - p))
+    raise ValueError(f"COMBINE_SPACE must be 'prob' | 'logit', got {COMBINE_SPACE!r}")
+
+
+def _from_space(ens: np.ndarray) -> np.ndarray:
+    """Blended score -> [0,1]. AUROC is invariant under this monotone map; it is applied
+    so the cached scores stay comparable to ensample.py's."""
+    return 1.0 / (1.0 + np.exp(-ens)) if COMBINE_SPACE == "logit" else ens
+
+
 def _weighted_blend(stack: np.ndarray, labels, wpc) -> np.ndarray:
-    """(M,N,T) member probabilities -> (N,T) per-class weighted average.
-    Weights are renormalized per class over the members present; an all-zero class
-    falls back to the uniform average."""
+    """(M,N,T) member probabilities -> (N,T) per-class weighted average, taken in
+    COMBINE_SPACE. Weights are renormalized per class over the members present; an
+    all-zero class falls back to the uniform average."""
     M, N, T = stack.shape
+    S = _to_space(stack)
     out = np.empty((N, T))
     for c, t in enumerate(TASKS):
         w = np.array([float(wpc[t][m]) for m in labels])
         w = w / w.sum() if w.sum() > 0 else np.full(M, 1.0 / M)
-        out[:, c] = np.tensordot(w, stack[:, :, c], axes=(0, 0))
-    return out
+        out[:, c] = np.tensordot(w, S[:, :, c], axes=(0, 0))
+    return _from_space(out)
 
 
 # --------------------------------------------------------------------------- metric
@@ -255,7 +285,8 @@ def format_report(all_res, weights_path, ts):
     L = []
     w = L.append
     w("=" * 96)
-    w(f"BOOTSTRAP 95% CI  —  3-member per-class WEIGHTED ensemble ({COMBINE_SPACE}-average)")
+    w(f"BOOTSTRAP 95% CI  —  {len(all_res[0]['members'])}-member per-class WEIGHTED "
+      f"ensemble ({COMBINE_SPACE}-average)")
     w(f"generated : {ts}   |   iterations : {N_BOOT}   |   seed : {SEED}")
     w(f"members   : {', '.join(all_res[0]['members'])}")
     w(f"weights   : {weights_path}  (FROZEN — not re-fit inside the bootstrap)")

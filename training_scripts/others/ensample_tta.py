@@ -2,9 +2,9 @@
 ensample_tta.py
 ===============
 Test-Time Augmentation (TTA) twin of ensample.py. IDENTICAL ensemble in every
-respect — same RUN_ON / SET / GPU / BATCH_SIZE, same FULL_MODELS, the same
-CHECKPOINT_MEMBERS, the same CKPT_SUBPATH / THRESHOLDS_FROM / USE_STAGE2 /
-STAGE2_GROUP — all imported straight from ensample.py so there is ONE source of
+respect — same RUN_ON / SET / GPU / BATCH_SIZE, same FULL_MODELS (same hierarchy
+and same per-member checkpoints), the same CKPT_SUBPATH / THRESHOLDS_FROM /
+USE_STAGE2 / STAGE2_GROUP — all imported straight from ensample.py so there is ONE source of
 truth. The ONLY difference: each member is scored as the MEAN probability over a
 small set of light, label-preserving augmented views (TTA_VIEWS below) instead of
 a single forward pass.
