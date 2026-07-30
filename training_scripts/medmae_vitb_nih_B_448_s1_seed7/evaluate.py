@@ -30,7 +30,7 @@ RUN_ON     = "modal"     # "modal" -> run on Modal GPU ; "local" -> this machine
 CHECKPOINT = "best"      # which checkpoint to score: best | last | <int step> | path
 AMP        = False       # False -> full fp32 for the cleanest final metrics
 OBJECTIVE  = "f1"        # threshold objective if thresholds.json must be (re)calibrated
-EVAL_SETS  = ("test500",)  # which official sets to score; valid200 already recorded
+EVAL_SETS  = ("test500",)   # which official sets to score; valid200 already recorded
 # ===========================================================================
 
 # Windows consoles default to cp1252 and choke on the emoji in the logs; force

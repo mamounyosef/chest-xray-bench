@@ -30,7 +30,7 @@ RUN_ON     = "modal"     # "modal" -> run on Modal GPU ; "local" -> this machine
 CHECKPOINT =  2600      # which checkpoint to score: best | last | <int step> | path
 AMP        = False       # False -> full fp32 for the cleanest final metrics
 OBJECTIVE  = "f1"        # threshold objective if thresholds.json must be (re)calibrated
-EVAL_SETS  = ["valid200"]   # official sets to score: ["valid200"], ["test500"], or both
+EVAL_SETS  = ("test500",)   # official sets to score: ["valid200"], ["test500"], or both
 CALIBRATE  = False       # False -> never run the slow 01_val.csv threshold calibration;
                          # if thresholds.json is missing, fall back to 0.5 per task
 # ===========================================================================
