@@ -1,4 +1,9 @@
 
+# CheXpert label tables are Stanford's data, not ours to redistribute.
+# The soft labels are this project's own model outputs, so they stay.
+data/chexpert/*.csv
+!data/chexpert/*_softlabels.csv
+
 debugged_images/
 checkpoints/
 train_config/
@@ -235,6 +240,7 @@ __marimo__/
 test.ipynb
 README_notes.txt
 modal_commands.txt
+modal_setup_commands.txt
 modal_download_chexpert_native.py   # contains a live AIMI SAS credential
 modal_download_chexpert_native.py
 .vscode/settings.json
@@ -242,3 +248,4 @@ modal_download_chexpert_native.py
 # LaTeX paper workspace (arXiv template + build artifacts)
 paper/
 training_scripts/others/member_correlation/member_correlation.ipynb
+paper.zip
