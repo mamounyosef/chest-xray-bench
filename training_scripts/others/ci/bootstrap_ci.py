@@ -55,14 +55,14 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 # ============================ CONFIG (edit here) ============================
-SETS = ["test500"]   # scored splits, each bootstrapped SEPARATELY
+SETS = ["test500_frontal"]   # scored splits, each bootstrapped SEPARATELY
 
 # Frozen per-class weights: path to an ensample.py summary json (or its folder) —
 # either a weighted_*_summary.json (a fresh fit) or an ensemble_*_summary.json (a run
 # that reused a saved fit). This is the 6-member fit itself, searched on valid200 —
 # the same weights ensample.py currently loads, and the ones behind the 0.9130 test500
 # run. They never saw test500.
-WEIGHTS_FROM = "../ensembling_results/2026-07-28_12-24-39"
+WEIGHTS_FROM = "../ensembling_results/2026-08-14_22-46-32 (best valid200_frontal)"
 
 # Members, as the labels used in the weights file (a best.pt member is just the run
 # name; a checkpoint member is "<run> @ step<N>"). None -> take them from the weights
@@ -77,7 +77,7 @@ CI_LOW, CI_HIGH = 2.5, 97.5      # percentiles for the 95% CI
 
 # Optional paired comparison: bootstrap this single member on the SAME indices and
 # report the CI of (ensemble - single). None -> skip.
-PAIRED_SINGLE = "rad_dino_vitB_768"   # the best single member on test500 (0.9027)
+PAIRED_SINGLE = "medmae_vitb_nih_B_768_s2_seed1337"   # best single member on frontal test500 (0.9113)
 
 # The 5 competition tasks, in the column order of every cached (N,5) matrix.
 TASKS = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema", "Pleural Effusion"]

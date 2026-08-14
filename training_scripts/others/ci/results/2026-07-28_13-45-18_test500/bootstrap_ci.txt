@@ -1,0 +1,31 @@
+================================================================================================
+BOOTSTRAP 95% CI  —  6-member per-class WEIGHTED ensemble (logit-average)
+generated : 2026-07-28T13:45:18   |   iterations : 10000   |   seed : 42
+members   : rad_dino_vitB_1064x896, convnext_base_22k_1600x1312, medmae_vitb_nih_B_768_s2, rad_dino_vitB_768, medmae_vitb_nih_B_768_s2_seed1337, medmae_vitb_nih_B_448_s1_seed1337
+weights   : D:\My Projects\chest-xray-bench\training_scripts\others\ensembling_results\2026-07-28_12-24-39\weighted_valid200_summary.json  (FROZEN — not re-fit inside the bootstrap)
+================================================================================================
+
+[test500]  N=668 images
+  MEAN AUROC : 0.9130   95% CI [0.8990, 0.9262]   (width 0.0272, boot sd 0.0070)
+  class                 point         95% CI          width
+  Atelectasis          0.8781   [0.8511, 0.9030]   0.0519
+  Cardiomegaly         0.8939   [0.8647, 0.9201]   0.0554
+  Consolidation        0.8943   [0.8495, 0.9347]   0.0852
+  Edema                0.9347   [0.9108, 0.9560]   0.0452
+  Pleural Effusion     0.9640   [0.9491, 0.9769]   0.0278
+  ------------------------------------------------------------------------------------------
+  vs single 'rad_dino_vitB_768' (same resampled patients):
+    single   mean AUROC : 0.9027   95% CI [0.8893, 0.9156]
+    diff (ens - single) : +0.0103   95% CI [+0.0022, +0.0186]   P(ens>single)=99.3%
+    -> CI excludes 0 -> ensemble genuinely better
+      Atelectasis        +0.0223   [+0.0043, +0.0406]   P>0=99%
+      Cardiomegaly       +0.0198   [+0.0014, +0.0387]   P>0=98%
+      Consolidation      -0.0015   [-0.0292, +0.0268]   P>0=45%
+      Edema              +0.0072   [-0.0002, +0.0147]   P>0=97%
+      Pleural Effusion   +0.0039   [-0.0018, +0.0097]   P>0=91%
+
+================================================================================================
+notes: each iteration resamples image rows with replacement and applies the SAME
+       rows to every member before blending (paired / patient-level). Weights are
+       frozen. A class with one label value in a resample -> NaN that iteration.
+================================================================================================

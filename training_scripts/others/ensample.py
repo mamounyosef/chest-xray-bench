@@ -44,12 +44,21 @@ from pathlib import Path
 # --- what to run -----------------------------------------------------------
 RUN_ON          = "auto"       # "auto" | "modal" | "local"   (auto: all cached -> local)
 SET             = "test500"   # scored split: "valid200" | "test500" | "val"
-WEIGHTS         = "2026-07-28_12-24-39"
+FRONTAL_ONLY    = True         # drop lateral rows from the scored split. valid200 is
+                               # 202 of 234 frontal and test500 is 518 of 668, and no
+                               # model ever trained on a lateral. Caches and summaries
+                               # are tagged separately, so the mixed-view artifacts of
+                               # earlier runs are neither read nor overwritten.
+WEIGHTS         = "2026-08-14_22-46-32 (best valid200_frontal)"
                                # "flat" | "search" | a saved fit: its folder/json, just
                                # the folder NAME, or "best_valid200" (the marked winner)
 COMBINE_SPACE   = "logit"       # blend space: "prob" | "logit" | "rank"
 THRESHOLDS_FROM = None         # run supplying thresholds.json; None -> the first member
 RUN_TAG         = ""           # appended to the output folder's timestamp
+
+# Cache and summary names carry this, so frontal-only artifacts never collide with
+# the mixed-view ones cached under the plain set name.
+SET_TAG         = SET + ("_frontal" if FRONTAL_ONLY else "")
 
 # --- members ---------------------------------------------------------------
 # "run" -> its best.pt. ("run", 8000) -> that run's step-8000 checkpoint.
@@ -800,7 +809,7 @@ def _node_probs(node, load_cfg, ckpt_path_of, df, device, cache_dir, depth: int 
     stem = _member_ckpt_stem(run, ckpt) or Path(resolver()).stem   # resolve only if "last"
     if depth:
         print(f"{pad}[leaf ] {_node_label(node)}", flush=True)
-    return np.asarray(_predict_member(cfg, resolver, df, device, cache_dir, SET,
+    return np.asarray(_predict_member(cfg, resolver, df, device, cache_dir, SET_TAG,
                                       f"{run}_{stem}"))
 
 
@@ -832,7 +841,7 @@ def _gather(load_cfg, ckpt_path_of, df, device, cache_dir, tasks):
             print(f"[member {n_total}/{n_total}] stage2/{disease}: {run}", flush=True)
             cname = f"{run}_{_member_ckpt_stem(run)}"
             p = _predict_member(cfg, (lambda run=run: ckpt_path_of(run)),
-                                df, device, cache_dir, SET, cname)   # (N,1)
+                                df, device, cache_dir, SET_TAG, cname)   # (N,1)
             comp[:, tasks.index(disease)] = p[:, 0]
         members["final_stage2 (5 per-disease composite)"] = comp
     return members, group_tree
@@ -842,10 +851,10 @@ def _load_y_true(load_cfg, df, device, cache_dir):
     """The split's (N, T) labels. FIXED per SET and model-independent, so they are
     cached beside the members (_y_true.npy) — an all-cached run then needs no model
     build at all (truly CPU-only)."""
-    npy = Path(cache_dir) / SET / "_y_true.npy"
+    npy = Path(cache_dir) / SET_TAG / "_y_true.npy"
     if npy.exists():
         y = np.load(npy)
-        print(f"[cache] HIT  {SET}/_y_true  {y.shape} (labels)")
+        print(f"[cache] HIT  {SET_TAG}/_y_true  {y.shape} (labels)")
         return y
     rcfg = load_cfg(REF_RUN)
     yt, _, _, _ = sc._predict_dataframe(
@@ -855,17 +864,26 @@ def _load_y_true(load_cfg, df, device, cache_dir):
     arr = yt.detach().cpu().numpy() if hasattr(yt, "detach") else np.asarray(yt)
     npy.parent.mkdir(parents=True, exist_ok=True)
     np.save(npy, arr)
-    print(f"[cache] save {SET}/_y_true  {arr.shape} (labels)")
+    print(f"[cache] save {SET_TAG}/_y_true  {arr.shape} (labels)")
     return arr
 
 
 def _split_df(load_cfg):
-    """(ref cfg, tasks, dataframe) for the scored split, from the reference run."""
+    """(ref cfg, tasks, dataframe) for the scored split, from the reference run.
+
+    With FRONTAL_ONLY the lateral rows are dropped here, which is the single place
+    every mode (flat, search, reused weights) gets its dataframe from. The view is
+    read off the filename because test500 carries no Frontal/Lateral column."""
     import pandas as pd
     ref = load_cfg(REF_RUN)
     tasks = list(ref["tasks"])
     data_dir = Path(ref["paths"]["data_dir"])
-    return ref, tasks, pd.read_csv(data_dir / ref["paths"][f"{SET}_csv"])
+    df = pd.read_csv(data_dir / ref["paths"][f"{SET}_csv"])
+    if FRONTAL_ONLY:
+        n_all = len(df)
+        df = df[df["Path"].str.contains("frontal", case=False)].reset_index(drop=True)
+        print(f"[split] {SET}: {len(df)} frontal rows of {n_all}")
+    return ref, tasks, df
 
 
 def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
@@ -888,7 +906,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     print(f"[ensemble] {SET}: {len(df)} images  |  tasks={tasks}  device={device}")
     # per-member prob cache, shared with every mode: others/cache_runs (or /runs/cache_runs)
     cache_dir = _cache_dir_of(out_dir)
-    print(f"[cache] dir: {cache_dir / SET}")
+    print(f"[cache] dir: {cache_dir / SET_TAG}")
 
     # per-class thresholds for F1/P/R/Spec (AUROC/AUPRC ignore them). Resolved by the
     # launcher from the local repo and passed in as a dict -> never depends on the vol.
@@ -954,7 +972,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     mac = ens_metrics["macro"]
     _blend_lbl = _blend if COMBINE_SPACE == "prob" else f"{_blend}, {COMBINE_SPACE}-space"
     lines = ["=" * 78,
-             f"ENSEMBLE ({_blend_lbl})  —  set={SET}  images={len(df)}",
+             f"ENSEMBLE ({_blend_lbl})  —  set={SET_TAG}  images={len(df)}",
              f"generated: {summary['generated']}",
              f"thresholds (F1/P/R/Spec): {thr_source or '(none -> 0.5)'}"
              + ("   [n/a in rank space]" if COMBINE_SPACE == "rank" else "")]
@@ -992,8 +1010,8 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     txt = "\n".join(lines) + "\n"
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"ensemble_{SET}_summary.json"
-    txt_path  = out_dir / f"ensemble_{SET}_summary.txt"
+    json_path = out_dir / f"ensemble_{SET_TAG}_summary.json"
+    txt_path  = out_dir / f"ensemble_{SET_TAG}_summary.txt"
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     txt_path.write_text(txt, encoding="utf-8")
     print(txt)
@@ -1005,7 +1023,7 @@ def run_ensemble(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = None,
     _big = f"{'WEIGHTED' if _used_weights else 'ENSEMBLE'} mean AUROC   {_f4(mac['mean_auroc'])}"
     _pad = 74
     print("\n" * 2 + "╔" + "═" * _pad + "╗")
-    print("║" + f"{SET}  ·  {len(df)} images  ·  {len(members)} members".center(_pad) + "║")
+    print("║" + f"{SET_TAG}  ·  {len(df)} images  ·  {len(members)} members".center(_pad) + "║")
     print("║" + " " * _pad + "║")
     print("║" + _big.center(_pad) + "║")
     print("║" + " " * _pad + "║")
@@ -1617,7 +1635,7 @@ def run_weight_search(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = Non
     ref, tasks, df = _split_df(load_cfg)
     print(f"[weighted] {SET}: {len(df)} images  |  tasks={tasks}  device={device}")
     cache_dir = _cache_dir_of(out_dir)
-    print(f"[cache] dir: {cache_dir / SET}")
+    print(f"[cache] dir: {cache_dir / SET_TAG}")
 
     thr_map = thr_map or {}
     if thr_map:
@@ -1703,8 +1721,8 @@ def run_weight_search(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = Non
 
     txt = _render_search_txt(summary, tasks, _PC)
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"weighted_{SET}_summary.json"
-    txt_path  = out_dir / f"weighted_{SET}_summary.txt"
+    json_path = out_dir / f"weighted_{SET_TAG}_summary.json"
+    txt_path  = out_dir / f"weighted_{SET_TAG}_summary.txt"
     json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     txt_path.write_text(txt, encoding="utf-8")
     print(txt)
@@ -1717,7 +1735,7 @@ def run_weight_search(load_cfg, ckpt_path_of, out_dir: Path, thr_map: dict = Non
     _big = f"WEIGHTED mean AUROC   {_w:.4f}"
     _pad = 74
     print("\n" * 2 + "╔" + "═" * _pad + "╗")
-    print("║" + f"{SET}  ·  {len(df)} images  ·  {len(member_labels)} members".center(_pad) + "║")
+    print("║" + f"{SET_TAG}  ·  {len(df)} images  ·  {len(member_labels)} members".center(_pad) + "║")
     print("║" + " " * _pad + "║")
     print("║" + _big.center(_pad) + "║")
     print("║" + " " * _pad + "║")
@@ -1863,7 +1881,7 @@ _IS_REMOTE = _MODAL_OK and not modal.is_local()
 if _IS_REMOTE:
     MODE, _ALL_CACHED = "modal", False
 else:
-    _ALL_CACHED = _members_all_cached(Path(__file__).resolve().parent, SET)
+    _ALL_CACHED = _members_all_cached(Path(__file__).resolve().parent, SET_TAG)
     if RUN_ON == "auto":
         MODE = "local" if _ALL_CACHED else "modal"
         print(f"[auto] {SET}: "
@@ -1998,7 +2016,7 @@ if __name__ == "__main__":
         if remote_sub:
             local_dir = _fetch_results_from_modal(_runs_volume, remote_sub,
                                                   _results_root_local())
-            _update_best_tracker(SET, local_dir)     # promote if it beats the local best
+            _update_best_tracker(SET_TAG, local_dir)     # promote if it beats the local best
     else:
         out_dir = run_local()
-        _update_best_tracker(SET, out_dir)           # promote if it beats the local best
+        _update_best_tracker(SET_TAG, out_dir)           # promote if it beats the local best

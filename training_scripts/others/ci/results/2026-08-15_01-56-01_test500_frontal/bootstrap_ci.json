@@ -1,0 +1,202 @@
+{
+  "generated": "2026-08-15T01:56:01",
+  "n_boot": 10000,
+  "seed": 42,
+  "ci_percentiles": [
+    2.5,
+    97.5
+  ],
+  "combine_space": "logit",
+  "weights_source": "D:\\My Projects\\chest-xray-bench\\training_scripts\\others\\ensembling_results\\2026-08-14_22-46-32 (best valid200_frontal)\\weighted_valid200_frontal_summary.json",
+  "tasks": [
+    "Atelectasis",
+    "Cardiomegaly",
+    "Consolidation",
+    "Edema",
+    "Pleural Effusion"
+  ],
+  "sets": {
+    "test500_frontal": {
+      "set": "test500_frontal",
+      "n_images": 518,
+      "n_boot": 10000,
+      "seed": 42,
+      "combine_space": "logit",
+      "blend": "weighted (per-class, frozen)",
+      "members": [
+        "rad_dino_vitB_1064x896",
+        "convnext_base_22k_1600x1312",
+        "medmae_vitb_nih_B_768_s2",
+        "rad_dino_vitB_768",
+        "medmae_vitb_nih_B_768_s2_seed1337",
+        "medmae_vitb_nih_B_448_s1_seed1337"
+      ],
+      "weights_per_class": {
+        "Atelectasis": {
+          "rad_dino_vitB_1064x896": 0.0,
+          "convnext_base_22k_1600x1312": 0.08,
+          "medmae_vitb_nih_B_768_s2": 0.0,
+          "rad_dino_vitB_768": 0.04,
+          "medmae_vitb_nih_B_768_s2_seed1337": 0.8800000000000001,
+          "medmae_vitb_nih_B_448_s1_seed1337": 0.0
+        },
+        "Cardiomegaly": {
+          "rad_dino_vitB_1064x896": 0.0,
+          "convnext_base_22k_1600x1312": 0.43999999999999995,
+          "medmae_vitb_nih_B_768_s2": 0.26000000000000006,
+          "rad_dino_vitB_768": 0.06000000000000001,
+          "medmae_vitb_nih_B_768_s2_seed1337": 0.22000000000000003,
+          "medmae_vitb_nih_B_448_s1_seed1337": 0.02
+        },
+        "Consolidation": {
+          "rad_dino_vitB_1064x896": 0.2,
+          "convnext_base_22k_1600x1312": 0.38,
+          "medmae_vitb_nih_B_768_s2": 0.15999999999999998,
+          "rad_dino_vitB_768": 0.21999999999999997,
+          "medmae_vitb_nih_B_768_s2_seed1337": 0.0,
+          "medmae_vitb_nih_B_448_s1_seed1337": 0.04
+        },
+        "Edema": {
+          "rad_dino_vitB_1064x896": 0.18000000000000002,
+          "convnext_base_22k_1600x1312": 0.21999999999999997,
+          "medmae_vitb_nih_B_768_s2": 0.0,
+          "rad_dino_vitB_768": 0.31999999999999995,
+          "medmae_vitb_nih_B_768_s2_seed1337": 0.0,
+          "medmae_vitb_nih_B_448_s1_seed1337": 0.28
+        },
+        "Pleural Effusion": {
+          "rad_dino_vitB_1064x896": 0.15999999999999998,
+          "convnext_base_22k_1600x1312": 0.24,
+          "medmae_vitb_nih_B_768_s2": 0.04,
+          "rad_dino_vitB_768": 0.1,
+          "medmae_vitb_nih_B_768_s2_seed1337": 0.27999999999999997,
+          "medmae_vitb_nih_B_448_s1_seed1337": 0.18
+        }
+      },
+      "ensemble": {
+        "mean_auroc": {
+          "point": 0.9167145399680212,
+          "ci_low": 0.9027844956325407,
+          "ci_high": 0.9298051088134011,
+          "boot_median": 0.9167071811775551,
+          "boot_std": 0.006851376168541241
+        },
+        "per_class": {
+          "Atelectasis": {
+            "point": 0.8600386779184247,
+            "ci_low": 0.8284892834309722,
+            "ci_high": 0.8898748183847577,
+            "boot_median": 0.8603233353690471,
+            "boot_std": 0.01580800070596312,
+            "n_degenerate_iters": 0
+          },
+          "Cardiomegaly": {
+            "point": 0.9114278578564293,
+            "ci_low": 0.882641592817939,
+            "ci_high": 0.9367929892739844,
+            "boot_median": 0.9116991826127878,
+            "boot_std": 0.01368762043304313,
+            "n_degenerate_iters": 0
+          },
+          "Consolidation": {
+            "point": 0.9170016218884423,
+            "ci_low": 0.8756055531625125,
+            "ci_high": 0.9524602919876226,
+            "boot_median": 0.9181010928961748,
+            "boot_std": 0.020006425737992356,
+            "n_degenerate_iters": 0
+          },
+          "Edema": {
+            "point": 0.924252472535394,
+            "ci_low": 0.8964604994013577,
+            "ci_high": 0.9495259106611612,
+            "boot_median": 0.924802340463112,
+            "boot_std": 0.013645976877644345,
+            "n_degenerate_iters": 0
+          },
+          "Pleural Effusion": {
+            "point": 0.9708520696414159,
+            "ci_low": 0.9569528614700744,
+            "ci_high": 0.9825238687163077,
+            "boot_median": 0.971226613878193,
+            "boot_std": 0.006493339824494991,
+            "n_degenerate_iters": 0
+          }
+        }
+      },
+      "paired_single": {
+        "member": "medmae_vitb_nih_B_768_s2_seed1337",
+        "mean_auroc": {
+          "point": 0.9112524888544081,
+          "ci_low": 0.8968567718474144,
+          "ci_high": 0.9246130278691256
+        },
+        "per_class": {
+          "Atelectasis": {
+            "point": 0.8554149085794656,
+            "ci_low": 0.823129213863804,
+            "ci_high": 0.885844935816226
+          },
+          "Cardiomegaly": {
+            "point": 0.9090909090909091,
+            "ci_low": 0.8794018139835803,
+            "ci_high": 0.9352485544139791
+          },
+          "Consolidation": {
+            "point": 0.901840490797546,
+            "ci_low": 0.8589722503373819,
+            "ci_high": 0.9387031010045112
+          },
+          "Edema": {
+            "point": 0.9245984833193968,
+            "ci_low": 0.8964398298463029,
+            "ci_high": 0.9496469762591299
+          },
+          "Pleural Effusion": {
+            "point": 0.9653176524847227,
+            "ci_low": 0.9494491814982688,
+            "ci_high": 0.9787457770460886
+          }
+        },
+        "diff_mean_auroc": {
+          "point": 0.005462051113613087,
+          "ci_low": 0.0004147066119958993,
+          "ci_high": 0.010561507853086013,
+          "p_ensemble_better": 0.9827
+        },
+        "diff_per_class": {
+          "Atelectasis": {
+            "point": 0.004623769338959138,
+            "ci_low": 0.001682241504442339,
+            "ci_high": 0.0076574773602312565,
+            "p_ensemble_better": 0.999
+          },
+          "Cardiomegaly": {
+            "point": 0.0023369487655202636,
+            "ci_low": -0.00869058891529186,
+            "ci_high": 0.013943979405553388,
+            "p_ensemble_better": 0.6561
+          },
+          "Consolidation": {
+            "point": 0.01516113109089623,
+            "ci_low": -0.004983488480129929,
+            "ci_high": 0.034693429654721795,
+            "p_ensemble_better": 0.9351
+          },
+          "Edema": {
+            "point": -0.0003460107840027593,
+            "ci_low": -0.010895498446294144,
+            "ci_high": 0.010302530682484264,
+            "p_ensemble_better": 0.4759
+          },
+          "Pleural Effusion": {
+            "point": 0.005534417156693228,
+            "ci_low": -4.167934389524837e-05,
+            "ci_high": 0.01141485428917321,
+            "p_ensemble_better": 0.9743
+          }
+        }
+      }
+    }
+  }
+}
