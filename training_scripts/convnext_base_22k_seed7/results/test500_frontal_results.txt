@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — test500   (01_test500.csv)
+======================================================================================
+  experiment : convnext_base_22k_seed7
+  checkpoint : /runs/convnext_base_22k_seed7/results/checkpoints/model.safetensors
+  images     : 518    device: cuda    amp: False
+  use_clahe  : False    u_policy: mixed    val_loss: 0.42329
+  thresholds : per-task (f1-optimal on /runs/convnext_base_22k_seed7/results/thresholds.json)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8949        mean AUPRC : 0.6675
+    mean F1    : 0.5474    mean precision: 0.5249    mean recall: 0.7868    mean spec: 0.7869
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.255  0.8328  0.6350  0.6744  0.5309  0.9241  0.6417     158
+    Cardiomegaly        0.259  0.8793  0.7817  0.5023  0.8852  0.3506  0.9808     154
+    Consolidation       0.092  0.8844  0.4218  0.2396  0.1383  0.8966  0.6687      29
+    Edema               0.486  0.9211  0.6486  0.6559  0.5701  0.7722  0.8952      79
+    Pleural Effusion    0.483  0.9567  0.8503  0.6645  0.5000  0.9905  0.7482     105
+======================================================================================

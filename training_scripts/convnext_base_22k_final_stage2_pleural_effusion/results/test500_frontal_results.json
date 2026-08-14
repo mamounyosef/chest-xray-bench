@@ -1,0 +1,43 @@
+{
+  "experiment": "convnext_base_22k_final_stage2_pleural_effusion",
+  "set": "test500",
+  "view_filter": "frontal only",
+  "csv": "01_test500.csv",
+  "n_images": 518,
+  "n_images_all_views": 668,
+  "checkpoint": "/runs/convnext_base_22k_final_stage2_pleural_effusion/results/checkpoints/model.safetensors",
+  "checkpoint_step": null,
+  "checkpoint_epoch": null,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "/runs/convnext_base_22k_final_stage2_pleural_effusion/results/thresholds.json",
+  "thresholds": {
+    "Pleural Effusion": 0.3894476890563965
+  },
+  "use_clahe": false,
+  "u_policy": "ones",
+  "val_loss": 0.15423507856125998,
+  "macro": {
+    "mean_auroc": 0.9557477228179407,
+    "mean_auprc": 0.8607896059230687,
+    "mean_f1": 0.6733333333333333,
+    "mean_precision": 0.517948717948718,
+    "mean_recall": 0.9619047619047619,
+    "mean_specificity": 0.7723970944309927
+  },
+  "per_task": {
+    "Pleural Effusion": {
+      "auroc": 0.9557477228179407,
+      "auprc": 0.8607896059230687,
+      "f1": 0.6733333333333333,
+      "precision": 0.517948717948718,
+      "recall": 0.9619047619047619,
+      "specificity": 0.7723970944309927,
+      "n_pos": 105,
+      "n_excluded": 0,
+      "threshold": 0.3894476890563965
+    }
+  },
+  "evaluated_at": "2026-08-14T22:25:38"
+}

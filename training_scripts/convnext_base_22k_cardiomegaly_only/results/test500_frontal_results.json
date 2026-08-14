@@ -1,0 +1,43 @@
+{
+  "experiment": "convnext_base_22k_cardiomegaly_only",
+  "set": "test500",
+  "view_filter": "frontal only",
+  "csv": "01_test500.csv",
+  "n_images": 518,
+  "n_images_all_views": 668,
+  "checkpoint": "/runs/convnext_base_22k_cardiomegaly_only/results/checkpoints/model.safetensors",
+  "checkpoint_step": null,
+  "checkpoint_epoch": null,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "/runs/convnext_base_22k_cardiomegaly_only/results/thresholds.json",
+  "thresholds": {
+    "Cardiomegaly": 0.197892427444458
+  },
+  "use_clahe": false,
+  "u_policy": "mixed",
+  "val_loss": 0.6050684574027779,
+  "macro": {
+    "mean_auroc": 0.8849543313829029,
+    "mean_auprc": 0.8062069449280996,
+    "mean_f1": 0.5787234042553191,
+    "mean_precision": 0.8395061728395061,
+    "mean_recall": 0.44155844155844154,
+    "mean_specificity": 0.9642857142857143
+  },
+  "per_task": {
+    "Cardiomegaly": {
+      "auroc": 0.8849543313829029,
+      "auprc": 0.8062069449280996,
+      "f1": 0.5787234042553191,
+      "precision": 0.8395061728395061,
+      "recall": 0.44155844155844154,
+      "specificity": 0.9642857142857143,
+      "n_pos": 154,
+      "n_excluded": 0,
+      "threshold": 0.197892427444458
+    }
+  },
+  "evaluated_at": "2026-08-14T22:24:46"
+}

@@ -1,0 +1,43 @@
+{
+  "experiment": "convnext_base_22k_final_stage2_atelectasis",
+  "set": "valid200",
+  "view_filter": "frontal only",
+  "csv": "01_valid200.csv",
+  "n_images": 202,
+  "n_images_all_views": 234,
+  "checkpoint": "/runs/convnext_base_22k_final_stage2_atelectasis/results/checkpoints/model.safetensors",
+  "checkpoint_step": null,
+  "checkpoint_epoch": null,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "/runs/convnext_base_22k_final_stage2_atelectasis/results/thresholds.json",
+  "thresholds": {
+    "Atelectasis": 0.28614529967308044
+  },
+  "use_clahe": false,
+  "u_policy": "ones",
+  "val_loss": 0.11096568405628204,
+  "macro": {
+    "mean_auroc": 0.8557480314960629,
+    "mean_auprc": 0.7605813373754408,
+    "mean_f1": 0.7294117647058824,
+    "mean_precision": 0.6526315789473685,
+    "mean_recall": 0.8266666666666667,
+    "mean_specificity": 0.7401574803149606
+  },
+  "per_task": {
+    "Atelectasis": {
+      "auroc": 0.8557480314960629,
+      "auprc": 0.7605813373754408,
+      "f1": 0.7294117647058824,
+      "precision": 0.6526315789473685,
+      "recall": 0.8266666666666667,
+      "specificity": 0.7401574803149606,
+      "n_pos": 75,
+      "n_excluded": 0,
+      "threshold": 0.28614529967308044
+    }
+  },
+  "evaluated_at": "2026-08-14T22:24:53"
+}

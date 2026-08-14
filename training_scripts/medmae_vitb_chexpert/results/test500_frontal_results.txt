@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — test500   (01_test500.csv)
+======================================================================================
+  experiment : medmae_vitb_chexpert
+  checkpoint : /runs/medmae_vitb_chexpert/results/checkpoints/model.safetensors
+  images     : 518    device: cuda    amp: False
+  use_clahe  : False    u_policy: mixed    val_loss: 0.38562
+  thresholds : per-task (f1-optimal on /runs/medmae_vitb_chexpert/results/thresholds.json)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8994        mean AUPRC : 0.6739
+    mean F1    : 0.5437    mean precision: 0.5165    mean recall: 0.7838    mean spec: 0.7905
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.313  0.8284  0.6278  0.6684  0.5598  0.8291  0.7139     158
+    Cardiomegaly        0.312  0.8954  0.8152  0.5455  0.9091  0.3896  0.9835     154
+    Consolidation       0.077  0.8918  0.3920  0.2396  0.1383  0.8966  0.6687      29
+    Edema               0.341  0.9221  0.6641  0.6047  0.4779  0.8228  0.8383      79
+    Pleural Effusion    0.372  0.9596  0.8706  0.6603  0.4976  0.9810  0.7482     105
+======================================================================================

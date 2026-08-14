@@ -1,0 +1,43 @@
+{
+  "experiment": "convnext_base_22k_final_stage2_consolidation",
+  "set": "valid200",
+  "view_filter": "frontal only",
+  "csv": "01_valid200.csv",
+  "n_images": 202,
+  "n_images_all_views": 234,
+  "checkpoint": "/runs/convnext_base_22k_final_stage2_consolidation/results/checkpoints/model.safetensors",
+  "checkpoint_step": null,
+  "checkpoint_epoch": null,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "/runs/convnext_base_22k_final_stage2_consolidation/results/thresholds.json",
+  "thresholds": {
+    "Consolidation": 0.5056405067443848
+  },
+  "use_clahe": false,
+  "u_policy": "ones",
+  "val_loss": 0.1194576621055603,
+  "macro": {
+    "mean_auroc": 0.9174632352941177,
+    "mean_auprc": 0.6738927756562275,
+    "mean_f1": 0.5871559633027523,
+    "mean_precision": 0.4155844155844156,
+    "mean_recall": 1.0,
+    "mean_specificity": 0.7352941176470589
+  },
+  "per_task": {
+    "Consolidation": {
+      "auroc": 0.9174632352941177,
+      "auprc": 0.6738927756562275,
+      "f1": 0.5871559633027523,
+      "precision": 0.4155844155844156,
+      "recall": 1.0,
+      "specificity": 0.7352941176470589,
+      "n_pos": 32,
+      "n_excluded": 0,
+      "threshold": 0.5056405067443848
+    }
+  },
+  "evaluated_at": "2026-08-14T22:24:54"
+}
