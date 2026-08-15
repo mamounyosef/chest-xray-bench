@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : coatnet_1_12k
+  checkpoint : /runs/coatnet_1_12k/results/checkpoints/best.pt
+  images     : 202    device: cuda    amp: False
+  use_clahe  : False    u_policy: mixed    val_loss: 0.45446
+  thresholds : per-task (f1-optimal on /runs/coatnet_1_12k/results/thresholds.json)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8769        mean AUPRC : 0.7402
+    mean F1    : 0.6715    mean precision: 0.6504    mean recall: 0.7855    mean spec: 0.8222
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.261  0.8056  0.6771  0.6923  0.5888  0.8400  0.6535      75
+    Cardiomegaly        0.368  0.8049  0.7365  0.5417  0.8667  0.3939  0.9706      66
+    Consolidation       0.083  0.9074  0.6152  0.6139  0.4493  0.9688  0.7765      32
+    Edema               0.388  0.9307  0.7951  0.7327  0.6271  0.8810  0.8625      42
+    Pleural Effusion    0.302  0.9359  0.8771  0.7770  0.7200  0.8438  0.8478      64
+======================================================================================

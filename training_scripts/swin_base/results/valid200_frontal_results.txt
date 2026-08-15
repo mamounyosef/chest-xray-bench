@@ -1,0 +1,21 @@
+======================================================================================
+OFFICIAL EVAL — valid200   (01_valid200.csv)
+======================================================================================
+  experiment : swin_base
+  checkpoint : /runs/swin_base/results/checkpoints/best.pt
+  images     : 202    device: cuda    amp: False
+  use_clahe  : False    u_policy: ones    val_loss: 0.43153
+  thresholds : per-task (f1-optimal on /runs/swin_base/results/thresholds.json)
+--------------------------------------------------------------------------------------
+  MACRO (mean over tasks)   [AUROC / AUPRC are threshold-free]
+    mean AUROC : 0.8605        mean AUPRC : 0.6933
+    mean F1    : 0.6371    mean precision: 0.6448    mean recall: 0.7272    mean spec: 0.8222
+--------------------------------------------------------------------------------------
+  PER-TASK
+    task                  thr   AUROC   AUPRC      F1    Prec     Rec    Spec   n_pos
+    Atelectasis         0.285  0.8165  0.6893  0.6893  0.5980  0.8133  0.6772      75
+    Cardiomegaly        0.262  0.8072  0.7312  0.5217  0.9231  0.3636  0.9853      66
+    Consolidation       0.189  0.8287  0.4105  0.4808  0.3472  0.7812  0.7235      32
+    Edema               0.301  0.9299  0.7885  0.7327  0.6271  0.8810  0.8625      42
+    Pleural Effusion    0.333  0.9202  0.8469  0.7612  0.7286  0.7969  0.8623      64
+======================================================================================

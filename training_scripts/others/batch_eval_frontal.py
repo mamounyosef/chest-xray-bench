@@ -115,6 +115,7 @@ def _score_one(run_name, eval_sets, checkpoint, amp, suffix, batch_size):
     arch = str(cfg.get("model", {}).get("arch", "")).lower()
     name = cfg["model"]["name"]
     n_out = _sc.num_output_logits(rcfg)
+    h, w = rcfg["image"]["height"], rcfg["image"]["width"]
     if arch == "raddino":
         model = _sc.build_raddino_vit(rcfg, load_pretrained=False)
     elif arch == "medmae_vitb" or name.startswith("vit_base_patch16"):
@@ -130,6 +131,12 @@ def _score_one(run_name, eval_sets, checkpoint, amp, suffix, batch_size):
         else:
             head = model.classifier[-1]
             model.classifier[-1] = _nn.Linear(head.in_features, n_out)
+    elif "coatnet" in name:
+        # CoAtNet's attention stages hold a resolution-tied position bias, so the
+        # model has to be rebuilt at this run's geometry or the weights will not fit
+        import timm as _timm
+        model = _timm.create_model(name, pretrained=False, num_classes=n_out,
+                                   img_size=(h, w))
     else:
         import timm as _timm
         model = _timm.create_model(name, pretrained=False, num_classes=n_out)
