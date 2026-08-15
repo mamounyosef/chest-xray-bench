@@ -62,7 +62,7 @@ SETS = ["test500_frontal"]   # scored splits, each bootstrapped SEPARATELY
 # that reused a saved fit). This is the 6-member fit itself, searched on valid200 —
 # the same weights ensample.py currently loads, and the ones behind the 0.9130 test500
 # run. They never saw test500.
-WEIGHTS_FROM = "../ensembling_results/2026-08-14_22-46-32 (best valid200_frontal)"
+WEIGHTS_FROM = "../ensembling_results/2026-08-15_11-50-49"
 
 # Members, as the labels used in the weights file (a best.pt member is just the run
 # name; a checkpoint member is "<run> @ step<N>"). None -> take them from the weights

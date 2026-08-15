@@ -17,6 +17,7 @@ training_scripts/others/ci/results/*
 !training_scripts/others/ci/results/2026-07-24_22-36-32_test500/
 !training_scripts/others/ci/results/2026-07-28_13-45-18_test500/
 !training_scripts/others/ci/results/2026-08-15_01-56-01_test500_frontal/
+!training_scripts/others/ci/results/2026-08-15_12-14-26_test500_frontal/
 training_scripts/others/weighted_ensemble/results/
 training_scripts/others/top_checkpoints/results/
 

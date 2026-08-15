@@ -58,7 +58,7 @@ OUT = OUT_DIR / "auroc_summary_across_runs.txt"
 # ============================ CONFIG (edit here) ============================
 # Which splits to rank on. A table is emitted for EACH, in this order. Drop or add
 # entries freely (each must be a key of SPLIT_SOURCE below).
-SPLITS = ["val19k", "val200"]
+SPLITS = ["val200_frontal", "val200", "val19k"]
 
 # Where each split's mean AUROC comes from. A LIST is a fallback chain, tried in
 # order until one yields a value:
@@ -69,6 +69,10 @@ SPLIT_SOURCE = {
     "val200":  ["results:valid200_results.json",   # canonical post-eval on the 200-study set
                 "summary"],                        # else the in-training best snapshot
     "test500": "results:test500_results.json",
+    # the frontal-only rescore: the same two official sets with their lateral rows
+    # dropped (202 of 234, and 518 of 668), which is what the models trained for
+    "val200_frontal":  "results:valid200_frontal_results.json",
+    "test500_frontal": "results:test500_frontal_results.json",
 }
 
 # Mark values that came from a FALLBACK source (not the first one listed), so a table

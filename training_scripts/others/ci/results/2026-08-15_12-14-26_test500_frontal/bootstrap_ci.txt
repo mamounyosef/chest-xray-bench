@@ -1,0 +1,31 @@
+================================================================================================
+BOOTSTRAP 95% CI  —  8-member per-class WEIGHTED ensemble (logit-average)
+generated : 2026-08-15T12:14:26   |   iterations : 10000   |   seed : 42
+members   : medmae_vitb_nih_B_768_s2_seed1337, medmae_vitb_nih_B_768_s2, convnext_base_22k_1600x1312, medmae_vitb_nih_B_448_s1_seed1337, medmae_vitb_nih_B_768_s2_seed7, medmae_vitb_raw, rad_dino_vitB_768, convnext_large_22k_768x640
+weights   : D:\My Projects\chest-xray-bench\training_scripts\others\ensembling_results\2026-08-15_11-50-49\weighted_valid200_frontal_summary.json  (FROZEN — not re-fit inside the bootstrap)
+================================================================================================
+
+[test500_frontal]  N=518 images
+  MEAN AUROC : 0.9159   95% CI [0.9022, 0.9288]   (width 0.0267, boot sd 0.0068)
+  class                 point         95% CI          width
+  Atelectasis          0.8605   [0.8290, 0.8902]   0.0612
+  Cardiomegaly         0.9075   [0.8786, 0.9332]   0.0547
+  Consolidation        0.9157   [0.8758, 0.9502]   0.0744
+  Edema                0.9262   [0.8987, 0.9509]   0.0522
+  Pleural Effusion     0.9696   [0.9555, 0.9816]   0.0261
+  ------------------------------------------------------------------------------------------
+  vs single 'medmae_vitb_nih_B_768_s2_seed1337' (same resampled patients):
+    single   mean AUROC : 0.9113   95% CI [0.8969, 0.9246]
+    diff (ens - single) : +0.0046   95% CI [-0.0000, +0.0095]   P(ens>single)=97.4%
+    -> CI includes 0 -> within noise
+      Atelectasis        +0.0051   [+0.0010, +0.0094]   P>0=99%
+      Cardiomegaly       -0.0016   [-0.0135, +0.0105]   P>0=38%
+      Consolidation      +0.0139   [-0.0027, +0.0310]   P>0=95%
+      Edema              +0.0016   [-0.0085, +0.0117]   P>0=63%
+      Pleural Effusion   +0.0043   [-0.0022, +0.0109]   P>0=90%
+
+================================================================================================
+notes: each iteration resamples image rows with replacement and applies the SAME
+       rows to every member before blending (paired / patient-level). Weights are
+       frozen. A class with one label value in a resample -> NaN that iteration.
+================================================================================================

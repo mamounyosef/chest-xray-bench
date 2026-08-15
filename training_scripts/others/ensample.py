@@ -49,7 +49,7 @@ FRONTAL_ONLY    = True         # drop lateral rows from the scored split. valid2
                                # model ever trained on a lateral. Caches and summaries
                                # are tagged separately, so the mixed-view artifacts of
                                # earlier runs are neither read nor overwritten.
-WEIGHTS         = "2026-08-14_22-46-32 (best valid200_frontal)"
+WEIGHTS         = "2026-08-15_11-50-49"
                                # "flat" | "search" | a saved fit: its folder/json, just
                                # the folder NAME, or "best_valid200" (the marked winner)
 COMBINE_SPACE   = "logit"       # blend space: "prob" | "logit" | "rank"
@@ -65,68 +65,14 @@ SET_TAG         = SET + ("_frontal" if FRONTAL_ONLY else "")
 # A nested LIST is a sub-ensemble: averaged flat among itself, ONE vote/weight above.
 
 FULL_MODELS = [
-#-------------------------------------------------
-    # top-10 checkpoints of rad_dino_vitB_1064x896 by val_mean_auroc on valid200
-    # (rank 1 is that run's best.pt, so it is written as the plain run name)
-
-    "rad_dino_vitB_1064x896",                    # rank  1, 0.8941  (= best.pt)
-    # ("rad_dino_vitB_1064x896", 12800),         # rank  2, 0.8936, -100 steps
-    # ("rad_dino_vitB_1064x896", 11800),         # rank  3, 0.8926,  -50 steps
-    # ("rad_dino_vitB_1064x896", 13000),         # rank  4, 0.8925,  -50 steps
-    # ("rad_dino_vitB_1064x896", 12600),         # rank  5, 0.8916, -150 steps
-    # ("rad_dino_vitB_1064x896", 13200),         # rank  6, 0.8911
-    # ("rad_dino_vitB_1064x896", 12400),         # rank  7, 0.8909,  -50 steps
-    # ("rad_dino_vitB_1064x896", 13400),         # rank  8, 0.8903,  +50 steps
-    # ("rad_dino_vitB_1064x896", 12200),         # rank  9, 0.8902, -100 steps
-    # ("rad_dino_vitB_1064x896", 12000),         # rank 10, 0.8900, -150 steps
-    
-    # top-10 checkpoints of medmae_vitb_nih_B_768_s2_seed1337 by val_mean_auroc on
-    # valid200 (rank 1 = step 3600 IS that run's best.pt — the same weights)
-    
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 3600), # rank  1, 0.896443
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 2400), # rank  2, 0.893255
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 1400), # rank  3, 0.893050
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 6600), # rank  4, 0.891701
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 6400), # rank  5, 0.891500
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 1200), # rank  6, 0.890678
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 4600), # rank  7, 0.890578
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 3800), # rank  8, 0.890281
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 5000), # rank  9, 0.889867
-    # ("medmae_vitb_nih_B_768_s2_seed1337", 2000), # rank 10, 0.888933
-
-    "convnext_base_22k_1600x1312",
-    # ("convnext_base_22k_1600x1312", 7500),
-    # ("convnext_base_22k_1600x1312", 8700),
-    # ("convnext_base_22k_1600x1312", 10200),
-
-    "medmae_vitb_nih_B_768_s2",
-    "rad_dino_vitB_768",
-    # "medmae_vitb_nih_B_448_s1_seed7",
-
     "medmae_vitb_nih_B_768_s2_seed1337",
+    "medmae_vitb_nih_B_768_s2",
+    "convnext_base_22k_1600x1312",
     "medmae_vitb_nih_B_448_s1_seed1337",
-
-    # ["convnext_base_22k_final_stage1",
-    # "convnext_base_22k_seed7",
-    # "convnext_base_22k_seed7",],
-    # "medmae_vitb_nih_B_768_s2_seed7",
-    # "medmae_vitb_nih",
-    # "convnext_base_22k_768x640",
-
-
-# ------------------------------------------------------------
-    # ("rad_dino_vitB_1064x896", 11800),
-    # [("rad_dino_vitB_1064x896", 11800), ("rad_dino_vitB_1064x896", 12800)],
-
-    # "medmae_vitb_nih_B_768_s2",
-
-    # "rad_dino_vitB_1064x896",
-    # "medmae_vitb_nih",
-    # "convnext_base_22k_final_stage1",
-
-    # "medmae_vitb_raw",
-    # "convnext_base_22k_seed1337",
-    # "convnext_base_22k_seed7",
+    "medmae_vitb_nih_B_768_s2_seed7",
+    "medmae_vitb_raw",
+    "rad_dino_vitB_768",
+    "convnext_large_22k_768x640",
 ]
 
 CKPT_SUBPATH = {}              # {run: "stage_subdir/best.pt"} for two-stage runs
