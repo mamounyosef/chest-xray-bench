@@ -1,0 +1,43 @@
+{
+  "experiment": "convnext_base_22k_edema_only",
+  "set": "valid200",
+  "view_filter": "frontal only",
+  "csv": "01_valid200.csv",
+  "n_images": 202,
+  "n_images_all_views": 234,
+  "checkpoint": "/runs/convnext_base_22k_edema_only/results/checkpoints/best.pt",
+  "checkpoint_step": 7200,
+  "checkpoint_epoch": 2,
+  "device": "cuda",
+  "amp": false,
+  "threshold_objective": "f1",
+  "threshold_source": "/runs/convnext_base_22k_edema_only/results/thresholds.json",
+  "thresholds": {
+    "Edema": 0.4049846827983856
+  },
+  "use_clahe": false,
+  "u_policy": "mixed",
+  "val_loss": 0.347167432308197,
+  "macro": {
+    "mean_auroc": 0.9297619047619048,
+    "mean_auprc": 0.8080434823701295,
+    "mean_f1": 0.7058823529411764,
+    "mean_precision": 0.6,
+    "mean_recall": 0.8571428571428571,
+    "mean_specificity": 0.85
+  },
+  "per_task": {
+    "Edema": {
+      "auroc": 0.9297619047619048,
+      "auprc": 0.8080434823701295,
+      "f1": 0.7058823529411764,
+      "precision": 0.6,
+      "recall": 0.8571428571428571,
+      "specificity": 0.85,
+      "n_pos": 42,
+      "n_excluded": 0,
+      "threshold": 0.4049846827983856
+    }
+  },
+  "evaluated_at": "2026-08-15T17:30:48"
+}
