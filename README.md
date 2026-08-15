@@ -9,19 +9,35 @@ Every run shares the same splits, preprocessing, augmentation and evaluation, so
 difference between two runs comes from the design choice under test and not from the
 setup around it.
 
-**[43 trained models on Hugging Face](https://huggingface.co/mamounyosef/chest-xray-bench)**
+- **[Technical report](https://doi.org/10.13140/RG.2.2.19222.92487)**
+- **[43 trained models on Hugging Face](https://huggingface.co/mamounyosef/chest-xray-bench)**
 
 ## Results
 
 Mean AUROC over the five competition findings, on the official test split.
 
 | | test500 |
-|---|---|
+| --- | --- |
 | Best single model, `medmae_vitb_nih_B_768_s2_seed1337` | 0.9113 |
 | Plain average of three different backbones | **0.9174** |
 
 The ensemble gains +0.0061 over its best member, with a 95% bootstrap interval of
 [+0.0005, +0.0118] over 10,000 paired resamples.
+
+### The three members
+
+A plain 1/3 probability average, no fitted weights. Fitting per finding weights on the
+validation split did not improve on it.
+
+| Model | Pretraining | Input | valid200 | test500 |
+| --- | --- | --- | --- | --- |
+| [`rad_dino_vitB_768`](https://huggingface.co/mamounyosef/chest-xray-bench/tree/main/rad_dino_vitB_768) | RAD-DINO, chest X-rays | 784x644 | 0.9016 | 0.9100 |
+| [`medmae_vitb_nih_B_768_s2`](https://huggingface.co/mamounyosef/chest-xray-bench/tree/main/medmae_vitb_nih_B_768_s2) | Medical-MAE + ChestX-ray14 | 768x640 | 0.9064 | 0.9067 |
+| [`convnext_base_22k_1600x1312`](https://huggingface.co/mamounyosef/chest-xray-bench/tree/main/convnext_base_22k_1600x1312) | ImageNet-22k | 1600x1312 | 0.9063 | 0.9037 |
+| **All three blended** | | | | **0.9174** |
+
+The three come from different pretraining families, which is what makes the average
+work. Members that differ only by seed correlate above 0.98 and add little.
 
 ### What moved the metric
 
@@ -32,7 +48,7 @@ The ensemble gains +0.0061 over its best member, with a 95% bootstrap interval o
 - **How uncertain labels are handled.** On ConvNeXt-B, self-training Consolidation's
   uncertain cells is worth +0.0227 over reading them all as positive.
 - **Ensembling, when the members differ.** Seven runs of one backbone averaged to
-  0.9095, below the best single model; three different backbones reached 0.9174.
+  0.9095, below the best single model; three different backbones reached 0.9174 on the final held out test500.
 
 ### What did not
 
@@ -53,7 +69,7 @@ than many of the differences this study set out to measure, so anything below ro
 Frontal views only, split by patient so no patient appears in two splits.
 
 | Split | Source | Images | Labels |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | train | official train, 90% | 171,927 | automatic labeler |
 | val19k | official train, 10% | 19,100 | automatic labeler |
 | valid200 | official validation | 202 | radiologist consensus |
@@ -72,7 +88,6 @@ training_scripts/
     calibrate_threshold.py
     results/          logs, metrics, thresholds (checkpoints are not tracked)
   others/             cross-run tooling: ensembling, bootstrap CI, exports, sweeps
-paper/                the technical report
 ```
 
 ## Reproducing a run
@@ -96,6 +111,19 @@ redistributing the dataset, and the label tables are part of it. Request access 
 [`data_code/chexpert/02_splits_dataset.ipynb`](data_code/chexpert/02_splits_dataset.ipynb)
 to regenerate the exact splits used here. See
 [`data/chexpert/README.md`](data/chexpert/README.md).
+
+## Citation
+
+```bibtex
+@techreport{yosef2026chexpert,
+  title       = {A Systematic Study of Design Choices for Multi-Label Chest X-ray
+                 Classification on CheXpert},
+  author      = {Yosef, Ma'moun},
+  year        = {2026},
+  institution = {University of Jordan},
+  doi         = {10.13140/RG.2.2.19222.92487}
+}
+```
 
 ## License
 
