@@ -1,0 +1,32 @@
+% Values from each run's results/<set>_frontal_results.json.
+
+\begin{table}[H]
+  \caption{Seed replicates. Every run inside a block is identical except for the
+  random seed. Spread is the largest value minus the smallest.}
+  \centering
+  \footnotesize
+  \begin{tabular}{llrrr}
+    \toprule
+    Run & Seed & val19k & val200 & test500 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{ConvNeXt-B, $384\times320$}} \\
+    final\_stage1 & 42 & 0.8038 & 0.8969 & 0.8985 \\
+    seed7 & 7 & 0.8034 & 0.8916 & 0.8949 \\
+    seed1337 & 1337 & 0.8028 & 0.8924 & 0.8967 \\
+    \multicolumn{2}{l}{\textit{spread}} & 0.0010 & 0.0053 & 0.0036 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{DenseNet-121, $384\times320$}} \\
+    densenet121 & 42 & 0.8028 & 0.8727 & 0.8750 \\
+    seed7 & 7 & 0.8023 & 0.8740 & 0.8804 \\
+    seed123 & 123 & -- & 0.8584 & 0.8634 \\
+    \multicolumn{2}{l}{\textit{spread}} & 0.0005 & 0.0156 & 0.0170 \\
+    \midrule
+    \multicolumn{5}{l}{\textit{ViT-B Medical-MAE, $768\times640$}} \\
+    nih\_B\_768\_s2 & 42 & 0.8076 & 0.9064 & 0.9067 \\
+    seed7 & 7 & 0.8090 & 0.9045 & 0.9077 \\
+    seed1337 & 1337 & 0.8053 & 0.9105 & 0.9112 \\
+    \multicolumn{2}{l}{\textit{spread}} & 0.0037 & 0.0059 & 0.0046 \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:seeds}
+\end{table}

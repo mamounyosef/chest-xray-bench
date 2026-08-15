@@ -22,20 +22,16 @@ GITHUB = "https://github.com/mamounyosef/chest-xray-bench"
 TASKS = ["Atelectasis", "Cardiomegaly", "Consolidation", "Edema",
          "Pleural Effusion"]
 
-ENSEMBLE = [
-    "rad_dino_vitB_1064x896", "convnext_base_22k_1600x1312",
-    "medmae_vitb_nih_B_768_s2", "rad_dino_vitB_768",
-    "medmae_vitb_nih_B_768_s2_seed1337", "medmae_vitb_nih_B_448_s1_seed1337",
+ENSEMBLE = [                    # the plain 1/3 average that scored best
+    "convnext_base_22k_1600x1312",
+    "medmae_vitb_nih_B_768_s2",
+    "rad_dino_vitB_768",
 ]
-ENSEMBLE_TEST500 = 0.9130       # the six blended, per class weights, logit space
+ENSEMBLE_TEST500 = 0.9174       # the three blended, plain probability average
+BEST_SINGLE = "medmae_vitb_nih_B_768_s2_seed1337"
+BEST_SINGLE_TEST500 = 0.9113
 
-# These two runs have no stored valid200_results.json, so their val200 comes from
-# the training log at the selected step. That is the same quantity: for every other
-# member the two sources agree to four decimals.
-VAL200_FALLBACK = {
-    "medmae_vitb_nih_B_768_s2_seed1337": 0.8964,
-    "medmae_vitb_nih_B_448_s1_seed1337": 0.8979,
-}
+VAL200_FALLBACK = {}            # every run now has a stored frontal valid200 score
 
 # Grouping for the full listing, in the order the report discusses them.
 GROUPS = [

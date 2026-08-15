@@ -248,7 +248,19 @@ modal_download_chexpert_native.py   # contains a live AIMI SAS credential
 modal_download_chexpert_native.py
 .vscode/settings.json
 
-# LaTeX paper workspace (arXiv template + build artifacts)
-paper/
+# LaTeX report: the source and the built PDF are tracked, the rest is not
+paper/build/
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.fdb_latexmk
+paper/*.fls
+paper/*.log
+paper/*.out
+paper/*.synctex.gz
+paper/README_notes.txt
 training_scripts/others/member_correlation/member_correlation.ipynb
 paper.zip
+
+paper/test.png
+paper/README.md

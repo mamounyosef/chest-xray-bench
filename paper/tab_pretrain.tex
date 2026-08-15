@@ -1,0 +1,37 @@
+% Values from each run's results/<set>_frontal_results.json; val19k from the run logs.
+
+\begin{table}[H]
+  \caption{Pretraining source at the shared $384\times320$ setting
+  ($384\times384$ for Swin-B). Gentle stage 1 means the ChestX-ray14
+  stage ran at $1\times10^{-5}$ for 4 epochs instead of $1\times10^{-4}$
+  for 10, with the CheXpert stage left untouched. The last four rows use
+  the mixed uncertainty policy and label smoothing, so the ConvNeXt-B row
+  is repeated there under those same settings as the matched reference.}
+  \centering
+  \footnotesize
+  \begin{tabular}{llccrrr}
+    \toprule
+    Backbone & Pretraining & U-policy & LS & val19k & val200 & test500 \\
+    \midrule
+    \multicolumn{7}{l}{\textit{ImageNet label set}} \\
+    ConvNeXt-T & IN-1k & U-Ones & no & 0.8043 & 0.8850 & 0.8896 \\
+    Swin-B & IN-1k & U-Ones & no & 0.8022 & 0.8605 & 0.8726 \\
+    Swin-B & IN-22k & U-Ones & no & 0.8036 & 0.8638 & 0.8761 \\
+    \midrule
+    \multicolumn{7}{l}{\textit{ChestX-ray14 pretraining}} \\
+    ConvNeXt-B & IN-22k & U-Ones & no & 0.8062 & 0.8806 & 0.8775 \\
+    ConvNeXt-B & IN-22k + CXR14 & U-Ones & no & 0.8061 & 0.8759 & 0.8795 \\
+    ConvNeXt-B & IN-22k + CXR14, gentle stage 1 & U-Ones & no & 0.8062 & 0.8919 & 0.8942 \\
+    ConvNeXt-B & IN-22k + CXR14, gentle both stages & U-Ones & no & 0.8070 & 0.8895 & 0.8899 \\
+    ConvNeXt-L & IN-22k & U-Ones & no & 0.8064 & 0.8748 & 0.8792 \\
+    ConvNeXt-L & IN-22k + CXR14 & U-Ones & no & 0.8067 & 0.8803 & 0.8811 \\
+    \midrule
+    \multicolumn{7}{l}{\textit{Chest X-ray pretrained backbones}} \\
+    ViT-B & Medical-MAE & mixed & yes & 0.8065 & 0.9030 & 0.9046 \\
+    ViT-B & Medical-MAE + CXR14 & mixed & yes & 0.8085 & 0.8970 & 0.9020 \\
+    ViT-B & Medical-MAE + CheXpert & mixed & yes & 0.8161 & 0.8906 & 0.8994 \\
+    ConvNeXt-B & IN-22k & mixed & yes & 0.8038 & 0.8969 & 0.8985 \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:pretrain}
+\end{table}

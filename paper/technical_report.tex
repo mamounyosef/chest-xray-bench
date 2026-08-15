@@ -1,0 +1,514 @@
+\documentclass{article}
+
+
+\usepackage{arxiv}
+
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{hyperref}       % hyperlinks
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{amsmath}
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{graphicx}
+\usepackage{multirow}
+\usepackage{float}          % [H] pins tables and figures exactly where they appear
+\usepackage{pdflscape}      % landscape pages for the wide appendix tables
+\usepackage{longtable}      % appendix tables that span several pages
+\graphicspath{ {./images/} }
+
+
+\title{A Systematic Study of Design Choices for Multi-Label Chest X-ray
+Classification on CheXpert}
+
+
+\author{
+ Ma'moun Yosef \\
+  Department of Artificial Intelligence\\
+  University of Jordan\\
+  Amman, Jordan \\
+  \texttt{mam0233493@ju.edu.jo} \\
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+  Results on CheXpert are hard to compare because published setups differ in backbone,
+  resolution, uncertain label handling, objective and ensembling all at once. This report
+  fixes the pipeline and varies one factor at a time across roughly fifty runs that share
+  the same splits, preprocessing and evaluation. Repeating configurations across seeds
+  gives a noise floor of 0.001 mean AUROC on a large automatically labelled validation
+  split and 0.004 to 0.017 on the two official radiologist sets, which is wider than many
+  of the differences the study set out to measure. Read against that floor, input
+  resolution up to $768\times640$ and pretraining on chest radiographs are the choices
+  that reliably pay, and the architecture matters more than its size. The ImageNet label
+  set, label smoothing and direct AUC optimization all fall inside the noise, while the
+  handling of uncertain labels is worth up to 0.023 on one backbone. Ensembling pays when
+  its members differ: seven runs of one backbone average to less than three different
+  backbones do. The best single model reaches 0.9113 mean AUROC on the official test set
+  and a plain average of three backbones reaches 0.9174, a paired bootstrap gain of
+  $+0.0061$ with a 95\% interval of $[+0.0005, +0.0118]$. The trained models and their
+  configurations are released.
+\end{abstract}
+
+
+% keywords can be removed
+%\keywords{chest radiography \and CheXpert \and multi-label classification \and transfer learning \and model selection}
+
+
+\section{Introduction}
+
+CheXpert \cite{irvin2019chexpert} is one of the standard benchmarks for multi-label
+chest radiograph classification, and results on it are difficult to compare. Published
+setups differ in backbone, input resolution, uncertain label handling, augmentation,
+objective and ensembling all at once, so a reported gain cannot be attributed to any
+one of those choices.
+
+This report fixes the pipeline and varies one factor at a time. Roughly fifty runs share
+the same splits, preprocessing, augmentation and evaluation, so every difference between
+them comes from the design choice under test. Repeated seeds give a noise floor to read
+those differences against, which turns out to matter more than any single result here.
+
+The contributions are a controlled comparison of the main design choices on CheXpert, a
+measurement of how much of the resulting spread is run to run noise, a final ensemble
+reaching 0.9174 mean AUROC on the official test set, and a public release of the trained
+models and their configurations.
+
+\section{Methods}
+
+\subsection{Dataset and splits}
+
+All experiments use mainly CheXpert \cite{irvin2019chexpert}, restricted to frontal views.
+The targets are the five competition pathologies: Atelectasis, Cardiomegaly,
+Consolidation, Edema and Pleural Effusion.
+
+The official training was therefore divided into a training part
+and a validation part. The division is 90/10 and split by patient, so no patient
+appears in both parts. The three official splits are already patient disjoint.
+Sizes are given in Table \ref{tab:splits}.
+
+The official validation set holds only 200 studies, which is too small to give a
+stable signal, so the larger val19k split was carved out of the training data for
+that purpose. Later runs also scored val200 at every validation and used it to pick
+the best checkpoint. The official test500 set was never seen during training and is
+kept for final reporting only.
+
+These exact splits are shared by every run, so any difference between runs comes from
+the design choice and not from the data. A big portion of the runs were trained at $384\times320$
+from the downscaled CheXpert release, and some trained above that resolution from
+the original full resolution images.
+
+\begin{table}[H]
+  \caption{Splits used in every experiment. Counts are frontal images.}
+  \centering
+  \begin{tabular}{llrl}
+    \toprule
+    Split    & Source                           & Images  & Labels                \\
+    \midrule
+    train    & official train, 90\%             & 171,927 & automatic labeler     \\
+    val19k   & official train, 10\%             & 19,100  & automatic labeler     \\
+    valid200 & official validation, 200 studies & 202     & radiologist consensus \\
+    test500  & official test, 500 studies       & 518     & radiologist consensus \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:splits}
+\end{table}
+
+
+\subsection{Uncertain labels}
+\label{sec:uncertain}
+
+CheXpert marks each pathology per study as positive, negative, uncertain or blank.
+Blank cells are treated as negative in every run. The uncertain cells are the open
+question, and five policies were compared:
+
+\begin{itemize}
+  \item \textbf{U-Ones}: uncertain becomes positive.
+  \item \textbf{U-Zeros}: uncertain becomes negative.
+  \item \textbf{Certain only}: uncertain cells are masked out of the loss.
+  \item \textbf{U-MultiClass}: the task gets a three way head over negative,
+        positive and uncertain.
+  \item \textbf{U-SelfTrained}: uncertain training cells take a soft probability
+        predicted by a model that was itself trained on certain cells only.
+\end{itemize}
+
+Uncertain labels in val19k are always U-Ones for consistency.
+The policies are compared in Section \ref{sec:results-uncertain}.
+
+\subsection{Preprocessing and augmentation}
+
+Each image is resized to fit inside the target width and height with its aspect ratio
+preserved, then zero padded on the short side to reach the exact size. Nothing is
+stretched and nothing is cropped, so the anatomy keeps its true proportions.
+Resampling uses area interpolation. Images are normalized with the statistics of the
+data each backbone was pretrained on. The base geometry is $384\times320$, and the higher resolution runs
+scale it up to $1600\times1312$.
+
+Contrast limited adaptive histogram equalization is a common preprocessing step for
+radiographs, so it was included as an ablation with a clip limit of 2.0 and an
+$8\times8$ tile grid, and it did not show a meaningful difference on ResNet-50. It is
+off everywhere else.
+
+Augmentation is applied to the training split only, never to any validation or test
+split. Each transform is drawn independently with its own probability, so a given
+image may receive none, one or several of them. The settings are listed in
+Table \ref{tab:augmentation} and are the same in every run. Horizontal flips are
+excluded, because mirroring a radiograph moves the heart to the wrong side.
+
+\begin{table}[H]
+  \caption{Training augmentation. It is applied to the training split only.}
+  \centering
+  \begin{tabular}{llc}
+    \toprule
+    Transform       & Range                      & Probability \\
+    \midrule
+    Rotation        & $\pm 5$ degrees            & 0.2         \\
+    Translation     & $\pm 5\%$ of width, height & 0.2         \\
+    Scale           & 0.95 to 1.05               & 0.2         \\
+    Brightness      & $\pm 10\%$                 & 0.2         \\
+    Contrast        & $\pm 10\%$                 & 0.2         \\
+    Horizontal flip & not used                   &             \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:augmentation}
+\end{table}
+
+\subsection{Backbones and pretraining}
+
+Twelve backbones were fine-tuned, listed in Table \ref{tab:models}. Parameter counts
+are the real counts of the built model, head included. All weights come from torchvision or timm
+\cite{wightman2019timm} except the two chest X-ray models. Every backbone is fine
+tuned end to end, with no frozen layers.
+
+\begin{table}[H]
+  \caption{Backbones, parameter counts and the resolutions each was trained at.}
+  \centering
+  \begin{tabular}{llrl}
+    \toprule
+    Backbone                                      & Pretraining          & Params (M) & Resolutions                                      \\
+    \midrule
+    ResNet-50 \cite{he2016resnet}                 & ImageNet-1k          & 23.5       & $384\times320$                                   \\
+    DenseNet-121 \cite{huang2017densenet}         & ImageNet-1k          & 7.0        & $384\times320$                                   \\
+    DenseNet-201 \cite{huang2017densenet}         & ImageNet-1k          & 18.1       & $384\times320$                                   \\
+    ConvNeXt-T \cite{liu2022convnext}             & ImageNet-1k, 22k     & 27.8       & $384\times320$                                   \\
+    ConvNeXt-S \cite{liu2022convnext}             & ImageNet-1k          & 49.5       & $384\times320$                                   \\
+    ConvNeXt-B \cite{liu2022convnext}             & ImageNet-22k         & 87.6       & $384\times320$, $768\times640$, $1600\times1312$ \\
+    ConvNeXt-L \cite{liu2022convnext}             & ImageNet-22k         & 196.2      & $384\times320$, $768\times640$                   \\
+    Swin-B \cite{liu2021swin}                     & ImageNet-1k, 22k     & 86.9       & $384\times384$                                   \\
+    EfficientNetV2-M \cite{tan2021efficientnetv2} & ImageNet-21k         & 52.9       & $384\times320$                                   \\
+    CoAtNet-1 \cite{dai2021coatnet}               & ImageNet-12k         & 41.0       & $384\times320$                                   \\
+    ViT-B, Medical-MAE \cite{xiao2023medicalmae}  & chest X-rays, MAE    & 86.0       & $384\times320$ to $768\times640$                 \\
+    ViT-B, RAD-DINO \cite{perezgarcia2024raddino} & chest X-rays, DINOv2 & 86.6       & $784\times644$, $1064\times896$                  \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:models}
+\end{table}
+
+The ImageNet-22k, 21k and 12k entries were pretrained on the larger label set and
+then fine tuned on ImageNet-1k before being used here.
+
+The last two rows are the only backbones that never saw natural images. Medical-MAE
+is a ViT-B trained with masked autoencoding \cite{he2022mae} on roughly 0.5 million
+chest radiographs, and three of its released checkpoints were compared: the raw
+self-supervised backbone, the same backbone after fine tuning on ChestX-ray14
+\cite{wang2017chestxray14}, and the one already fine tuned on CheXpert. RAD-DINO
+\cite{perezgarcia2024raddino} is a ViT-B trained with DINOv2 \cite{oquab2024dinov2}
+on chest radiographs, and it uses its own normalization statistics rather than the
+ImageNet ones. A separate run also pretrained ConvNeXt on ChestX-ray14 before moving
+to CheXpert, which tests the same idea with a convolutional backbone.
+
+\subsection{Training setup}
+
+Every run uses AdamW, a batch size of 64, mixed precision, and a cosine schedule with
+a one epoch linear warmup. The
+loss is binary cross entropy on the logits, computed over the five tasks at once and
+masked wherever a target is undefined. Training stops early when the monitored mean
+AUROC has not improved for a fixed number of validations.
+
+The weight decay is $1\times10^{-5}$ throughout. The runs that start from a backbone
+already pretrained on chest X-rays use a lower peak learning rate than the rest,
+because those weights already sit close to a good solution and a larger rate would
+only undo them. Those runs also use layer-wise learning rate decay of 0.75, so the
+rate is multiplied by 0.75 for each block further from the head, together with gradient
+clipping at a gradient norm of 1.0. No layer is frozen anywhere. The peak and minimum learning
+rate of every run is listed in
+Table \ref{tab:allruns}.
+
+Later runs add label smoothing of 0.05 to the targets, which keeps the model from
+driving its logits to saturation on labels that are themselves uncertain. An ablation
+was done with and without label smoothing, and label smoothing showed a very small
+gain, small enough to sit inside the seed noise reported in
+Section \ref{sec:results-seed}. It is kept in every later run.
+
+The high resolution vision transformers are trained in two stages. Their position
+embeddings are tied to the patch grid, so changing the input size means resampling
+them, and going straight from the pretraining resolution to the target resolution
+would be too large a jump for that resampling. The first stage therefore trains at an
+intermediate resolution, and the second stage begins from its best checkpoint and
+trains at the full target resolution, resampling the position embeddings again.
+
+One group of runs replaces the objective entirely. Instead of cross entropy they
+optimize an AUC margin loss \cite{yuan2021dam}, which approximates the headline metric
+directly, using the min-max optimizer that this loss requires. Mixed precision is disabled there and
+the model is warm started from a cross entropy model, both following the practice
+recommended for that loss. This changes the loss, the optimizer and the learning rate
+scale together, so it is not a single variable comparison and is reported as such.
+
+\subsection{Evaluation}
+
+The headline metric is the mean AUROC over the five pathologies, with the per class
+values and AUPRC also reported. Scoring is at the image level.
+
+F1, precision, recall and specificity use one threshold per pathology chosen to
+maximize F1 on val19k. Those thresholds are then frozen and applied unchanged to
+val200 and test500.
+
+During training the model is validated every few hundred optimizer steps on both
+val19k and val200. The checkpoint that is kept is the one with the best mean AUROC on
+the monitored set, and early stopping watches the same quantity.
+
+The final ensampling results carry bootstrap confidence intervals over 10,000 resamples
+of the images.
+
+\section{Results}
+
+\subsection{Architecture}
+\label{sec:results-arch}
+
+Table \ref{tab:arch} compares the backbones under the shared baseline setting, where
+everything except the architecture is held fixed.
+
+On val19k the backbones span 0.7994 to 0.8064, a range of 0.0070 across architectures
+that differ by a factor of twenty eight in parameter count. On the radiologist sets the
+same models span 0.0245 on val200 and 0.0170 on test500, around three times the seed
+spread most configurations show in Section \ref{sec:results-noise}. The distance between
+the best and the weakest backbone here is therefore a real difference, even though
+neighbouring rows are not separable.
+
+Nothing about capacity orders the results. ConvNeXt-L, at 196.2 million parameters,
+finishes below ConvNeXt-T at 27.8 million on both radiologist sets, and DenseNet-121 at
+7.0 million lands within 0.0042 of ConvNeXt-L on test500. ResNet-50, the oldest design
+in the table, is fourth on test500 and ahead of both ConvNeXt-B and ConvNeXt-L.
+
+The sets do not agree on a winner. ConvNeXt-L is first on val19k, while ConvNeXt-T leads
+both radiologist sets, at 0.8850 and 0.8896. The two Swin rows sit at the bottom of
+test500 despite being among the larger models. Most neighbouring rows differ by 0.002 to
+0.005, which is too little to rank them, so only the distance between the top and the
+bottom of the table should be read as a difference.
+
+\input{tab_arch}
+
+\subsection{Pretraining source}
+\label{sec:results-pretrain}
+
+Table \ref{tab:pretrain} holds the resolution fixed at the shared baseline and varies
+only what the backbone saw before CheXpert.
+
+The ImageNet label set makes no difference that survives the noise. Swin-B gains 0.0033
+on val200 and 0.0035 on test500 from the larger label set, both a fraction of the seed
+spread in Section \ref{sec:results-seed}. Pretraining on ten times more natural image
+labels does not carry into this task.
+
+An intermediate stage on ChestX-ray14 behaves differently depending on how that stage
+is run. Copying the CheXpert schedule into it leaves ConvNeXt-B where it started, 0.8795
+against 0.8775 on test500 and lower on val200. Running the same stage gently, at a tenth
+of the learning rate for four epochs, gives 0.8942 on test500, 0.0167 above the baseline,
+and softening both stages gives 0.8899. ConvNeXt-L moves the same way but by less,
+gaining 0.0055 on val200 and 0.0019 on test500. Only the gentle ConvNeXt-B stage clears
+the noise floor. One explanation is that the harm comes from the intermediate stage
+overwriting the ImageNet features rather than from the extra data itself.
+
+The backbones that were pretrained on chest radiographs from the start are the clearest
+result in this section. All three Medical-MAE checkpoints beat every ImageNet backbone
+in the table on test500, with the raw self-supervised checkpoint reaching 0.9046.
+Against the matched ConvNeXt-B, which uses the same uncertainty policy, label smoothing
+and resolution, the gain is 0.0061 on test500 and 0.0061 on val200. It costs nothing at
+inference, since this ViT-B is 86.0 million parameters against 87.6 million for
+ConvNeXt-B.
+
+The three Medical-MAE checkpoints also show how little the ranking sets agree. The
+checkpoint already fine tuned on CheXpert is far ahead on val19k at 0.8161, a margin of
+0.0076 over the next best, and yet it is last of the three on both radiologist sets. The
+raw checkpoint, which was never fine tuned on any labelled chest X-ray task, is the one
+that transfers best. Section \ref{sec:results-valsize} returns to this disagreement.
+
+\input{tab_pretrain}
+
+\subsection{Resolution}
+\label{sec:results-res}
+
+Table \ref{tab:res} raises the input resolution while holding the rest of the recipe
+fixed. This is the largest single lever in the study, and it is also the only one whose
+direction the radiologist sets agree on.
+
+Going from $384\times320$ to $768\times640$ gains ConvNeXt-B 0.0052 on test500 and
+0.0025 on val200. ConvNeXt-L gains 0.0195 and 0.0261 over the same step, although that
+pair also changes the uncertainty policy and label smoothing and so overstates the
+effect. Medical-MAE gains 0.0047 on test500 and 0.0094 on val200.
+
+Above roughly $768\times640$ the gains stop. ConvNeXt-B at $1600\times1312$ scores the
+same 0.9037 on test500 as its own $768\times640$ run, and RAD-DINO loses 0.0054 going
+to $1064\times896$. Only val200 keeps rising, which is a property of that set rather
+than of the models, as Section \ref{sec:results-noise} shows.
+
+\input{tab_res}
+
+\subsection{Training choices}
+\label{sec:results-uncertain}
+
+Table \ref{tab:train} covers what to do with the uncertain labels, what to optimize,
+and whether to smooth the targets. These runs sit on three different backbones, so
+only comparisons inside a block mean anything.
+
+On ResNet-50, U-Zeros loses 0.0171 on val200 and 0.0040 on test500, so mapping uncertain
+cells to negative is the weaker choice there. On DenseNet-121 both alternatives to plain
+U-Ones help: sending Consolidation's uncertain cells to negative gains 0.0176 on test500,
+and the full per task scheme gains 0.0228. Reading uncertain cells as positive, the
+simplest policy of all, is not the best on either backbone but is never far off.
+
+On ConvNeXt-B the picture is clearer. Every variant that stops training Consolidation
+toward the labeler's convention beats the U-Ones baseline on test500: masking uncertain
+cells out of the loss gives 0.8963, self-training all five tasks gives 0.8970, and
+self-training Consolidation alone gives 0.9002, against 0.8775 for the baseline. That
+last gain of 0.0227 is the largest single effect in this table. The curriculum variant,
+which shows the uncertain rows first, gives most of it back at 0.8848.
+
+Label smoothing of 0.05 changes almost nothing. Against the run it was added to, it
+moves test500 by $-0.0017$ and val200 by $-0.0002$, both well inside the noise. It is
+kept in the later runs.
+
+Replacing cross entropy with the AUC margin loss also fails to pay. Warm started from a
+cross entropy model it reaches 0.8836 on test500, above the U-Ones baseline it warm
+started from but below several plain cross entropy runs. When it is trained alone,
+without the cross entropy stage, it falls to 0.7548 on val19k and 0.8539 on test500, the
+worst result in the study. Optimizing the metric directly is not a shortcut to it.
+
+\input{tab_train}
+
+\subsection{How much of this is noise}
+\label{sec:results-noise}
+\label{sec:results-seed}
+\label{sec:results-valsize}
+
+Every number quoted so far should be read against the size of the differences that
+appear when nothing changes at all. Table \ref{tab:seeds} rebuilds the same
+configuration under different random seeds.
+
+The noise floor depends on the set. On val19k, with 19,100 images, three ConvNeXt-B
+replicates span 0.0010 and three DenseNet-121 replicates span 0.0005. On the
+radiologist sets the same replicates span 0.0053 to 0.0156 on val200 and 0.0036 to
+0.0170 on test500. So the DenseNet-121 block shows that a single unlucky seed can
+move test500 by 0.0170 on its own.
+
+The three sets also measure different things, which is why they keep disagreeing.
+val19k is large and therefore stable, but its labels come from the automatic labeler
+and its uncertain cells are always scored as positive, so it rewards models that
+reproduce the labeler. This shows up directly: the Medical-MAE checkpoint already fine
+tuned on CheXpert leads val19k by 0.0076 and is mid table on both radiologist sets,
+while the run that stopped training toward the labeler convention altogether, the one
+that masks uncertain cells out of the loss, gives up 0.0079 on val19k and gains 0.0188
+on test500.
+
+val200 and test500 carry radiologist consensus labels, which is what the task actually
+asks for, but at 202 and 518 images they are too small to rank models that sit within
+0.015 of each other. Their own disagreement is the proof: the ordering of the twelve
+backbones does not survive the move from one set to the other. A useful thought for the
+rest of this report is to read differences below roughly 0.015 on test500 as ties, and
+to take a lead on any single set as a hint rather than a settled ranking.
+
+\input{tab_seeds}
+
+\subsection{Ensembling and final result}
+\label{sec:results-ens}
+
+Table \ref{tab:ens} collects the ensembles. What decides their quality is not how many
+members they hold but how different those members are.
+
+Averaging five checkpoints of one ConvNeXt-B reaches 0.9076, and widening that to seven
+ConvNeXt-B runs, including separate seeds, reaches 0.9095. Both sit below the best single
+model, which scores 0.9113 on its own. Replacing those seven near copies with three
+genuinely different backbones, ConvNeXt-B at $1600\times1312$, Medical-MAE at
+$768\times640$ and RAD-DINO at $784\times644$, lifts a plain probability average to
+\textbf{0.9174}, the best result in the study. Fitting per class weights on val200 does
+not improve on that plain average.
+
+Over 10,000 paired resamples of the 518 test500 images, that ensemble scores 0.9174 with
+a 95\% interval of $[0.9040, 0.9303]$, and its gain over the strongest single member is
+$+0.0061$ with a 95\% interval of $[+0.0005, +0.0118]$. Per class the ensemble
+reaches 0.9712 on Pleural Effusion, 0.9269 on Edema, 0.9138 on Cardiomegaly, 0.9127 on
+Consolidation and 0.8623 on Atelectasis.
+
+\input{tab_ens}
+
+\section{Discussion}
+
+Across roughly fifty runs, a few choices moved the metric and most of the rest did not.
+
+Resolution moved it, up to a point. Going from $384\times320$ to $768\times640$ was the
+largest single gain in the study, and going further gave almost nothing back. Domain
+pretraining moved it: backbones pretrained on chest radiographs beat
+every ImageNet backbone at equal size and equal resolution, which is the one place where
+the choice of starting weights clearly paid. Ensembling moved it, but only when the
+members were genuinely different from one another.
+
+Architecture moved it too, but not in the way parameter counts suggest. The eleven
+backbones span 0.0170 on test500 and 0.0245 on val200, around three times the seed
+spread that most configurations show, so the difference between a good backbone and a
+weak one is real. What does not follow is capacity: ConvNeXt-T at 27.8 million parameters finishes above
+ConvNeXt-L at 196.2 million on both radiologist sets, and on test500 even ResNet-50
+lands ahead of ConvNeXt-B and ConvNeXt-L. Picking a good family matters, and paying for
+a larger member of that family does not.
+
+What did not move the metric is a shorter list than expected. Enlarging the ImageNet
+label set from 1k to 22k changed nothing that survives the noise, on either    backbone
+where both were available. That is a statement about the label set alone: every
+backbone here starts from pretrained weights and none was trained from scratch, so this
+study says nothing about the value of ImageNet pretraining itself, which is almost
+certainly large. The uncertainty policy, which the CheXpert literature has spent
+considerable effort on, mattered much less than the seed. Label smoothing did nothing
+measurable. Optimizing AUROC directly through an AUC margin loss did not beat cross
+entropy, and without a cross entropy stage it collapsed.
+
+\section{Limitations}
+
+Everything here is one dataset. There is no external validation on MIMIC-CXR,
+ChestX-ray14 as a target, or any prospective set, so none of these conclusions are known
+to transfer.
+
+The final ensemble is selected and weighted on val200, which holds 202 images and, for
+Consolidation, 32 positives. The bootstrap interval on test500 accounts for sampling the
+test images but not for that selection, so any headline figure on test500 could be
+optimistic, and this applies to any published number on that set. The per class weights should be read as one draw from a noisy
+procedure rather than as a finding about which model is good at which pathology.
+
+Not every ablation shares one backbone. The uncertainty policies are spread across
+ResNet-50, DenseNet-121 and ConvNeXt-B, and the ChestX-ray14 pretraining runs vary the
+schedule alongside the extra stage, so a few comparisons in Section
+\ref{sec:results-uncertain} and Section \ref{sec:results-pretrain} carry more than one
+variable. Only three configurations were repeated across seeds, so the noise floor is
+estimated from a small sample and may be understated for the configurations that were
+never repeated.
+
+\section{Conclusion}
+
+Under one fixed pipeline on CheXpert, input resolution, chest X-ray pretraining and the
+handling of uncertain labels were the design choices that paid, ensembling paid when its
+members were diverse, and the architecture mattered while its size did not as much. The
+remaining choices, including the ImageNet label set, label smoothing and the objective,
+were within the noise of rerunning the same configuration with a different seed. The best
+single model reached 0.9113 mean AUROC on the official test set and a plain average of
+three different backbones reached 0.9174, with a paired bootstrap interval of
+$[+0.0005, +0.0118]$ on the difference. The wider point is that the official radiologist
+sets are small enough that model rankings drawn from them are unstable, and reported
+gains below roughly 0.015 should be treated as ties.
+
+\bibliographystyle{unsrt}
+\bibliography{references}
+
+\appendix
+\input{appendix_runs}
+
+\end{document}

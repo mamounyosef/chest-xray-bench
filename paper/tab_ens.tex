@@ -1,0 +1,23 @@
+% Values from training_scripts/others/ensembling_results/*/ensemble_test500_frontal_summary.json
+% and training_scripts/others/ci/results/2026-08-15_14-24-38_test500_frontal/.
+
+\begin{table}[H]
+  \caption{Ensembles on test500. Weights, when used, are per class and fitted on
+  val200. The single model row is the strongest member on its own.}
+  \centering
+  \footnotesize
+  \begin{tabular}{llcr}
+    \toprule
+    Members & Blend & Weights & test500 \\
+    \midrule
+    Medical-MAE ViT-B $768\times640$ alone & -- & -- & 0.9113 \\
+    \midrule
+    5 ConvNeXt-B checkpoints & probability average & no & 0.9076 \\
+    7 ConvNeXt-B runs & probability average & no & 0.9095 \\
+    \midrule
+    3 backbones & probability average & no & \textbf{0.9174} \\
+    8 backbones & logit average & yes & 0.9159 \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:ens}
+\end{table}

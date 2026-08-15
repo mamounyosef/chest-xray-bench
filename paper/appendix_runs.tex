@@ -1,0 +1,126 @@
+﻿\section{Run configurations}
+\label{app:runs}
+
+Epochs are the configured budget, with the total number of optimizer steps in
+parentheses. Training stops early, so the selected checkpoint is usually well
+before the end. Batch size is 64 everywhere except
+\texttt{\scriptsize convnext\_base\_22k\_1600x1312}, which used 32.
+
+\begin{landscape}
+  \scriptsize
+  \setlength{\tabcolsep}{1.5pt}
+  \begin{longtable}{llllllllllrrr}
+    \caption{Configuration and results of every run reported in this study.}
+    \label{tab:allruns} \\
+    \toprule
+    Run & Pretraining & Resolution & LR peak & LR min & Epochs (steps) & GPU & U-policy & LS & Time & val19k & val200 & test500 \\
+    \midrule
+    \endfirsthead
+    \multicolumn{13}{l}{\textit{Table \thetable\ continued from the previous page}} \\
+    \toprule
+    Run & Pretraining & Resolution & LR peak & LR min & Epochs (steps) & GPU & U-policy & LS & Time & val19k & val200 & test500 \\
+    \midrule
+    \endhead
+    \midrule
+    \multicolumn{13}{r}{\textit{continued on the next page}} \\
+    \endfoot
+    \bottomrule
+    \endlastfoot
+    \midrule
+    \multicolumn{13}{l}{\textit{Architecture}} \\
+    \texttt{\scriptsize resnet50\_without\_clahe} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 15 (40,305) & L4 & U-Ones & no & 2h\,08m & 0.7994 & 0.8759 & 0.8836 \\
+    \texttt{\scriptsize densenet121} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 2h\,15m & 0.8028 & 0.8727 & 0.8750 \\
+    \texttt{\scriptsize densenet201} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 3h\,06m & 0.8029 & 0.8755 & 0.8750 \\
+    \texttt{\scriptsize convnext\_tiny} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 1h\,58m & 0.8043 & 0.8850 & 0.8896 \\
+    \texttt{\scriptsize convnext\_tiny\_22k} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 2h\,07m & 0.8045 & 0.8788 & 0.8835 \\
+    \texttt{\scriptsize convnext\_small} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 3h\,17m & 0.8056 & 0.8675 & 0.8789 \\
+    \texttt{\scriptsize convnext\_base\_22k} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & U-Ones & no & 1h\,17m & 0.8062 & 0.8806 & 0.8775 \\
+    \texttt{\scriptsize convnext\_large\_22k} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & U-Ones & no & 2h\,25m & 0.8064 & 0.8748 & 0.8792 \\
+    \texttt{\scriptsize swin\_base} & IN-1k & 384$\times$384 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100-80GB & U-Ones & no & 2h\,17m & 0.8022 & 0.8605 & 0.8726 \\
+    \texttt{\scriptsize swin\_base\_22k} & IN-22k & 384$\times$384 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100-80GB & U-Ones & no & 2h\,29m & 0.8036 & 0.8638 & 0.8761 \\
+    \texttt{\scriptsize efficientnetv2\_m} & IN-21k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & U-Ones & yes & 1h\,18m & 0.8020 & 0.8766 & 0.8805 \\
+    \texttt{\scriptsize coatnet\_1\_12k} & IN-12k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & mixed & yes & 1h\,54m & 0.8026 & 0.8769 & 0.8824 \\
+    \midrule
+    \multicolumn{13}{l}{\textit{Preprocessing}} \\
+    \texttt{\scriptsize resnet50\_with\_clahe} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 15 (40,305) & L4 & U-Ones & no & 3h\,39m & 0.7973 & 0.8664 & 0.8732 \\
+    \midrule
+    \multicolumn{13}{l}{\textit{Uncertain labels}} \\
+    \texttt{\scriptsize resnet50\_u\_zeros} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 15 (40,305) & L4 & U-Zeros & no & 2h\,38m & 0.7990 & 0.8588 & 0.8796 \\
+    \texttt{\scriptsize densenet121\_cons\_zeros} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 2h\,13m & 0.8085 & 0.8834 & 0.8926 \\
+    \texttt{\scriptsize densenet121\_u\_mixed} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & mixed & no & 2h\,39m & 0.8159 & 0.8820 & 0.8978 \\
+    \texttt{\scriptsize convnext\_base\_22k\_certain\_only} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & U-Ones & no & 1h\,28m & 0.7983 & 0.8808 & 0.8963 \\
+    \texttt{\scriptsize convnext\_base\_22k\_u\_selftrain} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & mixed & no & 1h\,47m & 0.8220 & 0.8977 & 0.8977 \\
+    \texttt{\scriptsize convnext\_base\_22k\_u\_selftrain\_all} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & mixed & no & 3h\,37m & 0.7983 & 0.8856 & 0.8970 \\
+    \texttt{\scriptsize convnext\_base\_22k\_u\_selftrain\_consol\_only} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & mixed & no & 1h\,21m & 0.8038 & 0.8971 & 0.9002 \\
+    \texttt{\scriptsize convnext\_base\_22k\_curriculum} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (16,818) & A100 & mixed & no & 58m\,11s & 0.7984 & 0.8812 & 0.8848 \\
+    \midrule
+    \multicolumn{13}{l}{\textit{Label smoothing}} \\
+    \texttt{\scriptsize convnext\_base\_22k\_final\_stage1} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & mixed & yes & 1h\,31m & 0.8038 & 0.8969 & 0.8985 \\
+    \midrule
+    \multicolumn{13}{l}{\textit{Objective}} \\
+    \texttt{\scriptsize convnext\_base\_22k\_aucm} & IN-22k & 384$\times$320 & $0.075$ & $7.5\times10^{-4}$ & 6 (16,122) & A100 & U-Ones & no & 1h\,15m & 0.8069 & 0.8825 & 0.8836 \\
+    \texttt{\scriptsize convnext\_base\_22k\_aucm\_no\_ce} & IN-22k & 384$\times$320 & $0.075$ & $7.5\times10^{-4}$ & 6 (16,122) & A100 & mixed & yes & 1h\,40m & 0.7548 & 0.8471 & 0.8539 \\
+    \midrule
+    \multicolumn{13}{l}{\textit{Domain pretraining}} \\
+    \texttt{\scriptsize medmae\_vitb\_raw} & MAE & 384$\times$320 & $5\times10^{-5}$ & $5\times10^{-7}$ & 6 (16,122) & A100 & mixed & yes & 1h\,03m & 0.8065 & 0.9030 & 0.9046 \\
+    \texttt{\scriptsize medmae\_vitb\_nih} & MAE+CXR14 & 384$\times$320 & $5\times10^{-5}$ & $5\times10^{-7}$ & 6 (16,122) & A100 & mixed & yes & 1h\,11m & 0.8085 & 0.8970 & 0.9020 \\
+    \texttt{\scriptsize medmae\_vitb\_chexpert} & MAE+CheXpert & 384$\times$320 & $1\times10^{-5}$ & $1\times10^{-7}$ & 6 (16,122) & A100 & mixed & yes & 1h\,04m & 0.8161 & 0.8906 & 0.8994 \\
+    \texttt{\scriptsize convnext\_base\_22k\_cxr14\_pretrain} & IN-22k+CXR14 & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & U-Ones & no & 1h\,33m & 0.8061 & 0.8759 & 0.8795 \\
+    \texttt{\scriptsize convnext\_base\_22k\_cxr14\_pretrain\_lowlr} & IN-22k+CXR14 & 384$\times$320 & $1\times10^{-5}$ & $1\times10^{-7}$ & 4 (26,870) & A100 & U-Ones & no & 1h\,12m & 0.8062 & 0.8919 & 0.8942 \\
+    \texttt{\scriptsize convnext\_base\_22k\_cxr14\_pretrain\_lowlr\_all} & IN-22k+CXR14 & 384$\times$320 & $1\times10^{-5}$ & $1\times10^{-7}$ & 4 (16,122) & A100 & U-Ones & no & 1h\,35m & 0.8070 & 0.8895 & 0.8899 \\
+    \texttt{\scriptsize convnext\_large\_22k\_cxr14\_pretrain} & IN-22k+CXR14 & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & U-Ones & no & 1h\,30m & 0.8067 & 0.8803 & 0.8811 \\
+    \midrule
+    \multicolumn{13}{l}{\textit{Resolution}} \\
+    \texttt{\scriptsize convnext\_base\_22k\_768x640} & IN-22k & 768$\times$640 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100-80GB & mixed & yes & 4h\,16m & 0.8065 & 0.8994 & 0.9037 \\
+    \texttt{\scriptsize convnext\_base\_22k\_1600x1312} & IN-22k & 1600$\times$1312 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & B200 & mixed & yes & 9h\,46m & 0.8030 & 0.9063 & 0.9037 \\
+    \texttt{\scriptsize convnext\_large\_22k\_768x640} & IN-22k & 768$\times$640 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & H200 & mixed & yes & 3h\,18m & 0.8062 & 0.9009 & 0.8987 \\
+    \texttt{\scriptsize medmae\_vitb\_nih\_B\_768\_s2} & MAE+CXR14 & 768$\times$640 & $5\times10^{-5}$ & $5\times10^{-7}$ & 8 (21,496) & A100-80GB & mixed & yes & 3h\,12m & 0.8076 & 0.9064 & 0.9067 \\
+    \texttt{\scriptsize rad\_dino\_vitB\_768} & DINOv2 & 784$\times$644 & $3\times10^{-5}$ & $3\times10^{-7}$ & 5 (13,435) & A100-80GB & mixed & yes & 5h\,15m & 0.8044 & 0.9016 & 0.9100 \\
+    \texttt{\scriptsize rad\_dino\_vitB\_1064x896} & DINOv2 & 1064$\times$896 & $6\times10^{-6}$ & $1\times10^{-7}$ & 6 (16,122) & H200 & mixed & yes & 6h\,14m & 0.8021 & 0.9000 & 0.9046 \\
+    \midrule
+    \multicolumn{13}{l}{\textit{Seed replicates}} \\
+    \texttt{\scriptsize convnext\_base\_22k\_seed7} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & mixed & yes & 51m\,18s & 0.8034 & 0.8916 & 0.8949 \\
+    \texttt{\scriptsize convnext\_base\_22k\_seed1337} & IN-22k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & A100 & mixed & yes & 54m\,20s & 0.8028 & 0.8924 & 0.8967 \\
+    \texttt{\scriptsize densenet121\_seed7} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 2h\,28m & 0.8023 & 0.8740 & 0.8804 \\
+    \texttt{\scriptsize densenet121\_seed123} & IN-1k & 384$\times$320 & $1\times10^{-4}$ & $1\times10^{-6}$ & 10 (26,870) & L4 & U-Ones & no & 2h\,41m & 0.8023 & 0.8584 & 0.8634 \\
+    \texttt{\scriptsize medmae\_vitb\_nih\_B\_448\_s1\_seed7} & MAE+CXR14 & 448$\times$384 & $5\times10^{-5}$ & $1\times10^{-5}$ & 1 (2,687) & A100 & mixed & yes & 39m\,24s & 0.7960 & 0.8972 & 0.9080 \\
+    \texttt{\scriptsize medmae\_vitb\_nih\_B\_448\_s1\_seed1337} & MAE+CXR14 & 448$\times$384 & $5\times10^{-5}$ & $1\times10^{-5}$ & 1 (2,687) & A100 & mixed & yes & 33m\,06s & 0.8019 & 0.9052 & 0.9088 \\
+    \texttt{\scriptsize medmae\_vitb\_nih\_B\_768\_s2\_seed7} & MAE+CXR14 & 768$\times$640 & $5\times10^{-5}$ & $5\times10^{-7}$ & 8 (21,496) & A100-80GB & mixed & yes & 2h\,22m & 0.8090 & 0.9045 & 0.9077 \\
+    \texttt{\scriptsize medmae\_vitb\_nih\_B\_768\_s2\_seed1337} & MAE+CXR14 & 768$\times$640 & $5\times10^{-5}$ & $5\times10^{-7}$ & 8 (21,496) & A100-80GB & mixed & yes & 2h\,06m & 0.8053 & 0.9105 & 0.9112 \\
+  \end{longtable}
+\end{landscape}
+
+\section{Per-disease runs}
+\label{app:perdisease}
+
+These runs train a single pathology rather than all five, so their scores are
+single class AUROC and are not comparable to the mean AUROC reported elsewhere.
+The first group trains one ConvNeXt-B per pathology with cross entropy. The
+second group replaces the objective with the AUC margin loss, warm started
+from a shared cross entropy backbone.
+
+\begin{table}[H]
+  \caption{Single pathology runs. Scores are single class AUROC.}
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{lllrrr}
+    \toprule
+    Run & Pathology & Objective & val19k & val200 & test500 \\
+    \midrule
+    \texttt{\scriptsize convnext\_base\_22k\_atelectasis\_only} & Atelectasis & BCE & 0.7243 & 0.8500 & 0.8431 \\
+    \texttt{\scriptsize convnext\_base\_22k\_cardiomegaly\_only} & Cardiomegaly & BCE & 0.8716 & 0.8277 & 0.8850 \\
+    \texttt{\scriptsize convnext\_base\_22k\_consolidation\_only} & Consolidation & BCE & 0.6800 & 0.8947 & 0.9155 \\
+    \texttt{\scriptsize convnext\_base\_22k\_edema\_only} & Edema & BCE & 0.8517 & 0.9298 & 0.9153 \\
+    \texttt{\scriptsize convnext\_base\_22k\_pleural\_effusion\_only} & Pleural Effusion & BCE & 0.8782 & 0.9299 & 0.9495 \\
+    \texttt{\scriptsize convnext\_base\_22k\_final\_stage2\_atelectasis} & Atelectasis & AUC-M & 0.7233 & 0.8557 & 0.8363 \\
+    \texttt{\scriptsize convnext\_base\_22k\_final\_stage2\_cardiomegaly} & Cardiomegaly & AUC-M & 0.8712 & 0.8319 & 0.8949 \\
+    \texttt{\scriptsize convnext\_base\_22k\_final\_stage2\_consolidation} & Consolidation & AUC-M & 0.6820 & 0.9175 & 0.8851 \\
+    \texttt{\scriptsize convnext\_base\_22k\_final\_stage2\_edema} & Edema & AUC-M & 0.8485 & 0.9454 & 0.9232 \\
+    \texttt{\scriptsize convnext\_base\_22k\_final\_stage2\_pleural\_effusion} & Pleural Effusion & AUC-M & 0.8767 & 0.9324 & 0.9557 \\
+    \bottomrule
+  \end{tabular}
+  \label{tab:perdisease}
+\end{table}
+
+
