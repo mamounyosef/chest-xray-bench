@@ -10,7 +10,6 @@ difference between two runs comes from the design choice under test and not from
 setup around it.
 
 **[43 trained models on Hugging Face](https://huggingface.co/mamounyosef/chest-xray-bench)**
-· technical report in [`paper/`](paper/)
 
 ## Results
 
