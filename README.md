@@ -80,7 +80,7 @@ Frontal views only, split by patient so no patient appears in two splits.
 ```
 data_code/            notebooks that build the splits from the raw CheXpert release
 training_scripts/
-  shared_code.py      the shared engine: data, training loop, metrics, Modal wiring
+  shared_code.py      the shared engine: data, training loop, metrics, cloud wiring
   <run>/              one folder per experiment
     config.yaml       everything that varies for this run
     train.py          builds the model, calls the shared trainer
@@ -92,11 +92,11 @@ training_scripts/
 
 ## Reproducing a run
 
-Runs execute on [Modal](https://modal.com) GPUs, configured per run under `modal:` in
-each `config.yaml`.
+Runs execute on cloud GPUs, declared per run in its `config.yaml`: L4 or A100 at
+384x320, A100-80GB at 768x640, H200 and B200 for the largest.
 
 ```bash
-modal run training_scripts/<run>/train.py
+python training_scripts/<run>/train.py
 python training_scripts/<run>/calibrate_threshold.py
 python training_scripts/<run>/evaluate.py
 ```
