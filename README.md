@@ -93,7 +93,7 @@ training_scripts/
 ## Reproducing a run
 
 Runs execute on cloud GPUs, declared per run in its `config.yaml`: L4 or A100 at
-384x320, A100-80GB at 768x640, H200 and B200 for the largest.
+384x320, A100-80GB at 768x640, H200 and B200 for the higher resolutions.
 
 ```bash
 python training_scripts/<run>/train.py
