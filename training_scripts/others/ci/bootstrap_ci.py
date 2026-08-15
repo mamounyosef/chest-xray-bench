@@ -62,14 +62,14 @@ SETS = ["test500_frontal"]   # scored splits, each bootstrapped SEPARATELY
 # that reused a saved fit). This is the 6-member fit itself, searched on valid200 —
 # the same weights ensample.py currently loads, and the ones behind the 0.9130 test500
 # run. They never saw test500.
-WEIGHTS_FROM = "../ensembling_results/2026-08-15_11-50-49"
+WEIGHTS_FROM = "../ensembling_results/2026-08-15_14-17-09 (best test500_frontal)"
 
 # Members, as the labels used in the weights file (a best.pt member is just the run
 # name; a checkpoint member is "<run> @ step<N>"). None -> take them from the weights
 # file itself, in its stored order.
 MEMBERS = None
 
-COMBINE_SPACE = "logit"          # "prob" | "logit" — MUST match the ensample.py run
+COMBINE_SPACE = "prob"          # "prob" | "logit" — MUST match the ensample.py run
 
 N_BOOT = 10000                   # bootstrap iterations
 SEED = 42                        # RNG seed (reproducible)
@@ -130,7 +130,14 @@ def _load_weights():
     # resolved weights as "class_weights" — both are {task: {member: weight}}
     wpc = d.get("weights_per_class") or d.get("class_weights")
     if wpc is None:
-        raise KeyError(f"{p} has neither 'weights_per_class' nor 'class_weights'")
+        # a FLAT run stores no weights because it has none: every member counts
+        # equally on every class, which is the same thing as 1/M weights
+        members = list(MEMBERS) if MEMBERS else list(d["members"])
+        if not members:
+            raise KeyError(f"{p} has no weights and no member list")
+        wpc = {t: {m: 1.0 / len(members) for m in members} for t in TASKS}
+        print(f"[weights] {p.name} is a flat run -> uniform 1/{len(members)} "
+              f"weights on every class")
     if d.get("combine_space") and d["combine_space"] != COMBINE_SPACE:
         raise ValueError(
             f"COMBINE_SPACE={COMBINE_SPACE!r} but {p.name} was produced with "

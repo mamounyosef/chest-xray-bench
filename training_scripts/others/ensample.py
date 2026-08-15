@@ -49,10 +49,10 @@ FRONTAL_ONLY    = True         # drop lateral rows from the scored split. valid2
                                # model ever trained on a lateral. Caches and summaries
                                # are tagged separately, so the mixed-view artifacts of
                                # earlier runs are neither read nor overwritten.
-WEIGHTS         = "2026-08-15_11-50-49"
+WEIGHTS         = "flat"
                                # "flat" | "search" | a saved fit: its folder/json, just
                                # the folder NAME, or "best_valid200" (the marked winner)
-COMBINE_SPACE   = "logit"       # blend space: "prob" | "logit" | "rank"
+COMBINE_SPACE   = "prob"       # blend space: "prob" | "logit" | "rank"
 THRESHOLDS_FROM = None         # run supplying thresholds.json; None -> the first member
 RUN_TAG         = ""           # appended to the output folder's timestamp
 
@@ -65,14 +65,9 @@ SET_TAG         = SET + ("_frontal" if FRONTAL_ONLY else "")
 # A nested LIST is a sub-ensemble: averaged flat among itself, ONE vote/weight above.
 
 FULL_MODELS = [
-    "medmae_vitb_nih_B_768_s2_seed1337",
-    "medmae_vitb_nih_B_768_s2",
     "convnext_base_22k_1600x1312",
-    "medmae_vitb_nih_B_448_s1_seed1337",
-    "medmae_vitb_nih_B_768_s2_seed7",
-    "medmae_vitb_raw",
+    "medmae_vitb_nih_B_768_s2",
     "rad_dino_vitB_768",
-    "convnext_large_22k_768x640",
 ]
 
 CKPT_SUBPATH = {}              # {run: "stage_subdir/best.pt"} for two-stage runs
